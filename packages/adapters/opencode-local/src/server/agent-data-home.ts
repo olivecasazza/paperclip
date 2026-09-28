@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import {
+  OPENCODE_APP_DIR_NAME,
+  resolveOpenCodeDataDir,
+  resolvePaperclipInstanceRootForAdapter,
+} from "@paperclipai/adapter-utils/server-utils";
 import { isTruthyEnvFlag } from "./models.js";
 
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
@@ -19,18 +23,6 @@ export type OpenCodePerAgentDataHomeResult = {
   notes: string[];
   dataHome: string | null;
 };
-
-/**
- * Resolve the directory OpenCode would use for its data dir (and therefore for
- * `opencode.db`) given the env that will reach the child process.
- */
-function resolveXdgDataHome(env: Record<string, string>): string {
-  return (
-    (typeof env.XDG_DATA_HOME === "string" && env.XDG_DATA_HOME.trim()) ||
-    (typeof process.env.XDG_DATA_HOME === "string" && process.env.XDG_DATA_HOME.trim()) ||
-    path.join(os.homedir(), ".local", "share")
-  );
-}
 
 function resolveIsolationDisabled(env: Record<string, string>, config: Record<string, unknown>): boolean {
   if (config.sharedDataHome === true) return true;
@@ -94,8 +86,12 @@ export async function prepareOpenCodePerAgentDataHome(input: {
     ? path.resolve(baseOverride)
     : path.join(resolvePaperclipInstanceRootForAdapter(), "adapter-data", "opencode");
 
-  const dataHome = path.join(base, agentId);
-  const previousDataHome = resolveXdgDataHome(input.env);
+  // OpenCode appends its own app name to XDG_DATA_HOME, so the directory that
+  // actually holds opencode.db / auth.json / storage/ is one level below the
+  // value we hand the child process. Both the seed source and the seed target
+  // must be expressed in OpenCode's own layout, not in XDG_DATA_HOME terms.
+  const dataHome = path.join(base, agentId, OPENCODE_APP_DIR_NAME);
+  const previousDataHome = resolveOpenCodeDataDir({ env: input.env });
   if (path.resolve(previousDataHome) === dataHome) {
     return { notes, dataHome };
   }
@@ -104,43 +100,41 @@ export async function prepareOpenCodePerAgentDataHome(input: {
 
   // Seed only what the agent cannot re-derive. Best-effort: a read-only or
   // partially-populated source dir must not fail the run.
-  if (path.resolve(previousDataHome) !== dataHome) {
-    for (const file of SEED_FILES) {
-      const target = path.join(dataHome, file);
-      try {
-        await fs.access(target);
-        continue;
-      } catch {
-        // Not present yet — fall through to the copy.
-      }
-      try {
-        await fs.copyFile(path.join(previousDataHome, file), target);
-      } catch {
-        // Absent or unreadable in the previous data dir; not fatal.
-      }
+  for (const file of SEED_FILES) {
+    const target = path.join(dataHome, file);
+    try {
+      await fs.access(target);
+      continue;
+    } catch {
+      // Not present yet — fall through to the copy.
     }
-    for (const dir of SEED_DIRS) {
-      const target = path.join(dataHome, dir);
-      try {
-        await fs.access(target);
-        continue;
-      } catch {
-        // Not present yet — fall through to the copy.
-      }
-      try {
-        await fs.cp(path.join(previousDataHome, dir), target, {
-          recursive: true,
-          force: false,
-          errorOnExist: false,
-          dereference: false,
-        });
-      } catch {
-        // Absent or unreadable in the previous data dir; not fatal.
-      }
+    try {
+      await fs.copyFile(path.join(previousDataHome, file), target);
+    } catch {
+      // Absent or unreadable in the previous data dir; not fatal.
+    }
+  }
+  for (const dir of SEED_DIRS) {
+    const target = path.join(dataHome, dir);
+    try {
+      await fs.access(target);
+      continue;
+    } catch {
+      // Not present yet — fall through to the copy.
+    }
+    try {
+      await fs.cp(path.join(previousDataHome, dir), target, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+        dereference: false,
+      });
+    } catch {
+      // Absent or unreadable in the previous data dir; not fatal.
     }
   }
 
-  input.env.XDG_DATA_HOME = dataHome;
+  input.env.XDG_DATA_HOME = path.join(base, agentId);
   notes.push(`Isolated OpenCode data dir per agent at ${dataHome}.`);
   return { notes, dataHome };
 }

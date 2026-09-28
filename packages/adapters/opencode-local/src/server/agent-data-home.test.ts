@@ -28,6 +28,10 @@ afterEach(async () => {
 });
 
 describe("prepareOpenCodePerAgentDataHome", () => {
+  // OpenCode appends its own app name to XDG_DATA_HOME, so the directory that
+  // actually holds opencode.db / auth.json / storage/ is one level below the
+  // XDG_DATA_HOME the adapter exports. These tests assert against the OpenCode
+  // dir (via the returned dataHome), not against XDG_DATA_HOME directly.
   it("gives two agents distinct data homes so they never open the same opencode.db", async () => {
     const envA: Record<string, string> = {};
     const envB: Record<string, string> = {};
@@ -37,11 +41,12 @@ describe("prepareOpenCodePerAgentDataHome", () => {
 
     expect(a.dataHome).not.toBeNull();
     expect(b.dataHome).not.toBeNull();
+    expect(a.dataHome).not.toBe(b.dataHome);
     expect(envA.XDG_DATA_HOME).not.toBe(envB.XDG_DATA_HOME);
-    expect(path.join(envA.XDG_DATA_HOME!, "opencode.db")).not.toBe(
-      path.join(envB.XDG_DATA_HOME!, "opencode.db"),
-    );
-    await expect(fs.stat(path.join(envA.XDG_DATA_HOME!, "opencode.db"))).rejects.toThrow();
+    // The real OpenCode data dir is $XDG_DATA_HOME/opencode.
+    expect(a.dataHome).toBe(path.join(envA.XDG_DATA_HOME!, "opencode"));
+    expect(b.dataHome).toBe(path.join(envB.XDG_DATA_HOME!, "opencode"));
+    await expect(fs.stat(path.join(a.dataHome!, "opencode.db"))).rejects.toThrow();
   });
 
   it("keeps one agent's data home stable across heartbeats so sessions stay resumable", async () => {
@@ -53,30 +58,37 @@ describe("prepareOpenCodePerAgentDataHome", () => {
   });
 
   it("seeds auth.json from the previous data dir without copying opencode.db", async () => {
-    const previous = path.join(tmpRoot, "previous-data");
+    // OpenCode stores these under $XDG_DATA_HOME/opencode, not $XDG_DATA_HOME.
+    const previousXdg = path.join(tmpRoot, "previous-data");
+    const previous = path.join(previousXdg, "opencode");
     await fs.mkdir(previous, { recursive: true });
     await fs.writeFile(path.join(previous, "auth.json"), '{"anthropic":{"type":"api"}}');
     await fs.writeFile(path.join(previous, "opencode.db"), "not-a-real-db");
     await fs.mkdir(path.join(previous, "repos"), { recursive: true });
     await fs.writeFile(path.join(previous, "repos", "keep.txt"), "keep");
 
-    const env: Record<string, string> = { XDG_DATA_HOME: previous };
+    const env: Record<string, string> = { XDG_DATA_HOME: previousXdg };
     const result = await prepareOpenCodePerAgentDataHome({ env, config: {}, agentId: AGENT_A });
 
-    expect(env.XDG_DATA_HOME).not.toBe(previous);
-    expect(await fs.readFile(path.join(env.XDG_DATA_HOME!, "auth.json"), "utf8")).toBe(
+    expect(env.XDG_DATA_HOME).not.toBe(previousXdg);
+    expect(result.dataHome).toBe(path.join(env.XDG_DATA_HOME!, "opencode"));
+    expect(await fs.readFile(path.join(result.dataHome!, "auth.json"), "utf8")).toBe(
       '{"anthropic":{"type":"api"}}',
     );
-    expect(await fs.readFile(path.join(env.XDG_DATA_HOME!, "repos", "keep.txt"), "utf8")).toBe("keep");
+    expect(await fs.readFile(path.join(result.dataHome!, "repos", "keep.txt"), "utf8")).toBe("keep");
     // The multi-GB shared DB must not be copied into every agent's dir.
-    await expect(fs.stat(path.join(env.XDG_DATA_HOME!, "opencode.db"))).rejects.toThrow();
+    await expect(fs.stat(path.join(result.dataHome!, "opencode.db"))).rejects.toThrow();
     expect(result.notes.join(" ")).toContain("Isolated OpenCode data dir per agent");
   });
 
   it("does not clobber an agent's own auth.json on a later heartbeat", async () => {
     const first: Record<string, string> = {};
-    await prepareOpenCodePerAgentDataHome({ env: first, config: {}, agentId: AGENT_A });
-    const dataHome = first.XDG_DATA_HOME!;
+    const firstResult = await prepareOpenCodePerAgentDataHome({
+      env: first,
+      config: {},
+      agentId: AGENT_A,
+    });
+    const dataHome = firstResult.dataHome!;
     await fs.writeFile(path.join(dataHome, "auth.json"), '{"mine":true}');
 
     const second: Record<string, string> = {};
@@ -87,12 +99,13 @@ describe("prepareOpenCodePerAgentDataHome", () => {
   it("honours an explicit data root override", async () => {
     const base = path.join(tmpRoot, "custom-root");
     const env: Record<string, string> = {};
-    await prepareOpenCodePerAgentDataHome({
+    const result = await prepareOpenCodePerAgentDataHome({
       env,
       config: { openCodeDataRoot: base },
       agentId: AGENT_A,
     });
     expect(env.XDG_DATA_HOME).toBe(path.join(base, AGENT_A));
+    expect(result.dataHome).toBe(path.join(base, AGENT_A, "opencode"));
   });
 
   it("opts out when sharedDataHome is configured", async () => {
