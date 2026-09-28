@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import {
   OPENCODE_APP_DIR_NAME,
+  isOpenCodePerAgentIsolationDisabled,
   resolveOpenCodeDataDir,
-  resolvePaperclipInstanceRootForAdapter,
+  resolveOpenCodePerAgentBaseDir,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isTruthyEnvFlag } from "./models.js";
 
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
 
@@ -24,14 +24,18 @@ export type OpenCodePerAgentDataHomeResult = {
   dataHome: string | null;
 };
 
-function resolveIsolationDisabled(env: Record<string, string>, config: Record<string, unknown>): boolean {
-  if (config.sharedDataHome === true) return true;
-  if (env.PAPERCLIP_OPENCODE_SHARED_DATA_HOME || process.env.PAPERCLIP_OPENCODE_SHARED_DATA_HOME) {
-    return isTruthyEnvFlag(
-      env.PAPERCLIP_OPENCODE_SHARED_DATA_HOME ?? process.env.PAPERCLIP_OPENCODE_SHARED_DATA_HOME,
-    );
-  }
-  return false;
+/**
+ * The env the child would actually inherit before we override anything.
+ *
+ * `input.env` is the overlay Paperclip builds for the run, but the server process
+ * may already export `XDG_DATA_HOME` (and it does: that is how every agent used
+ * to share one data dir). The child inherits both, so the seed source has to be
+ * read from both. Reading only the overlay made the seed fall back to
+ * `~/.local/share/opencode`, which on this deployment is not where the shared
+ * `auth.json` lives, so an agent that needed it started without credentials.
+ */
+function effectiveInheritedEnv(env: Record<string, string>): NodeJS.ProcessEnv {
+  return { ...process.env, ...env };
 }
 
 /**
@@ -71,27 +75,26 @@ export async function prepareOpenCodePerAgentDataHome(input: {
     return { notes, dataHome: null };
   }
 
-  if (resolveIsolationDisabled(input.env, input.config)) {
+  if (isOpenCodePerAgentIsolationDisabled({ env: input.env, config: input.config })) {
     return { notes, dataHome: null };
   }
 
-  const baseOverride =
-    (typeof input.config.openCodeDataRoot === "string" && input.config.openCodeDataRoot.trim()) ||
-    (typeof input.env.PAPERCLIP_OPENCODE_DATA_ROOT === "string" &&
-      input.env.PAPERCLIP_OPENCODE_DATA_ROOT.trim()) ||
-    (typeof process.env.PAPERCLIP_OPENCODE_DATA_ROOT === "string" &&
-      process.env.PAPERCLIP_OPENCODE_DATA_ROOT.trim()) ||
-    "";
-  const base = baseOverride
-    ? path.resolve(baseOverride)
-    : path.join(resolvePaperclipInstanceRootForAdapter(), "adapter-data", "opencode");
+  // The instance root comes from PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID, which
+  // the server exports rather than puts in the run overlay, so the base has to be
+  // resolved against the same effective env as the seed source below.
+  const base = resolveOpenCodePerAgentBaseDir({
+    config: input.config,
+    env: effectiveInheritedEnv(input.env),
+  });
 
   // OpenCode appends its own app name to XDG_DATA_HOME, so the directory that
   // actually holds opencode.db / auth.json / storage/ is one level below the
   // value we hand the child process. Both the seed source and the seed target
   // must be expressed in OpenCode's own layout, not in XDG_DATA_HOME terms.
   const dataHome = path.join(base, agentId, OPENCODE_APP_DIR_NAME);
-  const previousDataHome = resolveOpenCodeDataDir({ env: input.env });
+  const previousDataHome = resolveOpenCodeDataDir({
+    env: effectiveInheritedEnv(input.env),
+  });
   if (path.resolve(previousDataHome) === dataHome) {
     return { notes, dataHome };
   }

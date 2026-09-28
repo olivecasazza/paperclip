@@ -238,16 +238,63 @@ export function resolveOpenCodePerAgentDataDir(input: {
   agentId: string | null | undefined;
   instanceId?: string;
   env?: NodeJS.ProcessEnv;
+  config?: Record<string, unknown>;
 }): string | null {
   const agentId = input.agentId?.trim() ?? "";
   if (!agentId || !PATH_SEGMENT_RE.test(agentId)) return null;
-  const base = path.join(
+  // An operator can turn isolation off, in which case the run wrote to the shared
+  // home. Resolving a per-agent dir anyway would send the trace collector looking
+  // in a directory the run never wrote to.
+  if (isOpenCodePerAgentIsolationDisabled({ env: input.env, config: input.config })) return null;
+  const base = resolveOpenCodePerAgentBaseDir({
+    instanceId: input.instanceId,
+    env: input.env,
+    config: input.config,
+  });
+  return path.join(base, agentId, OPENCODE_APP_DIR_NAME);
+}
+
+/**
+ * The `<base>` that holds one subdirectory per agent.
+ *
+ * An operator can redirect the whole tree with `openCodeDataRoot` in the adapter
+ * config or `PAPERCLIP_OPENCODE_DATA_ROOT` in the env. This lives here, beside
+ * the resolver above, so the adapter (which writes) and the trace collector
+ * (which reads) cannot pick different bases.
+ */
+export function resolveOpenCodePerAgentBaseDir(input: {
+  instanceId?: string;
+  env?: NodeJS.ProcessEnv;
+  config?: Record<string, unknown>;
+} = {}): string {
+  const env = input.env ?? process.env;
+  const override =
+    (typeof input.config?.openCodeDataRoot === "string" && input.config.openCodeDataRoot.trim()) ||
+    env.PAPERCLIP_OPENCODE_DATA_ROOT?.trim() ||
+    "";
+  if (override) return path.resolve(override);
+  return path.join(
     resolvePaperclipInstanceRootForAdapter({ instanceId: input.instanceId, env: input.env }),
     "adapter-data",
     OPENCODE_APP_DIR_NAME,
   );
-  return path.join(base, agentId, OPENCODE_APP_DIR_NAME);
 }
+
+/** Whether an operator has turned per-agent OpenCode isolation off. */
+export function isOpenCodePerAgentIsolationDisabled(input: {
+  env?: NodeJS.ProcessEnv;
+  config?: Record<string, unknown>;
+} = {}): boolean {
+  const env = input.env ?? process.env;
+  if (input.config?.sharedDataHome === true) return true;
+  const flag = env.PAPERCLIP_OPENCODE_SHARED_DATA_HOME?.trim();
+  if (!flag) return false;
+  return TRUTHY_ENV_VALUES.has(flag.toLowerCase());
+}
+
+// Kept in step with isTruthyEnvFlag in the adapter's models.ts, so the reader and
+// the writer cannot disagree about whether isolation is off.
+const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes"]);
 
 export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",

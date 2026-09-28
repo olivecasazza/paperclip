@@ -119,6 +119,40 @@ describe("prepareOpenCodePerAgentDataHome", () => {
     expect(result.dataHome).toBeNull();
   });
 
+  it("seeds auth.json from the inherited XDG_DATA_HOME, not only the run overlay", async () => {
+    // The server process exports XDG_DATA_HOME; that is how every agent used to
+    // share one data dir. The run overlay does not carry it, so a resolver that
+    // reads only the overlay falls back to ~/.local/share/opencode and never
+    // finds the shared auth.json — the agent starts without credentials.
+    const inherited = path.join(tmpRoot, "inherited");
+    const inheritedData = path.join(inherited, "opencode");
+    await fs.mkdir(inheritedData, { recursive: true });
+    await fs.writeFile(path.join(inheritedData, "auth.json"), '{"inherited":true}');
+    const previousXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = inherited;
+    try {
+      const env: Record<string, string> = {};
+      const result = await prepareOpenCodePerAgentDataHome({ env, config: {}, agentId: AGENT_A });
+      expect(result.dataHome).not.toBeNull();
+      expect(await fs.readFile(path.join(result.dataHome!, "auth.json"), "utf8")).toBe(
+        '{"inherited":true}',
+      );
+    } finally {
+      if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = previousXdg;
+    }
+  });
+
+  it("writes under the same base the trace collector resolves", async () => {
+    // The writer and the reader must agree. If the writer honoured an override
+    // the reader did not, feedback bundles would silently lose the OpenCode trace.
+    const base = path.join(tmpRoot, "shared-base");
+    const env: Record<string, string> = { PAPERCLIP_OPENCODE_DATA_ROOT: base };
+    const result = await prepareOpenCodePerAgentDataHome({ env, config: {}, agentId: AGENT_A });
+    expect(result.dataHome).toBe(path.join(base, AGENT_A, "opencode"));
+    expect(env.XDG_DATA_HOME).toBe(path.join(base, AGENT_A));
+  });
+
   it("opts out via the env kill switch", async () => {
     const env: Record<string, string> = { PAPERCLIP_OPENCODE_SHARED_DATA_HOME: "1" };
     await prepareOpenCodePerAgentDataHome({ env, config: {}, agentId: AGENT_A });

@@ -3880,4 +3880,28 @@ describe("opencode data dir resolution", () => {
     expect(resolveOpenCodePerAgentDataDir({ agentId: "  ", env })).toBeNull();
     expect(resolveOpenCodePerAgentDataDir({ agentId: "../../etc", env })).toBeNull();
   });
+
+  it("returns null when an operator turns isolation off, so the collector does not look in a dir the run never wrote to", () => {
+    const env = { PAPERCLIP_HOME: "/home/paperclip", PAPERCLIP_INSTANCE_ID: "default" };
+    expect(
+      resolveOpenCodePerAgentDataDir({ agentId: "agent-a", env, config: { sharedDataHome: true } }),
+    ).toBeNull();
+    expect(
+      resolveOpenCodePerAgentDataDir({
+        agentId: "agent-a",
+        env: { ...env, PAPERCLIP_OPENCODE_SHARED_DATA_HOME: "true" },
+      }),
+    ).toBeNull();
+  });
+
+  it("honours the data root override the adapter writer uses, so writer and collector cannot drift", () => {
+    const env = { PAPERCLIP_HOME: "/home/paperclip", PAPERCLIP_INSTANCE_ID: "default" };
+    const overridden = { ...env, PAPERCLIP_OPENCODE_DATA_ROOT: "/srv/opencode" };
+    expect(resolveOpenCodePerAgentDataDir({ agentId: "agent-a", env: overridden })).toBe(
+      path.join("/srv/opencode", "agent-a", "opencode"),
+    );
+    expect(
+      resolveOpenCodePerAgentDataDir({ agentId: "agent-a", env, config: { openCodeDataRoot: "/srv/opencode" } }),
+    ).toBe(path.join("/srv/opencode", "agent-a", "opencode"));
+  });
 });
