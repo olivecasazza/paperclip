@@ -60,6 +60,42 @@ For local adapters, set:
 - `graceSec` (time before force-kill after timeout/cancel)
 - optional env vars and extra CLI args
 
+### Run-timeout policy
+
+`adapterConfig.timeoutSec` is the per-agent value, but it is not the only one.
+The effective wall clock for a run is resolved in this order:
+
+1. **Per-agent `adapterConfig.timeoutSec`** — a positive value wins; a negative
+   value is the documented "no wall-clock timeout" opt-out and beats every
+   default. A stored `0` is *not* an opt-out: the adapter config UI persists
+   the schema default of `0` for untouched fields, so `0` reads as "unset".
+2. **Sandbox transport default** — sandbox targets keep their own built-in
+   backstop (`DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC`, 4h), which matches
+   the recovery watchdog's critical threshold. The policy below does not
+   rescale it.
+3. **Company/instance default** — the `adapterRunTimeoutSec` instance setting
+   (Instance → General → "Agent run timeout"), applied to every local and SSH
+   agent that never set `timeoutSec`.
+4. **Env-var override** — `PAPERCLIP_ADAPTER_RUN_TIMEOUT_SEC` supplies the
+   value when the instance setting is unset.
+5. **Unlimited** — with no policy configured, local and SSH targets resolve to
+   `{ timeoutSec: 0, source: "unlimited" }`, exactly as before.
+
+The policy exists so the run-timeout policy is one value an operator owns
+instead of N independent per-agent rows. Adopting it is a deliberate action:
+with no policy set, nothing changes for existing runs, and a negative value
+from either layer opts the whole deployment out.
+
+The resolved source is always named in the run-start log and in the
+`Timed out after Ns` message, so a run can be attributed to the policy default
+or to an explicit per-agent value:
+
+```
+[paperclip] Adapter execution timeout: timeoutSec=7200 (company/instance default adapterRunTimeoutSec; set adapterConfig.timeoutSec to override).
+```
+
+Sandbox targets ignore the policy and keep their transport default.
+
 ## 3.4 Prompt templates
 
 You can set:

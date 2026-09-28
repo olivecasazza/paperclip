@@ -469,6 +469,7 @@ import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
+import { readAdapterRunTimeoutPolicy } from "./adapter-run-timeout.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -24342,6 +24343,12 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            // Company/instance run-timeout default handed to the adapter, so an
+            // agent that never set adapterConfig.timeoutSec inherits one policy
+            // value instead of running unbounded. Read per run: the setting is
+            // operator-editable and a stale cache would silently keep a removed
+            // wall clock (or miss a new one) in force.
+            const adapterTimeoutPolicy = await readAdapterRunTimeoutPolicy(db, runtimeEnv);
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
@@ -24356,6 +24363,7 @@ export function heartbeatService(
                     runtimeCommandSpec:
                       adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
                     executionTarget,
+                    adapterTimeoutPolicy,
                     executionTransport: remoteExecution
                       ? {
                           remoteExecution: remoteExecution as unknown as Record<

@@ -20,6 +20,19 @@ import { useSignOut } from "@/hooks/useSignOut";
 
 const FEEDBACK_TERMS_URL = import.meta.env.VITE_FEEDBACK_TERMS_URL?.trim() || "https://paperclip.ing/tos";
 
+// Presets for the company/instance run-timeout policy. "No limit" stores null,
+// which is indistinguishable from "unset" on purpose: the adapter config UI
+// persists 0 for untouched per-agent fields, so 0 cannot express intent here
+// either. The remaining presets are plain positive seconds.
+const ADAPTER_RUN_TIMEOUT_PRESETS_ENV_KEY = "PAPERCLIP_ADAPTER_RUN_TIMEOUT_SEC";
+const ADAPTER_RUN_TIMEOUT_PRESETS: { label: string; timeoutSec: number | null }[] = [
+  { label: "No limit", timeoutSec: null },
+  { label: "30 minutes", timeoutSec: 1_800 },
+  { label: "1 hour", timeoutSec: 3_600 },
+  { label: "2 hours", timeoutSec: 7_200 },
+  { label: "4 hours", timeoutSec: 14_400 },
+];
+
 export function InstanceGeneralSettings({ embedded = false }: { embedded?: boolean }) {
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
@@ -83,6 +96,8 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
   const showCensorUsernameInLogs = !hiddenSettings.has("instance.general.censorUsernameInLogs");
   const showBackupRetention = !hiddenSettings.has("instance.general.backupRetention");
   const showFeedbackDataSharing = !hiddenSettings.has("instance.general.feedbackDataSharingPreference");
+  const showAdapterRunTimeout = !hiddenSettings.has("instance.general.adapterRunTimeoutSec");
+  const adapterRunTimeoutSec = generalQuery.data?.adapterRunTimeoutSec ?? null;
   const showSignOut = !hiddenSettings.has("instance.general.signOut");
   const visibleTopics = [
     ...(showCensorUsernameInLogs ? ["log display"] : []),
@@ -274,6 +289,50 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
                 );
               })}
             </div>
+          </div>
+        </div>
+      </section>
+      )}
+
+      {showAdapterRunTimeout && (
+      <section>
+        <div className="space-y-5">
+          <div className="space-y-1.5">
+            <h2 className="text-sm font-semibold">Agent run timeout</h2>
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Default wall-clock limit for a single agent run on local and SSH targets. Agents
+              that never set a timeout inherit this value, so the policy is one number here
+              instead of a timeout on every agent. A per-agent
+              {" "}<code className="font-mono text-xs">adapterConfig.timeoutSec</code> always
+              wins over it, and a negative per-agent value means "no limit" for that agent.
+              Sandbox runs keep their own transport default and ignore this setting.
+              {" "}<code className="font-mono text-xs">{ADAPTER_RUN_TIMEOUT_PRESETS_ENV_KEY}</code>
+              {" "}supplies the value while this is unset.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {ADAPTER_RUN_TIMEOUT_PRESETS.map((preset) => {
+              const active = adapterRunTimeoutSec === preset.timeoutSec;
+              return (
+                <button
+                  key={preset.label}
+                  type="button"
+                  disabled={updateGeneralMutation.isPending || signOutMutation.isPending}
+                  className={cn(
+                    "rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                    active
+                      ? "border-foreground bg-accent text-foreground"
+                      : "border-border bg-background hover:bg-accent/50",
+                  )}
+                  onClick={() =>
+                    updateGeneralMutation.mutate({ adapterRunTimeoutSec: preset.timeoutSec })
+                  }
+                >
+                  <div className="text-sm font-medium">{preset.label}</div>
+                </button>
+              );
+            })}
           </div>
         </div>
       </section>
