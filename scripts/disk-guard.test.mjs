@@ -1,0 +1,357 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+const SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "disk-guard.sh");
+
+// Exit codes documented in the script header.
+const RC_OK = 0;
+const RC_ERROR = 1;
+const RC_WARN = 2;
+const RC_CRITICAL = 3;
+
+const MIB = 1024 * 1024;
+
+function makeSandbox() {
+  const root = mkdtempSync(path.join(os.tmpdir(), "disk-guard-test-"));
+  const mount = path.join(root, "mnt");
+  const binDir = path.join(root, "bin");
+  mkdirSync(mount);
+  mkdirSync(binDir);
+  return {
+    root,
+    mount,
+    binDir,
+    statusFile: path.join(root, "run", "disk-guard.status"),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Shadow `df` with a stub so usage is deterministic and independent of the real
+ * filesystem. The script calls `df --block-size=1 -P "$MOUNT"`; size/used/avail
+ * are emitted in 1-byte blocks, matching what the script's awk expects.
+ *
+ * `broken: true` makes the stub fail the way an unmounted or unreadable volume
+ * does, which is how we exercise the measurement-failure path.
+ */
+function installDfStub(sandbox, { size, used, avail, broken = false }) {
+  const lines = broken
+    ? "#!/bin/sh\nexit 1\n"
+    : [
+        "#!/bin/sh",
+        'echo "Filesystem 1024-blocks Used Available Capacity Mounted on"',
+        `echo "stub ${size} ${used} ${avail} 50% /mnt"`,
+        "",
+      ].join("\n");
+  const stub = path.join(sandbox.binDir, "df");
+  writeFileSync(stub, lines, { mode: 0o755 });
+  return stub;
+}
+
+function run(sandbox, args, env = {}) {
+  const result = spawnSync("bash", [SCRIPT, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${sandbox.binDir}:${process.env.PATH}`,
+      DISK_GUARD_MOUNT: sandbox.mount,
+      DISK_GUARD_STATUS_FILE: sandbox.statusFile,
+      ...env,
+    },
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+function seed(sandbox, relPath, sizeBytes) {
+  const full = path.join(sandbox.mount, relPath);
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(sizeBytes));
+  return full;
+}
+
+function exists(sandbox, relPath) {
+  return existsSync(path.join(sandbox.mount, relPath));
+}
+
+/** Total bytes of file content under `dir`, used to assert prune freed nothing. */
+function treeBytes(dir) {
+  const result = spawnSync("find", [dir, "-type", "f", "-printf", "%s\n"], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`find failed: ${result.stderr}`);
+  return result.stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .reduce((sum, line) => sum + Number(line), 0);
+}
+
+test("threshold and floor logic: WARN_PCT=1 yields rc=2", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const result = run(sandbox, ["--check"], { DISK_GUARD_WARN_PCT: "1", DISK_GUARD_MIN_FREE_MB: "0" });
+    assert.equal(result.status, RC_WARN);
+    assert.match(result.stdout, /level=warn/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("threshold and floor logic: CRIT_PCT=1 yields rc=3", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const result = run(sandbox, ["--check"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_MIN_FREE_MB: "0" });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.match(result.stdout, /level=critical/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("a healthy volume under both thresholds yields rc=0", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const result = run(sandbox, ["--check"]);
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /level=ok/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("a MIN_FREE_MB above available free space trips warn even at low usage", () => {
+  const sandbox = makeSandbox();
+  try {
+    // 5% used, so percentage is nowhere near WARN_PCT=88. Only the free-space
+    // floor can make this warn.
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 2 * 1024 * MIB });
+    const result = run(sandbox, ["--check"], { DISK_GUARD_MIN_FREE_MB: "100000" });
+    assert.equal(result.status, RC_WARN);
+    assert.match(result.stdout, /level=warn/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("MIN_FREE_MB=0 disables the floor, leaving percentage as the only signal", () => {
+  const sandbox = makeSandbox();
+  try {
+    // Same starved free space as above, but the floor is disabled.
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 2 * 1024 * MIB });
+    const result = run(sandbox, ["--check"], { DISK_GUARD_MIN_FREE_MB: "0" });
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /level=ok/);
+    assert.match(result.stdout, /floor=0MiB/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("unparseable usage is a measurement error (rc=1), not a pressure signal", () => {
+  const sandbox = makeSandbox();
+  try {
+    // An unreadable/unmounted volume makes df produce no usable row. This must
+    // not be reported as ok/warn: the guard simply could not measure.
+    installDfStub(sandbox, { broken: true });
+    const result = run(sandbox, ["--check"]);
+    assert.equal(result.status, RC_ERROR);
+    assert.doesNotMatch(result.stdout, /level=/, "must not publish a level it could not measure");
+    assert.match(result.stderr, /cannot measure/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("an unknown mode is a usage error (rc=1)", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const result = run(sandbox, ["--bogus"]);
+    assert.equal(result.status, RC_ERROR);
+    assert.match(result.stderr, /usage: disk-guard\.sh/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("--status reads the durable state file written by a previous --check", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    run(sandbox, ["--check"]);
+    const result = run(sandbox, ["--status"]);
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /^mount=/m);
+    assert.match(result.stdout, /^level=ok$/m);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("allowlist: prune deletes only the approved cache paths", () => {
+  const sandbox = makeSandbox();
+  try {
+    // Force pressure so prune is allowed to run at all; CRIT_PCT=1 guarantees
+    // critical regardless of the stub's numbers.
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const approved = [
+      ".cache/node/blob",
+      ".cache/zig/blob",
+      ".cache/opencode/blob",
+      ".cache/pnpm/blob",
+      ".cache/ms-playwright/blob",
+      ".npm/_cacache/blob",
+      ".npm/_npx/blob",
+    ];
+    const forbidden = [
+      "instances/default/keep",
+      "wt/repo/keep",
+      "opencode.db",
+      "opencode.db-wal",
+      ".nix-portable/store/keep",
+      ".rustup/toolchains/keep",
+      ".local/share/opencode/opencode.db",
+      ".local/share/opencode/opencode.db-wal",
+      ".local/share/pnpm/store/blob",
+    ];
+    for (const rel of [...approved, ...forbidden]) {
+      seed(sandbox, rel, 3 * MIB);
+    }
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1" });
+    assert.equal(result.status, RC_CRITICAL);
+
+    for (const rel of approved) {
+      assert.ok(!exists(sandbox, rel), `expected ${rel} to be pruned`);
+    }
+    for (const rel of forbidden) {
+      assert.ok(exists(sandbox, rel), `expected ${rel} to survive the prune`);
+    }
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("allowlist: prune only removes rotated logs (mtime>1d) from the log dir", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const oldLog = seed(sandbox, ".local/share/opencode/log/old.log", 2 * MIB);
+    const freshLog = seed(sandbox, ".local/share/opencode/log/fresh.log", 2 * MIB);
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(oldLog, threeDaysAgo, threeDaysAgo);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1" });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(oldLog), "expected the rotated log to be deleted");
+    assert.ok(existsSync(freshLog), "expected the current log to be kept");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nlink gate: a cache hardlinked into a live node_modules is skipped, not deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // .cache/pnpm is on the prune allowlist, so the gate is what stands between
+    // it and deletion: its inodes are shared with a live node_modules tree, so
+    // reclaim measured with `-links 1` is 0 and the path must take the skip
+    // branch. This mirrors the real volume, where the analogous pnpm store
+    // frees only ~15M while breaking hardlink dedup.
+    const liveBlob = seed(sandbox, "live/node_modules/dep/blob", 5 * MIB);
+    const cacheBlob = path.join(sandbox.mount, ".cache/pnpm/store/blob");
+    mkdirSync(path.dirname(cacheBlob), { recursive: true });
+    linkSync(liveBlob, cacheBlob);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1" });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(cacheBlob), "hardlinked cache must survive (skip branch)");
+    assert.ok(existsSync(liveBlob), "the live tree sharing the inode must survive");
+    assert.match(result.stderr, /skip .*\.cache\/pnpm \(only 0KiB unlinked-reclaimable\)/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nlink gate: the same allowlisted cache with its own inodes is pruned", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // Control case for the test above: identical path and size, but nlink==1,
+    // so it is genuinely reclaimable and must be deleted. Without this, the
+    // skip branch could pass simply because the path was mis-seeded.
+    const cacheBlob = seed(sandbox, ".cache/pnpm/blob", 5 * MIB);
+    const bytesBefore = treeBytes(sandbox.mount);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1" });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(cacheBlob), "an unhardlinked cache must be pruned");
+    assert.ok(
+      treeBytes(sandbox.mount) < bytesBefore,
+      "pruning must actually reclaim the space it reported",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("prune is a no-op at level=ok: nothing is deleted and exactly 0 bytes are freed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const cacheBlob = seed(sandbox, ".cache/node/blob", 3 * MIB);
+    const logBlob = seed(sandbox, ".local/share/opencode/log/old.log", 2 * MIB);
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(logBlob, threeDaysAgo, threeDaysAgo);
+    const bytesBefore = treeBytes(sandbox.mount);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "99" });
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /prune_skipped=level_ok/);
+    // The skip path returns before prune prints its reclaimed_mib line, so
+    // measure the tree directly: 0 bytes freed is the property under test.
+    assert.equal(treeBytes(sandbox.mount) - bytesBefore, 0, "prune must free exactly 0 bytes at level=ok");
+    assert.ok(existsSync(cacheBlob), "cache must be untouched when there is no pressure");
+    assert.ok(existsSync(logBlob), "logs must be untouched when there is no pressure");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("prune fails closed when df is unusable, rather than trusting a stale status file", () => {
+  const sandbox = makeSandbox();
+  try {
+    // A previous run left level=critical in the durable status file. If prune
+    // trusted that stale reading while df was broken it would delete caches
+    // without having measured anything.
+    mkdirSync(path.dirname(sandbox.statusFile), { recursive: true });
+    writeFileSync(sandbox.statusFile, "level=critical\n");
+    const cacheBlob = seed(sandbox, ".cache/node/blob", 3 * MIB);
+    installDfStub(sandbox, { broken: true });
+
+    const result = run(sandbox, ["--prune"]);
+    assert.equal(result.status, RC_ERROR);
+    assert.match(result.stdout, /prune_skipped=measurement_failed/);
+    assert.ok(existsSync(cacheBlob), "cache must survive an unmeasurable run");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("the committed script stays in sync with the deployed runtime copies", { skip: process.env.DISK_GUARD_SKIP_SYNC_CHECK === "1" }, () => {
+  const committed = readFileSync(SCRIPT);
+  for (const runtimeCopy of ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"]) {
+    if (!existsSync(runtimeCopy)) continue;
+    const deployed = readFileSync(runtimeCopy);
+    assert.ok(
+      deployed.equals(committed),
+      `${runtimeCopy} has drifted from scripts/disk-guard.sh; redeploy it from the repo copy`,
+    );
+  }
+});
