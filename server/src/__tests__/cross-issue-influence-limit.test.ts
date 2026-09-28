@@ -30,6 +30,7 @@ function counterDb(
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve(claimOverrides === null ? [] : [{
                 issueId: "55555555-5555-4555-8555-555555555555",
+                status: "in_progress",
                 checkoutRunId: null,
                 executionRunId: null,
                 ...claimOverrides,
@@ -265,6 +266,33 @@ describe("cross-issue influence limit rollout", () => {
       expect.objectContaining({ action: "issue.cross_issue_influence_observed" }),
     ]);
   });
+
+  // A live run can still reference a *finished* issue: recovery and retry
+  // paths leave `checkoutRunId` / `executionRunId` in place after the issue
+  // reaches a terminal status. The run being alive is not evidence that the
+  // claim is current, so a terminal issue must not buy an uncounted
+  // cross-issue write (Greptile P1 on the claim fallback).
+  it.each(["done", "cancelled"])(
+    "does not let a %s issue's stale binding exempt a write from a running run",
+    async (issueStatus) => {
+      const fake = counterDb(0, { contextSnapshot: {}, status: "running" }, {
+        status: issueStatus,
+        checkoutRunId: "11111111-1111-4111-8111-111111111111",
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        kind: "update",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({ allowed: true, count: 1, mode: "enforce" });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_observed" }),
+      ]);
+    },
+  );
 
   // `issues.executionRunId` is written at *scheduling* time, so it can already
   // name a run that has no process. A queued or scheduled-retry run is a

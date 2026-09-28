@@ -95,6 +95,7 @@ async function runHoldsIssue(
   const rows = await tx
     .select({
       issueId: issues.id,
+      status: issues.status,
       checkoutRunId: issues.checkoutRunId,
       executionRunId: issues.executionRunId,
     })
@@ -105,6 +106,11 @@ async function runHoldsIssue(
     ))
     .then((selected) => selected[0] ?? null);
   if (!rows) return false;
+  // A run status check is not enough. Recovery and retry paths can leave a
+  // finished issue still referencing a run that is running for other reasons,
+  // and exempting that write would hand out uncounted cross-issue influence
+  // through a stale terminal binding (Greptile P1 on the claim fallback).
+  if (rows.status === "done" || rows.status === "cancelled") return false;
   return rows.checkoutRunId === input.runId || rows.executionRunId === input.runId;
 }
 
