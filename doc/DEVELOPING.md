@@ -1109,6 +1109,35 @@ agent workspace. The host `HOME` itself, a directory that contains it, a
 filesystem root, a `CODEX_HOME` overlap, or a canonical path outside the
 assigned workspace is rejected before provider startup.
 
+### Sandbox ACP input delivery
+
+The legacy sandbox process bridge retries recognized Daytona and Cloudflare
+HTTP 502, 503, and 504 failures while writing an input message, with at most
+three attempts and a short backoff.
+Retries keep the message sequence and use separate temporary upload files.
+The remote wrapper discards already-consumed sequences, so a lost provider
+response cannot send the same input bytes twice. Messages remain ordered.
+This does not restart an agent turn or replay a tool call. Authentication and
+shell errors fail immediately; exhausted input delivery closes the bridge and
+records a fixed diagnostic without logging the input payload. Persisting that
+failure diagnostic does not block bridge teardown.
+Run-log finalization closes its write handle and waits for accepted file
+appends before computing the size, hash, and durable copy. Writes submitted
+after finalization starts are ignored; later progress persistence is not part
+of that file-write barrier. If accepted writes remain stalled after three
+seconds, finalization returns unknown size/hash metadata and skips the final
+durable copy so the run can reach a terminal state. A late write cannot restart
+mirroring or produce a claimed verified snapshot.
+Readers still attempt bounded reads when size is unknown. Legacy comment
+attribution retains its existing 2 MB scan limit and allows three seconds per
+log. Storage errors or timeouts preserve any evidence already read and leave
+the comments available without additional derived attribution.
+The read deadline requests cancellation of local file streams, S3 HEAD and GET
+requests, and S3 response streams. The listing stops waiting at the deadline
+even if filesystem I/O delays cancellation. Late results cannot add evidence
+or start another page. Each listing retains its existing batches of eight reads;
+concurrent listings do not skip healthy logs because another listing is busy.
+
 ### Preinstalled remote runner runtime
 
 For fast sandbox startup, bake `paperclip-runnerd` and the latest stable agent
