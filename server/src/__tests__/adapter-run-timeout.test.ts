@@ -7,13 +7,16 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({ getGeneral }),
 }));
 
-const { readAdapterRunTimeoutPolicy } = await import("../services/adapter-run-timeout.js");
+const { readAdapterRunTimeoutPolicy, resetAdapterRunTimeoutPolicyCache } = await import(
+  "../services/adapter-run-timeout.js"
+);
 const { readAdapterRunTimeoutPolicyFromEnv } = await import("@paperclipai/adapter-utils");
 
 describe("readAdapterRunTimeoutPolicy", () => {
   beforeEach(() => {
     getGeneral.mockReset();
     getGeneral.mockResolvedValue({ adapterRunTimeoutSec: null });
+    resetAdapterRunTimeoutPolicyCache();
   });
 
   it("has no policy when neither the instance setting nor the env var is set", async () => {
@@ -52,6 +55,41 @@ describe("readAdapterRunTimeoutPolicy", () => {
     expect(
       await readAdapterRunTimeoutPolicy({} as never, { [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "900" }),
     ).toEqual({ timeoutSec: 900, source: "env_default" });
+  });
+
+  it("reuses the last successfully read value instead of dropping the wall clock", async () => {
+    getGeneral.mockResolvedValueOnce({ adapterRunTimeoutSec: 7_200 });
+    expect(await readAdapterRunTimeoutPolicy({} as never, {})).toEqual({
+      timeoutSec: 7_200,
+      source: "instance_default",
+    });
+
+    getGeneral.mockRejectedValue(new Error("db down"));
+    expect(await readAdapterRunTimeoutPolicy({} as never, {})).toEqual({
+      timeoutSec: 7_200,
+      source: "instance_default",
+    });
+  });
+
+  it("does not resurrect a removed policy during a later read failure", async () => {
+    getGeneral.mockResolvedValueOnce({ adapterRunTimeoutSec: 7_200 });
+    await readAdapterRunTimeoutPolicy({} as never, {});
+    getGeneral.mockResolvedValueOnce({ adapterRunTimeoutSec: null });
+    expect(await readAdapterRunTimeoutPolicy({} as never, {})).toBeNull();
+
+    getGeneral.mockRejectedValue(new Error("db down"));
+    expect(
+      await readAdapterRunTimeoutPolicy({} as never, { [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "900" }),
+    ).toEqual({ timeoutSec: 900, source: "env_default" });
+  });
+
+  it("keeps the last known negative opt-out through a read failure", async () => {
+    getGeneral.mockResolvedValueOnce({ adapterRunTimeoutSec: -1 });
+    await readAdapterRunTimeoutPolicy({} as never, {});
+    getGeneral.mockRejectedValue(new Error("db down"));
+    expect(
+      await readAdapterRunTimeoutPolicy({} as never, { [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "900" }),
+    ).toEqual({ timeoutSec: -1, source: "instance_default" });
   });
 
   it("throws on a non-numeric env value so the host can refuse startup", async () => {

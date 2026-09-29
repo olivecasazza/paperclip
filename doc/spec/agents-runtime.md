@@ -101,6 +101,13 @@ or to an explicit per-agent value:
 
 Sandbox targets ignore the policy and keep their transport default.
 
+The instance setting is read once per run. If that read throws, the run is not
+blocked and the last value read successfully in this process is reused, so a
+transient settings failure degrades to a slightly stale policy rather than
+dropping the operator's wall clock. Only a cold start with no successful read
+falls through to the env layer, and that case is logged as a possibly-unbounded
+run.
+
 ## 3.4 Prompt templates
 
 You can set:
