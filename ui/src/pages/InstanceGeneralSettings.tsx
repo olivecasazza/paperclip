@@ -20,13 +20,16 @@ import { useSignOut } from "@/hooks/useSignOut";
 
 const FEEDBACK_TERMS_URL = import.meta.env.VITE_FEEDBACK_TERMS_URL?.trim() || "https://paperclip.ing/tos";
 
-// Presets for the company/instance run-timeout policy. "No limit" stores null,
-// which is indistinguishable from "unset" on purpose: the adapter config UI
-// persists 0 for untouched per-agent fields, so 0 cannot express intent here
-// either. The remaining presets are plain positive seconds.
+// Presets for the company/instance run-timeout policy. "Use env default" stores
+// null, which inherits PAPERCLIP_ADAPTER_RUN_TIMEOUT_SEC (or stays unlimited
+// when that variable is unset). "No limit" stores -1, which is the explicit
+// opt-out: a negative instance value beats the env layer, so this control can
+// always turn the wall clock off. Storing null for "No limit" would leave the
+// env value in force while the button claimed otherwise.
 const ADAPTER_RUN_TIMEOUT_PRESETS_ENV_KEY = "PAPERCLIP_ADAPTER_RUN_TIMEOUT_SEC";
 const ADAPTER_RUN_TIMEOUT_PRESETS: { label: string; timeoutSec: number | null }[] = [
-  { label: "No limit", timeoutSec: null },
+  { label: "Use env default", timeoutSec: null },
+  { label: "No limit", timeoutSec: -1 },
   { label: "30 minutes", timeoutSec: 1_800 },
   { label: "1 hour", timeoutSec: 3_600 },
   { label: "2 hours", timeoutSec: 7_200 },
@@ -307,7 +310,8 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
               wins over it, and a negative per-agent value means "no limit" for that agent.
               Sandbox runs keep their own transport default and ignore this setting.
               {" "}<code className="font-mono text-xs">{ADAPTER_RUN_TIMEOUT_PRESETS_ENV_KEY}</code>
-              {" "}supplies the value while this is unset.
+              {" "}supplies the value when this is unset. Choosing "No limit" stores a negative
+              value, which overrides that variable; "Use env default" clears it again.
             </p>
           </div>
 

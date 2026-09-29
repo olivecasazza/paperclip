@@ -4,6 +4,7 @@ import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
@@ -91,7 +92,7 @@ async function runHoldsIssue(
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
   input: { companyId: string; runId: string; runStatus: string; targetIssueId: string },
 ): Promise<boolean> {
-  if (input.runStatus !== "running") return false;
+  if (input.runStatus !== "running" || TERMINAL_HEARTBEAT_RUN_STATUSES.has(input.runStatus)) return false;
   const rows = await tx
     .select({
       issueId: issues.id,

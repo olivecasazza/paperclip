@@ -6,6 +6,7 @@ import {
   formatAdapterExecutionTimeoutSummary,
   resolveAdapterExecutionTargetTimeout,
   resolveAdapterExecutionTargetTimeoutSec,
+  type AdapterExecutionTargetTimeoutPolicy,
   type AdapterSshExecutionTarget,
 } from "./execution-target.js";
 import {
@@ -171,6 +172,33 @@ describe("resolveAdapterExecutionTargetTimeout for local and SSH targets", () =>
         source: "instance_default",
       }),
     ).toEqual({ timeoutSec: 90, source: "configured" });
+  });
+
+  it("turns a resolved timeout into the native run turn timeout", () => {
+    // Native runs do not reach adapter.execute, so the server applies the
+    // same chain to the turn wall clock instead. The clamp preserves today's
+    // native behavior for an opted-out (negative) per-agent value, where 0
+    // means "no turn timeout". This is the exact expression at the call site.
+    const turnTimeoutMs = (
+      configured: number | null | undefined,
+      policy: AdapterExecutionTargetTimeoutPolicy | null,
+    ) =>
+      Math.max(
+        0,
+        resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, configured, policy),
+      ) * 1_000;
+
+    const policy = { timeoutSec: 7_200, source: "instance_default" };
+    // The policy is the floor for an unconfigured agent, and the per-agent
+    // value still outranks it in both directions.
+    expect(turnTimeoutMs(undefined, policy)).toBe(7_200_000);
+    expect(turnTimeoutMs(0, policy)).toBe(7_200_000);
+    expect(turnTimeoutMs(900, policy)).toBe(900_000);
+    expect(turnTimeoutMs(-1, policy)).toBe(0);
+    // An opted-out policy and no policy at all both leave the native run
+    // without a turn timeout, exactly as before.
+    expect(turnTimeoutMs(0, { timeoutSec: -1, source: "env_default" })).toBe(0);
+    expect(turnTimeoutMs(0, null)).toBe(0);
   });
 });
 

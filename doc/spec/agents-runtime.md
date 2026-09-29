@@ -86,6 +86,11 @@ instead of N independent per-agent rows. Adopting it is a deliberate action:
 with no policy set, nothing changes for existing runs, and a negative value
 from either layer opts the whole deployment out.
 
+The Instance → General control offers "Use env default" (store `null`, inherit
+the env var or stay unlimited) and "No limit" (store `-1`, which beats the env
+layer). Storing `null` for "No limit" would leave the env value in force while
+the button claimed otherwise, so the opt-out is the negative value.
+
 The resolved source is always named in the run-start log and in the
 `Timed out after Ns` message, so a run can be attributed to the policy default
 or to an explicit per-agent value:

@@ -55,6 +55,7 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  resolveAdapterExecutionTargetTimeoutSec,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
@@ -24053,6 +24054,15 @@ export function heartbeatService(
         const runGoalControlRequestId = readNonEmptyString(
           context.goalControlRequestId,
         );
+        // Company/instance run-timeout default, resolved once and shared by
+        // both dispatch paths: a native run enforces it as the turn timeout and
+        // an adapter run receives it on the execution context. Read per run,
+        // because the setting is operator-editable and a stale cache would keep
+        // a removed wall clock in force.
+        const adapterTimeoutPolicy = await readAdapterRunTimeoutPolicy(
+          db,
+          runtimeEnv,
+        );
         try {
           if (nativeRuntimeResolution.kind === "native") {
             if (!nativeExecution || !nativeRunnerInstanceId)
@@ -24145,7 +24155,20 @@ export function heartbeatService(
                     db,
                     execution: nativeExecution,
                     conversationMode: isConversation(issueContext),
-                    turnTimeoutMs: Math.max(0, asNumber(runtimeConfig.timeoutSec, 0)) * 1_000,
+                    // Resolve the turn wall clock through the same chain the
+                    // legacy adapter path uses, so the company/instance policy
+                    // bounds native runs too. The clamp preserves today's
+                    // native behavior for an opted-out (negative) per-agent
+                    // value: 0 means "no turn timeout".
+                    turnTimeoutMs:
+                      Math.max(
+                        0,
+                        resolveAdapterExecutionTargetTimeoutSec(
+                          executionTarget,
+                          asNumber(runtimeConfig.timeoutSec, 0),
+                          adapterTimeoutPolicy,
+                        ),
+                      ) * 1_000,
                     runnerInstanceId: nativeRunnerInstanceId,
                     leaseOwner: runOptions.nativeLeaseOwner,
                     restartRecovery: runOptions.nativeRestartRecovery,
@@ -24343,12 +24366,8 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
-            // Company/instance run-timeout default handed to the adapter, so an
-            // agent that never set adapterConfig.timeoutSec inherits one policy
-            // value instead of running unbounded. Read per run: the setting is
-            // operator-editable and a stale cache would silently keep a removed
-            // wall clock (or miss a new one) in force.
-            const adapterTimeoutPolicy = await readAdapterRunTimeoutPolicy(db, runtimeEnv);
+            // adapterTimeoutPolicy was resolved above, before the dispatch
+            // branch, so the native and legacy paths cannot drift apart.
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {

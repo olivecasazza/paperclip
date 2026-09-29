@@ -8,6 +8,7 @@ vi.mock("../services/instance-settings.js", () => ({
 }));
 
 const { readAdapterRunTimeoutPolicy } = await import("../services/adapter-run-timeout.js");
+const { readAdapterRunTimeoutPolicyFromEnv } = await import("@paperclipai/adapter-utils");
 
 describe("readAdapterRunTimeoutPolicy", () => {
   beforeEach(() => {
@@ -51,5 +52,23 @@ describe("readAdapterRunTimeoutPolicy", () => {
     expect(
       await readAdapterRunTimeoutPolicy({} as never, { [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "900" }),
     ).toEqual({ timeoutSec: 900, source: "env_default" });
+  });
+
+  it("throws on a non-numeric env value so the host can refuse startup", async () => {
+    await expect(
+      readAdapterRunTimeoutPolicy({} as never, { [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "2h" }),
+    ).rejects.toThrow(ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY);
+  });
+});
+
+describe("readAdapterRunTimeoutPolicyFromEnv", () => {
+  it("returns the env layer, and throws on an unparseable value", () => {
+    expect(readAdapterRunTimeoutPolicyFromEnv({})).toBeNull();
+    expect(
+      readAdapterRunTimeoutPolicyFromEnv({ [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "-1" }),
+    ).toEqual({ timeoutSec: -1, source: "env_default" });
+    expect(() => readAdapterRunTimeoutPolicyFromEnv({ [ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY]: "soon" })).toThrow(
+      ADAPTER_RUN_TIMEOUT_SEC_ENV_KEY,
+    );
   });
 });
