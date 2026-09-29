@@ -108,7 +108,7 @@ json_agent_ids() {
 }
 
 json_issue_status() {
-  node -e 'const fs=require("fs"); const data=JSON.parse(fs.readFileSync(0,"utf8")); const issue=Array.isArray(data)?data[0]:data.items?.[0]??data.issue??data; if (issue&&issue.status) console.log(issue.status);'
+  node -e 'const fs=require("fs"); const want=process.argv[1]; const data=JSON.parse(fs.readFileSync(0,"utf8")); const items=Array.isArray(data)?data:data.items??[data.issue??data]; const issue=items.find((item)=>item&&String(item.identifier||"").toUpperCase()===want.toUpperCase()); if (issue&&issue.status) console.log(issue.status);' "$1"
 }
 
 unlinked_bytes() {
@@ -124,27 +124,38 @@ newest_mtime_epoch() {
 candidate_issue_identifier() {
   local checkout="$1" branch identifier
   branch="$(git -C "$checkout" branch --show-current 2>/dev/null || true)"
-  identifier="$(printf '%s\n%s\n' "$(basename "$checkout")" "$branch" | sed -nE 's/.*\b([A-Za-z]+-[0-9]+)\b.*/\U\1/p' | head -1)"
+  identifier="$(printf '%s\n' "$branch" | sed -nE 's/.*\b([A-Za-z]+-[0-9]+)\b.*/\U\1/p' | head -1)"
   [ -n "$identifier" ] && printf '%s\n' "$identifier"
 }
 
 issue_is_terminal() {
   local identifier="$1" status
   [ -n "$identifier" ] || return 1
-  status="$(api_get "/companies/$COMPANY_ID/issues?search=$identifier&limit=10" 2>/dev/null | json_issue_status 2>/dev/null || true)"
+  status="$(api_get "/companies/$COMPANY_ID/issues?q=$identifier&limit=10" 2>/dev/null | json_issue_status "$identifier" 2>/dev/null || true)"
   [ "$status" = "done" ] || [ "$status" = "cancelled" ]
 }
 
+contained_realpath() {
+  local base="$1" target="$2" base_real target_real
+  base_real="$(realpath -e -- "$base" 2>/dev/null)" || return 1
+  target_real="$(realpath -e -- "$target" 2>/dev/null)" || return 1
+  case "$target_real" in
+    "$base_real"/*) printf '%s\n' "$target_real" ;;
+    *) return 1 ;;
+  esac
+}
+
 workspace_reclaim_candidates() {
-  local agents_json agent_id workspace checkout rel p identifier newest cutoff tracked
+  local agents_json agent_id workspace checkout rel p p_real identifier newest cutoff tracked
   [ -d "$WORKSPACES_DIR" ] || return 0
   agents_json="$(api_get "/companies/$COMPANY_ID/agents" 2>/dev/null)" || return 0
   cutoff=$(( $(date +%s) - WORKSPACE_RECLAIM_MIN_AGE_HOURS * 3600 ))
   while IFS= read -r agent_id; do
     workspace="$WORKSPACES_DIR/$agent_id"
     [ -d "$workspace" ] || continue
-    for checkout in "$workspace"/*; do
-      [ -d "$checkout/.git" ] || continue
+    for checkout in "$workspace"/* "$workspace"/*/.paperclip/worktrees/*; do
+      [ -e "$checkout" ] || continue
+      [ -d "$checkout/.git" ] || [ -f "$checkout/.git" ] || continue
       identifier="$(candidate_issue_identifier "$checkout")"
       if ! issue_is_terminal "$identifier"; then
         for rel in client/target target node_modules; do
@@ -155,6 +166,14 @@ workspace_reclaim_candidates() {
       for rel in client/target target node_modules; do
         p="$checkout/$rel"
         [ -e "$p" ] || continue
+        if [ -L "$p" ]; then
+          log "skip  $p (candidate is a symlink)"
+          continue
+        fi
+        p_real="$(contained_realpath "$workspace" "$p")" || {
+          log "skip  $p (outside rostered workspace)"
+          continue
+        }
         if ! git -C "$checkout" check-ignore -q -- "$rel"; then
           log "skip  $p (not gitignored)"
           continue
@@ -169,7 +188,7 @@ workspace_reclaim_candidates() {
           log "skip  $p (newest mtime under ${WORKSPACE_RECLAIM_MIN_AGE_HOURS}h)"
           continue
         fi
-        printf '%s\n' "$p"
+        printf '%s\n' "$p_real"
       done
     done
   done <<<"$(printf '%s' "$agents_json" | json_agent_ids)"
@@ -240,7 +259,7 @@ report() {
 
 prune() {
   local before after p freed total=0
-  local lvl rc
+  local lvl="" rc report_output
   local workspace_candidates=()
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
@@ -255,15 +274,19 @@ prune() {
   # Only rc=1 counts as a measurement failure. report() also returns 2 (warn)
   # and 3 (critical) for successful measurements, so test the code exactly
   # rather than treating any non-zero status as an error.
-  report >/dev/null 2>&1
+  report_output="$(report 2>/dev/null)"
   rc=$?
   if [ "$rc" -eq 1 ]; then
     printf 'prune_skipped=measurement_failed\n'
     return 1
   fi
-  lvl="$(awk -F= '/^level=/{print $2; exit}' "$STATUS_FILE" 2>/dev/null)"
+  case "$rc" in
+    2) lvl="warn" ;;
+    3) lvl="critical" ;;
+    *) lvl="ok" ;;
+  esac
   if [ "$lvl" != "warn" ] && [ "$lvl" != "critical" ] && [ "${DISK_GUARD_FORCE:-0}" != "1" ]; then
-    printf 'prune_skipped=level_%s\n' "${lvl:-unknown}"
+    printf 'prune_skipped=level_%s\n' "$lvl"
     return 0
   fi
 
@@ -288,6 +311,10 @@ prune() {
   for p in "${workspace_candidates[@]}"; do
     [ -e "$p" ] || continue
     freed="$(unlinked_bytes "$p")"
+    if [ "$freed" -lt 1048576 ]; then
+      log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
+      continue
+    fi
     remove_path "$p"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
     total=$(( total + freed ))

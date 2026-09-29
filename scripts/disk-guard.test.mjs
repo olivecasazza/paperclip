@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,7 +80,7 @@ function exists(sandbox, relPath) {
   return existsSync(path.join(sandbox.mount, relPath));
 }
 
-function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" } } = {}) {
+function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" }, ignoreQuery = false } = {}) {
   const stub = path.join(sandbox.binDir, "paperclip-api-stub.mjs");
   const body = [
     "#!/usr/bin/env node",
@@ -88,8 +88,10 @@ function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DE
     `const issues = ${JSON.stringify(issues)};`,
     "const requestPath = process.argv[2] || '';",
     "if (requestPath.includes('/agents')) { console.log(JSON.stringify(roster.map((id) => ({ id })))); process.exit(0); }",
-    "const match = requestPath.match(/search=([^&]+)/);",
+    `const ignoreQuery = ${JSON.stringify(ignoreQuery)};`,
+    "const match = requestPath.match(/[?&]q=([^&]+)/);",
     "const identifier = match ? decodeURIComponent(match[1]) : '';",
+    "if (ignoreQuery) { console.log(JSON.stringify({ items: [{ identifier: 'DEF-999', status: 'done' }] })); process.exit(0); }",
     "const status = issues[identifier] || 'todo';",
     "console.log(JSON.stringify({ items: [{ identifier, status }] }));",
     "",
@@ -99,11 +101,27 @@ function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DE
   return stub;
 }
 
-function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "def-1", issue = "DEF-1", rel = "client/target", ignored = true, tracked = false, fresh = false } = {}) {
-  const checkout = path.join(sandbox.mount, "instances/default/workspaces", agentId, checkoutName);
-  mkdirSync(checkout, { recursive: true });
-  spawnSync("git", ["init", "-q"], { cwd: checkout });
-  spawnSync("git", ["checkout", "-b", issue.toLowerCase()], { cwd: checkout });
+function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "repo", issue = "DEF-1", rel = "client/target", ignored = true, tracked = false, fresh = false, worktree = false } = {}) {
+  const workspace = path.join(sandbox.mount, "instances/default/workspaces", agentId);
+  const checkout = worktree
+    ? path.join(workspace, "repo", ".paperclip", "worktrees", checkoutName)
+    : path.join(workspace, checkoutName);
+  if (worktree) {
+    const base = path.join(workspace, "repo");
+    mkdirSync(base, { recursive: true });
+    spawnSync("git", ["init", "-q"], { cwd: base });
+    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: base });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: base });
+    writeFileSync(path.join(base, "README.md"), "test\n");
+    spawnSync("git", ["add", "README.md"], { cwd: base });
+    spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: base });
+    mkdirSync(path.dirname(checkout), { recursive: true });
+    spawnSync("git", ["worktree", "add", "-q", "-b", issue.toLowerCase(), checkout, "HEAD"], { cwd: base });
+  } else {
+    mkdirSync(checkout, { recursive: true });
+    spawnSync("git", ["init", "-q"], { cwd: checkout });
+    spawnSync("git", ["checkout", "-b", issue.toLowerCase()], { cwd: checkout });
+  }
   if (ignored) writeFileSync(path.join(checkout, ".gitignore"), `${rel}\n`);
   const full = path.join(checkout, rel, "blob");
   mkdirSync(path.dirname(full), { recursive: true });
@@ -374,12 +392,12 @@ test("workspace scope: closed issue build output is pruned and failing gates sur
       roster: ["agent-1"],
       issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done", "DEF-6": "done" },
     });
-    const closed = seedWorkspaceCheckout(sandbox, { checkoutName: "def-1", issue: "DEF-1" });
-    const open = seedWorkspaceCheckout(sandbox, { checkoutName: "def-2", issue: "DEF-2" });
-    const tracked = seedWorkspaceCheckout(sandbox, { checkoutName: "def-3", issue: "DEF-3", tracked: true });
-    const notIgnored = seedWorkspaceCheckout(sandbox, { checkoutName: "def-4", issue: "DEF-4", ignored: false });
-    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "def-5", issue: "DEF-5", fresh: true });
-    const outsider = seedWorkspaceCheckout(sandbox, { agentId: "agent-2", checkoutName: "def-6", issue: "DEF-6" });
+    const closed = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-1", issue: "DEF-1" });
+    const open = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-2", issue: "DEF-2" });
+    const tracked = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-3", issue: "DEF-3", tracked: true });
+    const notIgnored = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-4", issue: "DEF-4", ignored: false });
+    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-5", issue: "DEF-5", fresh: true });
+    const outsider = seedWorkspaceCheckout(sandbox, { agentId: "agent-2", checkoutName: "repo-6", issue: "DEF-6" });
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
@@ -389,6 +407,74 @@ test("workspace scope: closed issue build output is pruned and failing gates sur
     assert.ok(existsSync(notIgnored.full), "non-gitignored build output must survive");
     assert.ok(existsSync(fresh.full), "fresh build output must survive");
     assert.ok(existsSync(outsider.full), "workspace outside the company roster must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("workspace scope: ignored issue filters and rejects mismatched issue identifiers", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], ignoreQuery: true });
+    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "repo", issue: "DEF-7" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(checkout.full), "mismatched API results must not authorize deletion");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("workspace scope: linked worktrees with .git files are scanned", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-8": "done" } });
+    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "linked", issue: "DEF-8", worktree: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(checkout.full), "linked worktree build output must be pruned when all gates pass");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("workspace scope: directory names and symlinks do not authorize deletion", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-9": "done", "DEF-10": "done" } });
+    const branchOnly = seedWorkspaceCheckout(sandbox, { checkoutName: "def-9", issue: "feature-open" });
+    const symlinkCheckout = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-symlink", issue: "DEF-10" });
+    const outside = path.join(sandbox.mount, "outside");
+    mkdirSync(outside);
+    rmSync(path.dirname(symlinkCheckout.full), { recursive: true, force: true });
+    symlinkSync(outside, path.dirname(symlinkCheckout.full));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(branchOnly.full), "checkout directory names must not determine issue ownership");
+    assert.ok(existsSync(path.dirname(symlinkCheckout.full)), "symlinked candidates must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("prune gates on this invocation's measured level instead of stale status", () => {
+  const sandbox = makeSandbox();
+  try {
+    mkdirSync(path.dirname(sandbox.statusFile), { recursive: true });
+    writeFileSync(sandbox.statusFile, "level=critical\n");
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const cacheBlob = seed(sandbox, ".cache/node/blob", 3 * MIB);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "99" });
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /prune_skipped=level_ok/);
+    assert.ok(existsSync(cacheBlob), "stale critical status must not authorize pruning");
   } finally {
     sandbox.cleanup();
   }
