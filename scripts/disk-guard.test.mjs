@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,6 +61,8 @@ function run(sandbox, args, env = {}) {
       PATH: `${sandbox.binDir}:${process.env.PATH}`,
       DISK_GUARD_MOUNT: sandbox.mount,
       DISK_GUARD_STATUS_FILE: sandbox.statusFile,
+      DISK_GUARD_COMPANY_ID: "company-1",
+      DISK_GUARD_WORKSPACES_DIR: path.join(sandbox.mount, "instances/default/workspaces"),
       ...env,
     },
   });
@@ -76,6 +78,46 @@ function seed(sandbox, relPath, sizeBytes) {
 
 function exists(sandbox, relPath) {
   return existsSync(path.join(sandbox.mount, relPath));
+}
+
+function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" } } = {}) {
+  const stub = path.join(sandbox.binDir, "paperclip-api-stub.mjs");
+  const body = [
+    "#!/usr/bin/env node",
+    `const roster = ${JSON.stringify(roster)};`,
+    `const issues = ${JSON.stringify(issues)};`,
+    "const requestPath = process.argv[2] || '';",
+    "if (requestPath.includes('/agents')) { console.log(JSON.stringify(roster.map((id) => ({ id })))); process.exit(0); }",
+    "const match = requestPath.match(/search=([^&]+)/);",
+    "const identifier = match ? decodeURIComponent(match[1]) : '';",
+    "const status = issues[identifier] || 'todo';",
+    "console.log(JSON.stringify({ items: [{ identifier, status }] }));",
+    "",
+  ].join("\n");
+  writeFileSync(stub, body);
+  chmodSync(stub, 0o755);
+  return stub;
+}
+
+function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "def-1", issue = "DEF-1", rel = "client/target", ignored = true, tracked = false, fresh = false } = {}) {
+  const checkout = path.join(sandbox.mount, "instances/default/workspaces", agentId, checkoutName);
+  mkdirSync(checkout, { recursive: true });
+  spawnSync("git", ["init", "-q"], { cwd: checkout });
+  spawnSync("git", ["checkout", "-b", issue.toLowerCase()], { cwd: checkout });
+  if (ignored) writeFileSync(path.join(checkout, ".gitignore"), `${rel}\n`);
+  const full = path.join(checkout, rel, "blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  if (tracked) {
+    spawnSync("git", ["add", "-f", path.join(rel, "blob")], { cwd: checkout });
+  }
+  if (!fresh) {
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(checkout, rel), old, old);
+  }
+  return { checkout, full };
 }
 
 /** Total bytes of file content under `dir`, used to assert prune freed nothing. */
@@ -319,6 +361,34 @@ test("prune is a no-op at level=ok: nothing is deleted and exactly 0 bytes are f
     assert.equal(treeBytes(sandbox.mount) - bytesBefore, 0, "prune must free exactly 0 bytes at level=ok");
     assert.ok(existsSync(cacheBlob), "cache must be untouched when there is no pressure");
     assert.ok(existsSync(logBlob), "logs must be untouched when there is no pressure");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("workspace scope: closed issue build output is pruned and failing gates survive", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done", "DEF-6": "done" },
+    });
+    const closed = seedWorkspaceCheckout(sandbox, { checkoutName: "def-1", issue: "DEF-1" });
+    const open = seedWorkspaceCheckout(sandbox, { checkoutName: "def-2", issue: "DEF-2" });
+    const tracked = seedWorkspaceCheckout(sandbox, { checkoutName: "def-3", issue: "DEF-3", tracked: true });
+    const notIgnored = seedWorkspaceCheckout(sandbox, { checkoutName: "def-4", issue: "DEF-4", ignored: false });
+    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "def-5", issue: "DEF-5", fresh: true });
+    const outsider = seedWorkspaceCheckout(sandbox, { agentId: "agent-2", checkoutName: "def-6", issue: "DEF-6" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(closed.full), "closed issue build output in a roster workspace must be pruned");
+    assert.ok(existsSync(open.full), "open issue build output must survive");
+    assert.ok(existsSync(tracked.full), "tracked build output must survive");
+    assert.ok(existsSync(notIgnored.full), "non-gitignored build output must survive");
+    assert.ok(existsSync(fresh.full), "fresh build output must survive");
+    assert.ok(existsSync(outsider.full), "workspace outside the company roster must survive");
   } finally {
     sandbox.cleanup();
   }

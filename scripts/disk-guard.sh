@@ -55,6 +55,10 @@ WARN_PCT="${DISK_GUARD_WARN_PCT:-88}"
 CRIT_PCT="${DISK_GUARD_CRIT_PCT:-94}"
 MIN_FREE_MB="${DISK_GUARD_MIN_FREE_MB:-1500}"
 STATUS_FILE="${DISK_GUARD_STATUS_FILE:-/paperclip/run/disk-guard.status}"
+COMPANY_ID="${DISK_GUARD_COMPANY_ID:-${PAPERCLIP_COMPANY_ID:-eb60b98c-bc6c-4796-9c36-63fcd13ed083}}"
+API_URL="${PAPERCLIP_API_URL:-http://127.0.0.1:3100}"
+WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces}"
+WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
 
 mode="${1:---check}"
 
@@ -77,10 +81,98 @@ log_dirs=(
 
 log() { printf '%s\n' "$*" >&2; }
 
+remove_path() {
+  local p="$1"
+  if [ "${DISK_GUARD_DRY_RUN:-0}" = "1" ]; then
+    log "dry-run rm -rf $p"
+    return 0
+  fi
+  rm -rf -- "$p" 2>/dev/null
+}
+
+api_get() {
+  local path="$1"
+  if [ -n "${DISK_GUARD_API_STUB:-}" ]; then
+    "$DISK_GUARD_API_STUB" "$path"
+    return $?
+  fi
+  [ -n "${PAPERCLIP_API_KEY:-}" ] || return 1
+  curl -fsS \
+    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    -H "X-Paperclip-Run-Id: ${PAPERCLIP_RUN_ID:-disk-guard}" \
+    "${API_URL%/}/api$path"
+}
+
+json_agent_ids() {
+  node -e 'const fs=require("fs"); const data=JSON.parse(fs.readFileSync(0,"utf8")); for (const a of (Array.isArray(data)?data:data.items??[])) if (a&&a.id) console.log(a.id);'
+}
+
+json_issue_status() {
+  node -e 'const fs=require("fs"); const data=JSON.parse(fs.readFileSync(0,"utf8")); const issue=Array.isArray(data)?data[0]:data.items?.[0]??data.issue??data; if (issue&&issue.status) console.log(issue.status);'
+}
+
 unlinked_bytes() {
   # Bytes held by inodes with nlink==1 under $1. This is the only figure that
   # predicts space actually returned to the filesystem.
   find "$1" -xdev -type f -links 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
+}
+
+newest_mtime_epoch() {
+  find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
+}
+
+candidate_issue_identifier() {
+  local checkout="$1" branch identifier
+  branch="$(git -C "$checkout" branch --show-current 2>/dev/null || true)"
+  identifier="$(printf '%s\n%s\n' "$(basename "$checkout")" "$branch" | sed -nE 's/.*\b([A-Za-z]+-[0-9]+)\b.*/\U\1/p' | head -1)"
+  [ -n "$identifier" ] && printf '%s\n' "$identifier"
+}
+
+issue_is_terminal() {
+  local identifier="$1" status
+  [ -n "$identifier" ] || return 1
+  status="$(api_get "/companies/$COMPANY_ID/issues?search=$identifier&limit=10" 2>/dev/null | json_issue_status 2>/dev/null || true)"
+  [ "$status" = "done" ] || [ "$status" = "cancelled" ]
+}
+
+workspace_reclaim_candidates() {
+  local agents_json agent_id workspace checkout rel p identifier newest cutoff tracked
+  [ -d "$WORKSPACES_DIR" ] || return 0
+  agents_json="$(api_get "/companies/$COMPANY_ID/agents" 2>/dev/null)" || return 0
+  cutoff=$(( $(date +%s) - WORKSPACE_RECLAIM_MIN_AGE_HOURS * 3600 ))
+  while IFS= read -r agent_id; do
+    workspace="$WORKSPACES_DIR/$agent_id"
+    [ -d "$workspace" ] || continue
+    for checkout in "$workspace"/*; do
+      [ -d "$checkout/.git" ] || continue
+      identifier="$(candidate_issue_identifier "$checkout")"
+      if ! issue_is_terminal "$identifier"; then
+        for rel in client/target target node_modules; do
+          [ -e "$checkout/$rel" ] && log "skip  $checkout/$rel (issue ${identifier:-unknown} is not terminal)"
+        done
+        continue
+      fi
+      for rel in client/target target node_modules; do
+        p="$checkout/$rel"
+        [ -e "$p" ] || continue
+        if ! git -C "$checkout" check-ignore -q -- "$rel"; then
+          log "skip  $p (not gitignored)"
+          continue
+        fi
+        tracked="$(git -C "$checkout" ls-files -- "$rel" 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "${tracked:-0}" -ne 0 ]; then
+          log "skip  $p (contains tracked files)"
+          continue
+        fi
+        newest="$(newest_mtime_epoch "$p")"
+        if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+          log "skip  $p (newest mtime under ${WORKSPACE_RECLAIM_MIN_AGE_HOURS}h)"
+          continue
+        fi
+        printf '%s\n' "$p"
+      done
+    done
+  done <<<"$(printf '%s' "$agents_json" | json_agent_ids)"
 }
 
 measure() {
@@ -140,7 +232,7 @@ report() {
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
     printf 'level=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\n' \
       "$level" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB"
-    printf 'guard_version=2\n'
+    printf 'guard_version=3\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -149,6 +241,7 @@ report() {
 prune() {
   local before after p freed total=0
   local lvl rc
+  local workspace_candidates=()
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
   # "because the routine ran" costs a slow re-download for no gain. Only prune
@@ -184,8 +277,19 @@ prune() {
       log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
       continue
     fi
-    rm -rf -- "$p" 2>/dev/null
+    remove_path "$p"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable)"
+    total=$(( total + freed ))
+  done
+
+  while IFS= read -r p; do
+    [ -n "$p" ] && workspace_candidates+=("$p")
+  done <<<"$(workspace_reclaim_candidates)"
+  for p in "${workspace_candidates[@]}"; do
+    [ -e "$p" ] || continue
+    freed="$(unlinked_bytes "$p")"
+    remove_path "$p"
+    log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
     total=$(( total + freed ))
   done
 
