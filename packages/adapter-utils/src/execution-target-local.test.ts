@@ -188,7 +188,10 @@ describe("resolveAdapterExecutionTargetTimeout for local and SSH targets", () =>
         resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, configured, policy),
       ) * 1_000;
 
-    const policy = { timeoutSec: 7_200, source: "instance_default" };
+    const policy: AdapterExecutionTargetTimeoutPolicy = {
+      timeoutSec: 7_200,
+      source: "instance_default",
+    };
     // The policy is the floor for an unconfigured agent, and the per-agent
     // value still outranks it in both directions.
     expect(turnTimeoutMs(undefined, policy)).toBe(7_200_000);
