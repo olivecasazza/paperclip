@@ -1513,6 +1513,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceBaseline?: DirectorySnapshot;
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
   workspaceExclude?: string[];
+  /** Plain persistent directories include all files, independent of Git and task cache exclusions. */
+  workspaceFileMode?: "all";
   preserveAbsentOnRestore?: string[];
   assets?: AdapterManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage into the sandbox as plain, read-only trees. */
@@ -1554,6 +1556,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       workspaceLocalDir: input.workspaceLocalDir,
       workspaceRemoteDir: input.workspaceRemoteDir,
       syncWorkspace: input.syncWorkspace,
+      workspaceFileMode: input.workspaceFileMode,
+      workspaceExclude: input.workspaceExclude,
       assets: input.assets,
       additionalSources: input.additionalSources,
       onProgress: input.onProgress,
@@ -1593,6 +1597,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     workspaceBaseline: input.workspaceBaseline,
     workspaceGitSnapshot: input.workspaceGitSnapshot,
     workspaceExclude: input.workspaceExclude,
+    workspaceFileMode: input.workspaceFileMode,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
     assets: input.assets,
     additionalSources: input.additionalSources,

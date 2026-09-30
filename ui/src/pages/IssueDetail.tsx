@@ -1,3 +1,4 @@
+import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
@@ -2905,6 +2906,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     requestId: number;
     handled?: boolean;
   } | null>(null);
+  const [openAttachment, setOpenAttachment] = useState<{ issueId: string; id: string; title: string; requestId: number } | null>(null);
   const [openSkill, setOpenSkill] = useState<{ id: string; name: string } | null>(null);
   const handleSkillOpened = useCallback((skillId: string) => {
     setOpenSkill((current) => current?.id === skillId ? null : current);
@@ -3602,6 +3604,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     setPanelVisible(true);
   }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
+  const handleAttachmentOpened = useCallback(() => setOpenAttachment(null), []);
+  const handleOpenTextAttachment = useCallback((id: string, title: string) => {
+    if (!issue?.id) return;
+    setOpenAttachment({ issueId: issue.id, id, title, requestId: Date.now() });
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [issue?.id, openTaskSidePanel, isMobile]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },
@@ -5672,6 +5681,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       checkingMonitorNow: checkIssueMonitorNow.isPending,
       documentDeepLink:
         documentDeepLink?.issueId === panelIssue.id ? documentDeepLink : null,
+      onAttachmentOpened: handleAttachmentOpened,
+      openAttachment: !isMobile && openAttachment?.issueId === panelIssue.id ? openAttachment : null,
       openSkillId: openSkill?.id ?? null,
       openSkillName: openSkill?.name ?? null,
       onSkillOpened: handleSkillOpened,
@@ -5709,6 +5720,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     issuePanelKey,
     openNewSubIssue,
     openPanel,
+    openAttachment,
+    handleAttachmentOpened,
     openSkill,
     handleSkillOpened,
     panelChildIssues,
@@ -7411,7 +7424,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   return (
     <FileViewerProvider issueId={conversation && !conversation.issue ? "" : issue.id} enabled={fileViewerEnabled}>
-      <IssueGalleryContext.Provider value={openIssueGallery}>
+      <TextAttachmentContext.Provider value={taskChatShellEnabled ? handleOpenTextAttachment : null}><IssueGalleryContext.Provider value={openIssueGallery}>
         <div
           data-task-chat-shell={taskChatShellEnabled ? "" : undefined}
           className={
@@ -8200,6 +8213,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     artifactsOpenRequestId={isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === issue.id
                       ? artifactsOpenRequest.requestId : undefined}
                     onArtifactsOpened={handleArtifactsOpened}
+                    onAttachmentOpened={handleAttachmentOpened}
+                    openAttachment={openAttachment?.issueId === issue.id ? openAttachment : null}
                     openSkillId={openSkill?.id ?? null}
                     openSkillName={openSkill?.name ?? null}
                     onSkillOpened={handleSkillOpened}
@@ -8279,7 +8294,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           ) : null}
           <ScrollToBottom />
         </div>
-      </IssueGalleryContext.Provider>
+      </IssueGalleryContext.Provider></TextAttachmentContext.Provider>
     </FileViewerProvider>
   );
 }

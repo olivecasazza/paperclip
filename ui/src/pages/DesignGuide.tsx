@@ -1,5 +1,6 @@
 import { DispositionRecoveryNotice } from "../components/DispositionRecoveryNotice";
 import { CloudSignIn } from "../components/CloudSignIn";
+import { CloudAccessError } from "../components/CloudAccessGate";
 import { SetupPrompt } from "./apps/chat/SetupPrompt";
 import { MediaArtifactCard } from "@/components/artifacts/MediaArtifactCard";
 import { WebhookUrlWarning } from "@/components/routine-triggers/WebhookUrlWarning";
@@ -7,6 +8,7 @@ import { SetupWizardNavigation, SetupWizardFooter } from "../components/SetupWiz
 import { RemoteMcpDesignExample } from "@/features/connections/remote-mcp/RemoteMcpDesignExample";
 import { AgentChatPicker } from "@/components/AgentChatPicker";
 import { TaskChatProjectCreatedCard } from "@/components/task-chat/TaskChatProjectCreatedCard";
+import { TextAttachmentPreview } from "@/components/task-side-panel/TaskAttachmentPanel";
 import { AnnouncementCard } from "@/components/AnnouncementCard";
 import { announcementPreview, announcementAnimationPreview, announcementAnimationPreviewSrc } from "@/lib/announcement-preview";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -2372,6 +2374,26 @@ export function DesignGuide() {
             Compact variant for embedding inside dialogs and modals.
           </InlineBanner>
         </div>
+      </Section>
+
+      <Section title="Text attachment tabs">
+        <p className="text-sm text-muted-foreground">Uploaded text opens in a named task tab. Markdown offers Rendered and Raw icon controls; every text file has a download action.</p>
+        <div className="grid gap-4 md:grid-cols-2">
+          <TextAttachmentPreview title="README.md" text={"# Project notes\n\nReview the **original** file."} markdown downloadUrl="data:text/markdown,%23%20Project%20notes" />
+          <TextAttachmentPreview title="notes.txt" text="Plain text stays literal: <example>" markdown={false} downloadUrl="data:text/plain,Plain%20text" />
+        </div>
+      </Section>
+
+      <Section title="Connection recovery">
+        <SubSection title="Waiting for server">
+          <CloudAccessError temporary retrying={false} onRetry={() => undefined} />
+        </SubSection>
+        <SubSection title="Checking connection">
+          <CloudAccessError temporary retrying onRetry={() => undefined} />
+        </SubSection>
+        <SubSection title="Access check failed">
+          <CloudAccessError temporary={false} retrying={false} onRetry={() => undefined} />
+        </SubSection>
       </Section>
 
       <Section title="Media artifacts">
