@@ -60,6 +60,10 @@ WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces
 WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
 CARGO_TARGET_SHARED_DIR="${DISK_GUARD_CARGO_TARGET_SHARED_DIR:-$MOUNT/cargo-target-shared}"
 CARGO_TARGET_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_CARGO_TARGET_RECLAIM_MIN_AGE_HOURS:-24}"
+# In-band ownership marker each shared cargo target dir must carry to be
+# reclaimable. The dir name alone is a human-typed label, not proof of who owns
+# the build output inside it.
+CARGO_TARGET_OWNER_MARKER="${DISK_GUARD_CARGO_TARGET_OWNER_MARKER:-.paperclip-owner}"
 
 mode="${1:---check}"
 
@@ -89,14 +93,21 @@ log() { printf '%s\n' "$*" >&2; }
 # 403, and silently reclaimed nothing while still reporting a healthy level.
 # A missing company id must be a loud configuration error, never a silent
 # wrong-tenant lookup that degrades to "no reclaim" invisibly.
-if [ -n "${DISK_GUARD_COMPANY_ID:-}" ]; then
-  COMPANY_ID="$DISK_GUARD_COMPANY_ID"
-elif [ -n "${PAPERCLIP_COMPANY_ID:-}" ]; then
-  COMPANY_ID="$PAPERCLIP_COMPANY_ID"
-else
-  log "no company id: set DISK_GUARD_COMPANY_ID or PAPERCLIP_COMPANY_ID"
-  exit 1
-fi
+#
+# Only --prune consults the issue API. --check and --status are the monitoring
+# surface and must keep working with no company id at all: a guard that cannot
+# measure pressure is worse than one that cannot reclaim, because the failure
+# is invisible until the volume is already full.
+require_company_id() {
+  if [ -n "${DISK_GUARD_COMPANY_ID:-}" ]; then
+    COMPANY_ID="$DISK_GUARD_COMPANY_ID"
+  elif [ -n "${PAPERCLIP_COMPANY_ID:-}" ]; then
+    COMPANY_ID="$PAPERCLIP_COMPANY_ID"
+  else
+    log "no company id: set DISK_GUARD_COMPANY_ID or PAPERCLIP_COMPANY_ID"
+    exit 1
+  fi
+}
 
 remove_path() {
   local p="$1"
@@ -212,7 +223,7 @@ workspace_reclaim_candidates() {
 }
 
 cargo_target_reclaim_candidates() {
-  local p p_real name identifier newest cutoff
+  local p p_real name identifier marked newest cutoff
   [ -d "$CARGO_TARGET_SHARED_DIR" ] || return 0
   cutoff=$(( $(date +%s) - CARGO_TARGET_RECLAIM_MIN_AGE_HOURS * 3600 ))
   for p in "$CARGO_TARGET_SHARED_DIR"/*; do
@@ -222,6 +233,23 @@ cargo_target_reclaim_candidates() {
     identifier="$(printf '%s\n' "$name" | sed -nE 's/^([A-Za-z]+)-([0-9]+)$/\U\1-\2/p')"
     if [ -z "$identifier" ]; then
       log "skip  $p (not a per-issue target dir)"
+      continue
+    fi
+    # A directory name is a label a person or agent typed, not evidence of who
+    # owns the build output inside it. `def-190/` can hold another issue's
+    # artifacts, and this volume already holds `def-129-base/` and
+    # `def-129-cold/` beside `def-129/`. Deleting on the name alone removes
+    # output the name does not describe, so require an in-band marker written by
+    # whoever populated the directory and require it to agree with the name. A
+    # dir with no marker is skipped: fail closed, and leave the space for a
+    # human to attribute.
+    if [ ! -f "$p/$CARGO_TARGET_OWNER_MARKER" ] || [ -L "$p/$CARGO_TARGET_OWNER_MARKER" ]; then
+      log "skip  $p (no $CARGO_TARGET_OWNER_MARKER ownership marker)"
+      continue
+    fi
+    marked="$(tr -d '[:space:]' <"$p/$CARGO_TARGET_OWNER_MARKER" 2>/dev/null || true)"
+    if [ "$(printf '%s\n' "$marked" | tr '[:lower:]' '[:upper:]')" != "$identifier" ]; then
+      log "skip  $p (marker says '${marked:-<empty>}', dir says '$identifier')"
       continue
     fi
     if ! issue_is_terminal "$identifier"; then
@@ -309,6 +337,9 @@ prune() {
   local lvl="" rc report_output
   local workspace_candidates=()
   local cargo_target_candidates=()
+  # Everything below this point consults the issue API, so the company id must
+  # resolve before any reclaim work starts.
+  require_company_id
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
   # "because the routine ran" costs a slow re-download for no gain. Only prune
