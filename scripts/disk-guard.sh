@@ -55,10 +55,11 @@ WARN_PCT="${DISK_GUARD_WARN_PCT:-88}"
 CRIT_PCT="${DISK_GUARD_CRIT_PCT:-94}"
 MIN_FREE_MB="${DISK_GUARD_MIN_FREE_MB:-1500}"
 STATUS_FILE="${DISK_GUARD_STATUS_FILE:-/paperclip/run/disk-guard.status}"
-COMPANY_ID="${DISK_GUARD_COMPANY_ID:-${PAPERCLIP_COMPANY_ID:-eb60b98c-bc6c-4796-9c36-63fcd13ed083}}"
 API_URL="${PAPERCLIP_API_URL:-http://127.0.0.1:3100}"
 WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces}"
 WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
+CARGO_TARGET_SHARED_DIR="${DISK_GUARD_CARGO_TARGET_SHARED_DIR:-$MOUNT/cargo-target-shared}"
+CARGO_TARGET_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_CARGO_TARGET_RECLAIM_MIN_AGE_HOURS:-24}"
 
 mode="${1:---check}"
 
@@ -80,6 +81,22 @@ log_dirs=(
 )
 
 log() { printf '%s\n' "$*" >&2; }
+
+# Company whose issue API decides terminality. There is deliberately NO
+# hardcoded fallback here. This guard previously fell back to a *different*
+# company's id, so any invocation without PAPERCLIP_COMPANY_ID in the
+# environment (cron, systemd, a bare shell) queried the wrong tenant, got a
+# 403, and silently reclaimed nothing while still reporting a healthy level.
+# A missing company id must be a loud configuration error, never a silent
+# wrong-tenant lookup that degrades to "no reclaim" invisibly.
+if [ -n "${DISK_GUARD_COMPANY_ID:-}" ]; then
+  COMPANY_ID="$DISK_GUARD_COMPANY_ID"
+elif [ -n "${PAPERCLIP_COMPANY_ID:-}" ]; then
+  COMPANY_ID="$PAPERCLIP_COMPANY_ID"
+else
+  log "no company id: set DISK_GUARD_COMPANY_ID or PAPERCLIP_COMPANY_ID"
+  exit 1
+fi
 
 remove_path() {
   local p="$1"
@@ -194,6 +211,36 @@ workspace_reclaim_candidates() {
   done <<<"$(printf '%s' "$agents_json" | json_agent_ids)"
 }
 
+cargo_target_reclaim_candidates() {
+  local p p_real name identifier newest cutoff
+  [ -d "$CARGO_TARGET_SHARED_DIR" ] || return 0
+  cutoff=$(( $(date +%s) - CARGO_TARGET_RECLAIM_MIN_AGE_HOURS * 3600 ))
+  for p in "$CARGO_TARGET_SHARED_DIR"/*; do
+    [ -d "$p" ] || continue
+    [ ! -L "$p" ] || { log "skip  $p (candidate is a symlink)"; continue; }
+    name="$(basename -- "$p")"
+    identifier="$(printf '%s\n' "$name" | sed -nE 's/^([A-Za-z]+)-([0-9]+)$/\U\1-\2/p')"
+    if [ -z "$identifier" ]; then
+      log "skip  $p (not a per-issue target dir)"
+      continue
+    fi
+    if ! issue_is_terminal "$identifier"; then
+      log "skip  $p (issue $identifier is not terminal)"
+      continue
+    fi
+    p_real="$(contained_realpath "$CARGO_TARGET_SHARED_DIR" "$p")" || {
+      log "skip  $p (outside cargo-target-shared)"
+      continue
+    }
+    newest="$(newest_mtime_epoch "$p")"
+    if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+      log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
+      continue
+    fi
+    printf '%s\n' "$p_real"
+  done
+}
+
 measure() {
   # df -P columns: 1=filesystem 2=size 3=used 4=avail 5=capacity 6=mount
   # Use awk so column positions and the percentage are explicit rather than
@@ -261,6 +308,7 @@ prune() {
   local before after p freed total=0
   local lvl="" rc report_output
   local workspace_candidates=()
+  local cargo_target_candidates=()
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
   # "because the routine ran" costs a slow re-download for no gain. Only prune
@@ -317,6 +365,21 @@ prune() {
     fi
     remove_path "$p"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
+    total=$(( total + freed ))
+  done
+
+  while IFS= read -r p; do
+    [ -n "$p" ] && cargo_target_candidates+=("$p")
+  done <<<"$(cargo_target_reclaim_candidates)"
+  for p in "${cargo_target_candidates[@]}"; do
+    [ -e "$p" ] || continue
+    freed="$(unlinked_bytes "$p")"
+    if [ "$freed" -lt 1048576 ]; then
+      log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
+      continue
+    fi
+    remove_path "$p"
+    log "prune $p (~$((freed/1024/1024))MiB reclaimable cargo target)"
     total=$(( total + freed ))
   done
 
