@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -141,18 +141,34 @@ function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "r
 /**
  * Seed `$MOUNT/cargo-target-shared/<name>/blob`. The shared cargo target root is
  * the guard's second deletion-capable path, and it resolves the owning issue
- * from the directory name rather than from a checkout branch, so its gates need
+ * from an in-band marker rather than from the directory name, so its gates need
  * their own coverage.
+ *
+ * `marker` is what gets written to the ownership marker file: a string to
+ * attribute the dir, `false` to write no marker at all, `true` for a marker that
+ * agrees with the directory name.
  */
-function seedCargoTarget(sandbox, { name, fresh = false, symlink = false } = {}) {
+function seedCargoTarget(sandbox, { name, fresh = false, symlink = false, marker = true } = {}) {
   const root = path.join(sandbox.mount, "cargo-target-shared");
   const full = path.join(root, name, "blob");
   mkdirSync(path.dirname(full), { recursive: true });
   writeFileSync(full, Buffer.alloc(2 * MIB));
+  if (marker !== false) {
+    const owner = marker === true
+      ? name.replace(/^([a-z]+)-([0-9]+)$/, (_m, k, n) => `${k.toUpperCase()}-${n}`)
+      : marker;
+    const markerFile = path.join(path.dirname(full), ".paperclip-owner");
+    writeFileSync(markerFile, `${owner}\n`);
+    if (!fresh) {
+      const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      utimesSync(markerFile, old, old);
+    }
+  }
   if (!fresh) {
     const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
     utimesSync(full, old, old);
     utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(root, name), old, old);
   }
   if (symlink) {
     const outside = path.join(sandbox.root, "outside-cargo-target");
@@ -532,7 +548,7 @@ test("cargo target scope: closed issue target dir is pruned and failing gates su
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
     const apiStub = installPaperclipApiStub(sandbox, {
       roster: ["agent-1"],
-      issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done" },
+      issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done", "DEF-6": "done", "DEF-7": "done", "DEF-8": "done" },
     });
     // The root dir name is lowercased on disk and uppercased by the script, so
     // "def-1" must still resolve to the DEF-1 issue in the control plane.
@@ -540,7 +556,24 @@ test("cargo target scope: closed issue target dir is pruned and failing gates su
     const open = seedCargoTarget(sandbox, { name: "def-2" });
     const fresh = seedCargoTarget(sandbox, { name: "def-3", fresh: true });
     const unnamed = seedCargoTarget(sandbox, { name: "shared-fallback" });
-    const symlink = seedCargoTarget(sandbox, { name: "def-5", symlink: true });
+    const unmarked = seedCargoTarget(sandbox, { name: "def-4", marker: false });
+    const misattributed = seedCargoTarget(sandbox, { name: "def-5", marker: "DEF-6" });
+    const symlink = seedCargoTarget(sandbox, { name: "def-7", symlink: true });
+    // A marker that is itself a symlink would let a dir outside the mount
+    // dictate what this one claims to own.
+    const linkedMarker = seedCargoTarget(sandbox, { name: "def-8" });
+    rmSync(path.join(path.dirname(linkedMarker), ".paperclip-owner"), { force: true });
+    const outsideMarker = path.join(sandbox.root, "outside-marker");
+    writeFileSync(outsideMarker, "DEF-8\n");
+    const markerLink = path.join(path.dirname(linkedMarker), ".paperclip-owner");
+    symlinkSync(outsideMarker, markerLink);
+    // Age the link and its parent: creating the link refreshes the directory
+    // mtime, and find reports it, so without this the min-age gate would skip
+    // the dir and hide the result. find reports the symlink's own mtime, so
+    // utimes on the link would age the target instead and not help.
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    lutimesSync(markerLink, old, old);
+    lutimesSync(path.dirname(linkedMarker), old, old);
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
@@ -548,12 +581,17 @@ test("cargo target scope: closed issue target dir is pruned and failing gates su
     assert.ok(existsSync(open), "open issue cargo target must survive");
     assert.ok(existsSync(fresh), "cargo target under the min-age gate must survive");
     assert.ok(existsSync(unnamed), "a dir that is not named after an issue must survive");
+    assert.ok(existsSync(unmarked), "a dir with no ownership marker must survive");
+    assert.ok(existsSync(misattributed), "a dir whose marker names another issue must survive");
+    assert.ok(existsSync(linkedMarker), "a symlinked ownership marker must survive");
     // Assert the gate's own refusal, not just that the file survived: `find
     // -xdev` and `rm -rf` both refuse to descend a symlink anyway, so survival
     // alone would not catch the symlink check being deleted.
     assert.match(result.stderr, /candidate is a symlink/);
     assert.match(result.stderr, /not a per-issue target dir/);
     assert.match(result.stderr, /is not terminal/);
+    assert.match(result.stderr, /no \.paperclip-owner ownership marker/);
+    assert.match(result.stderr, /marker says 'DEF-6', dir says 'DEF-5'/);
   } finally {
     sandbox.cleanup();
   }
@@ -576,7 +614,7 @@ test("cargo target scope: a mis-named dir borrows no status from another issue",
   }
 });
 
-test("a missing company id is a loud configuration error, not a wrong-tenant lookup", () => {
+test("a missing company id is a loud prune error, not a wrong-tenant lookup", () => {
   const sandbox = makeSandbox();
   try {
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
@@ -584,19 +622,47 @@ test("a missing company id is a loud configuration error, not a wrong-tenant loo
     const env = { ...process.env };
     delete env.DISK_GUARD_COMPANY_ID;
     delete env.PAPERCLIP_COMPANY_ID;
-    const result = spawnSync("bash", [SCRIPT, "--prune"], {
-      encoding: "utf8",
-      env: {
-        ...env,
-        PATH: `${sandbox.binDir}:${env.PATH}`,
-        DISK_GUARD_MOUNT: sandbox.mount,
-        DISK_GUARD_STATUS_FILE: sandbox.statusFile,
-        DISK_GUARD_CRIT_PCT: "1",
-      },
-    });
+    const base = {
+      ...env,
+      PATH: `${sandbox.binDir}:${env.PATH}`,
+      DISK_GUARD_MOUNT: sandbox.mount,
+      DISK_GUARD_STATUS_FILE: sandbox.statusFile,
+      DISK_GUARD_CRIT_PCT: "1",
+    };
+    const result = spawnSync("bash", [SCRIPT, "--prune"], { encoding: "utf8", env: base });
     assert.equal(result.status, RC_ERROR);
     assert.match(result.stderr, /no company id/);
-    assert.ok(existsSync(cacheBlob), "a run with no company id must not delete anything");
+    assert.ok(existsSync(cacheBlob), "a prune with no company id must not delete anything");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("--check and --status work with no company id, because neither queries issues", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const cacheBlob = seed(sandbox, ".cache/node/blob", 3 * MIB);
+    const env = { ...process.env };
+    delete env.DISK_GUARD_COMPANY_ID;
+    delete env.PAPERCLIP_COMPANY_ID;
+    const base = {
+      ...env,
+      PATH: `${sandbox.binDir}:${env.PATH}`,
+      DISK_GUARD_MOUNT: sandbox.mount,
+      DISK_GUARD_STATUS_FILE: sandbox.statusFile,
+      DISK_GUARD_CRIT_PCT: "1",
+    };
+    // A guard that cannot measure pressure when the environment is incomplete is
+    // worse than one that cannot reclaim: the blind spot is invisible until the
+    // volume is already full.
+    const check = spawnSync("bash", [SCRIPT, "--check"], { encoding: "utf8", env: base });
+    assert.equal(check.status, RC_CRITICAL);
+    assert.match(check.stdout, /level=critical/);
+    const status = spawnSync("bash", [SCRIPT, "--status"], { encoding: "utf8", env: base });
+    assert.equal(status.status, RC_OK);
+    assert.match(status.stdout, /level=critical/);
+    assert.ok(existsSync(cacheBlob), "monitoring must never delete");
   } finally {
     sandbox.cleanup();
   }
