@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -136,6 +136,32 @@ function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "r
     utimesSync(path.join(checkout, rel), old, old);
   }
   return { checkout, full };
+}
+
+/**
+ * Seed `$MOUNT/cargo-target-shared/<name>/blob`. The shared cargo target root is
+ * the guard's second deletion-capable path, and it resolves the owning issue
+ * from the directory name rather than from a checkout branch, so its gates need
+ * their own coverage.
+ */
+function seedCargoTarget(sandbox, { name, fresh = false, symlink = false } = {}) {
+  const root = path.join(sandbox.mount, "cargo-target-shared");
+  const full = path.join(root, name, "blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  if (!fresh) {
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+  }
+  if (symlink) {
+    const outside = path.join(sandbox.root, "outside-cargo-target");
+    mkdirSync(outside, { recursive: true });
+    renameSync(path.dirname(full), path.join(outside, "real"));
+    rmSync(path.join(sandbox.mount, "cargo-target-shared", name), { recursive: true, force: true });
+    symlinkSync(path.join(outside, "real"), path.join(root, name));
+  }
+  return full;
 }
 
 /** Total bytes of file content under `dir`, used to assert prune freed nothing. */
@@ -495,6 +521,82 @@ test("prune fails closed when df is unusable, rather than trusting a stale statu
     assert.equal(result.status, RC_ERROR);
     assert.match(result.stdout, /prune_skipped=measurement_failed/);
     assert.ok(existsSync(cacheBlob), "cache must survive an unmeasurable run");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("cargo target scope: closed issue target dir is pruned and failing gates survive", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done" },
+    });
+    // The root dir name is lowercased on disk and uppercased by the script, so
+    // "def-1" must still resolve to the DEF-1 issue in the control plane.
+    const closed = seedCargoTarget(sandbox, { name: "def-1" });
+    const open = seedCargoTarget(sandbox, { name: "def-2" });
+    const fresh = seedCargoTarget(sandbox, { name: "def-3", fresh: true });
+    const unnamed = seedCargoTarget(sandbox, { name: "shared-fallback" });
+    const symlink = seedCargoTarget(sandbox, { name: "def-5", symlink: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(closed), "closed issue cargo target must be pruned");
+    assert.ok(existsSync(open), "open issue cargo target must survive");
+    assert.ok(existsSync(fresh), "cargo target under the min-age gate must survive");
+    assert.ok(existsSync(unnamed), "a dir that is not named after an issue must survive");
+    // Assert the gate's own refusal, not just that the file survived: `find
+    // -xdev` and `rm -rf` both refuse to descend a symlink anyway, so survival
+    // alone would not catch the symlink check being deleted.
+    assert.match(result.stderr, /candidate is a symlink/);
+    assert.match(result.stderr, /not a per-issue target dir/);
+    assert.match(result.stderr, /is not terminal/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("cargo target scope: a mis-named dir borrows no status from another issue", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // The stub ignores the `q=` filter and answers with an unrelated issue that
+    // happens to be done. Without an identifier match the guard must refuse.
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], ignoreQuery: true });
+    const target = seedCargoTarget(sandbox, { name: "def-1" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(target), "mismatched API results must not authorize cargo target deletion");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("a missing company id is a loud configuration error, not a wrong-tenant lookup", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const cacheBlob = seed(sandbox, ".cache/node/blob", 3 * MIB);
+    const env = { ...process.env };
+    delete env.DISK_GUARD_COMPANY_ID;
+    delete env.PAPERCLIP_COMPANY_ID;
+    const result = spawnSync("bash", [SCRIPT, "--prune"], {
+      encoding: "utf8",
+      env: {
+        ...env,
+        PATH: `${sandbox.binDir}:${env.PATH}`,
+        DISK_GUARD_MOUNT: sandbox.mount,
+        DISK_GUARD_STATUS_FILE: sandbox.statusFile,
+        DISK_GUARD_CRIT_PCT: "1",
+      },
+    });
+    assert.equal(result.status, RC_ERROR);
+    assert.match(result.stderr, /no company id/);
+    assert.ok(existsSync(cacheBlob), "a run with no company id must not delete anything");
   } finally {
     sandbox.cleanup();
   }
