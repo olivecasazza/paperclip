@@ -103,7 +103,6 @@ const mockAccessApi = vi.hoisted(() => ({
 
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
-  getPreferences: vi.fn(),
 }));
 
 const mockProjectsApi = vi.hoisted(() => ({
@@ -1373,11 +1372,9 @@ describe("IssueDetail", () => {
     });
     mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
     mockAuthApi.getSession.mockResolvedValue({ session: null, user: null });
-    mockAuthApi.getPreferences.mockResolvedValue({ keyboardShortcuts: false });
     mockProjectsApi.list.mockResolvedValue([]);
     mockDecisionsApi.list.mockResolvedValue([]);
     mockInstanceSettingsApi.getGeneral.mockResolvedValue({
-      keyboardShortcuts: false,
       feedbackDataSharingPreference: "prompt",
     });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
@@ -1565,6 +1562,34 @@ describe("IssueDetail", () => {
     expect(windowOpen).not.toHaveBeenCalled();
   });
 
+  it.each(["comments", "description", "empty"])("reveals %s without waiting for supporting history unless the thread is empty", async (content) => {
+    const history = createDeferred<[]>();
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      description: content === "description" ? "Saved task description" : null,
+    }));
+    mockIssuesApi.listComments.mockResolvedValue(content === "comments" ? [createIssueComment()] : []);
+    mockActivityApi.forIssue.mockReturnValue(history.promise);
+    mockActivityApi.runsForIssue.mockReturnValue(history.promise);
+    mockHeartbeatsApi.liveRunsForIssue.mockReturnValue(history.promise);
+    mockIssuesApi.listInteractions.mockReturnValue(history.promise);
+    mockIssuesApi.listAttachments.mockReturnValue(history.promise);
+    mockIssuesApi.listWorkProducts.mockReturnValue(history.promise);
+
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    });
+    await waitForAssertion(() => {
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]).toMatchObject({
+        initialHistoryPending: content === "empty",
+      });
+    });
+    // Resolving metadata fills the same thread rather than replacing its content.
+    history.resolve([]);
+    await waitForAssertion(() => {
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]).toMatchObject({ initialHistoryPending: false });
+    });
+  });
+
   it("loads from the pending state into issue detail without changing hook order", async () => {
     const issueRequest = createDeferred<Issue>();
     mockIssuesApi.get.mockReturnValueOnce(issueRequest.promise);
@@ -1576,6 +1601,11 @@ describe("IssueDetail", () => {
         </QueryClientProvider>,
       );
     });
+
+    // The task response may need slow workspace/recovery enrichment. The
+    // thread requests must already be in flight while its skeleton is showing.
+    expect(mockActivityApi.forIssue).toHaveBeenCalledWith("PAP-1");
+    expect(mockActivityApi.runsForIssue).toHaveBeenCalledWith("PAP-1");
 
     issueRequest.resolve(createIssue());
     await flushReact();
@@ -2839,9 +2869,7 @@ describe("IssueDetail", () => {
     );
     mockIssuesApi.get.mockResolvedValue(createIssue());
     mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
-    mockAuthApi.getPreferences.mockResolvedValue({ keyboardShortcuts: true });
     mockInstanceSettingsApi.getGeneral.mockResolvedValue({
-      keyboardShortcuts: false,
       feedbackDataSharingPreference: "prompt",
     });
 
@@ -2881,9 +2909,7 @@ describe("IssueDetail", () => {
     );
     mockIssuesApi.get.mockResolvedValue(createIssue());
     mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
-    mockAuthApi.getPreferences.mockResolvedValue({ keyboardShortcuts: true });
     mockInstanceSettingsApi.getGeneral.mockResolvedValue({
-      keyboardShortcuts: false,
       feedbackDataSharingPreference: "prompt",
     });
 

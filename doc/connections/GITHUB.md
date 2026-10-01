@@ -5,6 +5,18 @@ compatibility method. Cloud owns the fixed public OAuth callback and signed
 webhook inbox; provider tokens are sealed to the enrolled instance and stored
 only in its existing encrypted secret system.
 
+## Catalog entries
+
+**GitHub** connects an account for repository tools, Git, and `gh`, and opens
+Access → Connect directly. **GitHub Code Review Bot** connects one agent to a
+GitHub App for pull-request reviews and mentions, and opens Choose agent directly.
+The bot entry follows the Chat Connectors experimental setting.
+
+Both entries reuse the existing GitHub integrations. Bot endpoints retain the
+`github` provider identity and existing setup, reconnect, and management URLs;
+saved bot connections and drafts appear under GitHub Code Review Bot. GitHub
+repository and MCP URLs still resolve to the ordinary GitHub tool connection.
+
 ## Self-hosted setup
 
 The Access step uses **Continue** to open the local setup screen.
