@@ -86,6 +86,8 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT,
+  HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT,
   CHAT_PROVIDERS,
   CONNECTION_INTENT_AGENT_GUIDANCE,
   CONNECTION_RUNTIME_TOOL_NAMES,
@@ -649,6 +651,13 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+// The company-scoped and process-scoped admission ceilings share the per-agent
+// clamp bounds: an operator who writes a 0 or a negative ceiling means "unset",
+// and one who writes 500 clearly means "no meaningful bound". Both fall back to
+// the shared process-wide default so a company with many agents cannot buy its
+// way past a tenant with one by omitting the field.
+const HEARTBEAT_SCOPED_MAX_CONCURRENT_RUNS_MIN = 1;
+const HEARTBEAT_SCOPED_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -3647,6 +3656,133 @@ function normalizeMaxConcurrentRuns(value: unknown) {
     HEARTBEAT_MAX_CONCURRENT_RUNS_MIN,
     Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed),
   );
+}
+
+/**
+ * Normalize a company-scoped or process-scoped run-admission ceiling. Unlike
+ * `normalizeMaxConcurrentRuns` (which is per-agent and may legitimately be 20),
+ * this clamps to the same 1..50 band with a shared process-wide default so an
+ * unset company/global ceiling can never widen the aggregate.
+ */
+function normalizeScopedMaxConcurrentRuns(
+  value: unknown,
+  fallback: number,
+) {
+  const parsed = Math.floor(asNumber(value, fallback));
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(
+    HEARTBEAT_SCOPED_MAX_CONCURRENT_RUNS_MIN,
+    Math.min(HEARTBEAT_SCOPED_MAX_CONCURRENT_RUNS_MAX, parsed),
+  );
+}
+
+/**
+ * Which ceiling refused a queued-run promotion. Every refusal names one so an
+ * operator reading a stalled issue can tell "this agent is at its own budget"
+ * apart from "the pod is full" apart from "this company holds its share".
+ */
+export type RunAdmissionCapKind =
+  | "company_run_cap"
+  | "global_run_cap"
+  | "agent_run_cap";
+
+export interface RunAdmissionCapInput {
+  /** `heartbeat.globalMaxConcurrentRuns` — process-scoped aggregate ceiling. */
+  globalCap: number;
+  /** `heartbeat.companyMaxConcurrentRuns` — per-company ceiling. */
+  companyCap: number;
+  /** `heartbeat.maxConcurrentRuns` — the pre-existing per-agent ceiling. */
+  agentCap: number;
+  runningGlobal: number;
+  runningCompany: number;
+  runningAgent: number;
+  /** Distinct companies with at least one queued or running run. */
+  activeCompanyCount: number;
+}
+
+export interface RunAdmissionDecision {
+  allowed: boolean;
+  /** Set only when `allowed` is false. */
+  cap: RunAdmissionCapKind | null;
+  /** Human-readable refusal text naming the cap that fired. */
+  reason: string | null;
+  /** Remaining slots this promotion batch may claim, after every ceiling. */
+  availableSlots: number;
+}
+
+/**
+ * Apply the company-scoped, process-scoped, and agent-scoped run-admission
+ * ceilings to one queued-run promotion.
+ *
+ * The aggregate ceiling alone would let whoever asks first take every slot, so
+ * it is paired with a fair-share rule: when the aggregate is full, a company is
+ * refused only if it already holds `ceil(globalCap / activeCompanyCount)` slots.
+ * An under-represented tenant therefore keeps one slot reachable even while the
+ * aggregate reads full, which is what keeps a single large tenant from starving
+ * every other tenant in the process.
+ *
+ * Ordering is deliberate: company, then aggregate, then the pre-existing
+ * per-agent ceiling. The agent ceiling stays last so the pre-existing refusal
+ * behavior for a single agent is unchanged when the wider ceilings are unset.
+ */
+export function evaluateRunAdmissionCaps(
+  input: RunAdmissionCapInput,
+): RunAdmissionDecision {
+  const globalCap = Math.max(1, Math.floor(input.globalCap));
+  const companyCap = Math.max(1, Math.floor(input.companyCap));
+  const agentCap = Math.max(0, Math.floor(input.agentCap));
+  const activeCompanyCount = Math.max(1, Math.floor(input.activeCompanyCount));
+  const fairShareSlots = Math.max(1, Math.ceil(globalCap / activeCompanyCount));
+  const agentSlots = Math.max(0, agentCap - input.runningAgent);
+  const companySlots = Math.max(0, companyCap - input.runningCompany);
+  const aggregateHasRoom = input.runningGlobal < globalCap;
+
+  if (companySlots <= 0) {
+    return {
+      allowed: false,
+      cap: "company_run_cap",
+      reason: `company run cap reached (${input.runningCompany}/${companyCap})`,
+      availableSlots: 0,
+    };
+  }
+
+  if (!aggregateHasRoom && input.runningCompany >= fairShareSlots) {
+    return {
+      allowed: false,
+      cap: "global_run_cap",
+      reason: `global run cap reached (${input.runningGlobal}/${globalCap}); company already holds ${input.runningCompany} slot(s), at or above its fair share of ${fairShareSlots} across ${activeCompanyCount} active compan${
+        activeCompanyCount === 1 ? "y" : "ies"
+      }`,
+      availableSlots: 0,
+    };
+  }
+
+  if (agentSlots <= 0) {
+    return {
+      allowed: false,
+      cap: "agent_run_cap",
+      reason: `agent max concurrent runs reached (${input.runningAgent}/${agentCap})`,
+      availableSlots: 0,
+    };
+  }
+
+  // An under-represented tenant keeps exactly one reachable slot while the
+  // aggregate reads full; otherwise it gets whatever the aggregate has left.
+  const aggregateSlots = aggregateHasRoom
+    ? globalCap - input.runningGlobal
+    : 1;
+  const availableSlots = Math.min(agentSlots, companySlots, aggregateSlots);
+
+  if (availableSlots <= 0) {
+    return {
+      allowed: false,
+      cap: "global_run_cap",
+      reason: `global run cap reached (${input.runningGlobal}/${globalCap})`,
+      availableSlots: 0,
+    };
+  }
+
+  return { allowed: true, cap: null, reason: null, availableSlots };
 }
 
 interface WakeupOptions {
@@ -16596,6 +16732,18 @@ export function heartbeatService(
       maxConcurrentRuns: normalizeMaxConcurrentRuns(
         heartbeat.maxConcurrentRuns,
       ),
+      // Company-scoped and process-scoped run-admission ceilings. Both are read
+      // off the same `runtimeConfig.heartbeat` record as the agent ceiling, and
+      // both resolve to a shared process-wide default when unset, so a company
+      // that omits them cannot buy its way past a tenant that sets them.
+      companyMaxConcurrentRuns: normalizeScopedMaxConcurrentRuns(
+        heartbeat.companyMaxConcurrentRuns,
+        HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT,
+      ),
+      globalMaxConcurrentRuns: normalizeScopedMaxConcurrentRuns(
+        heartbeat.globalMaxConcurrentRuns,
+        HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT,
+      ),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -16914,6 +17062,93 @@ export function heartbeatService(
         ),
       );
     return Number(count ?? 0);
+  }
+
+  /**
+   * Company-scoped sibling of {@link countRunningRunsForAgent}. This is the
+   * per-tenant admission ceiling: without it, several companies' agents each at
+   * `maxConcurrentRuns: 1` accumulate in-flight workers across tenants with
+   * nothing bounding one tenant's share of the process's CPU quota.
+   */
+  async function countRunningRunsForCompany(companyId: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    return Number(count ?? 0);
+  }
+
+  /** Process-scoped aggregate of in-flight heartbeat runs across every company. */
+  async function countRunningRunsGlobally() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    return Number(count ?? 0);
+  }
+
+  /**
+   * Distinct companies with at least one queued or running run — the denominator
+   * for the aggregate ceiling's fair-share rule. "Active" means demand, not
+   * tenancy: a company with nothing queued is not owed a reserved share, while a
+   * company whose run is queued is counted even if it currently holds zero slots.
+   */
+  async function countActiveRunCompanies() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(distinct ${heartbeatRuns.companyId})` })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+    return Number(count ?? 0);
+  }
+
+  /**
+   * Read every count the admission gate needs in one round trip per scope, then
+   * evaluate the company, aggregate, and agent ceilings together. Returns the
+   * number of promotions this batch may claim; a refusal is logged with the cap
+   * that fired so an operator can tell a tenant-full pod from a tenant-full
+   * company without reading code.
+   */
+  async function evaluateAgentRunAdmission(
+    agent: typeof agents.$inferSelect,
+  ) {
+    const policy = parseHeartbeatPolicy(agent);
+    const [runningAgent, runningCompany, runningGlobal, activeCompanyCount] =
+      await Promise.all([
+        countRunningRunsForAgent(agent.id),
+        countRunningRunsForCompany(agent.companyId),
+        countRunningRunsGlobally(),
+        countActiveRunCompanies(),
+      ]);
+    const decision = evaluateRunAdmissionCaps({
+      globalCap: policy.globalMaxConcurrentRuns,
+      companyCap: policy.companyMaxConcurrentRuns,
+      agentCap: policy.maxConcurrentRuns,
+      runningGlobal,
+      runningCompany,
+      runningAgent,
+      activeCompanyCount,
+    });
+    if (!decision.allowed) {
+      logger.info(
+        {
+          agentId: agent.id,
+          companyId: agent.companyId,
+          cap: decision.cap,
+          reason: decision.reason,
+          runningGlobal,
+          runningCompany,
+          runningAgent,
+          activeCompanyCount,
+        },
+        "queued heartbeat run promotion refused by a run-admission cap",
+      );
+    }
+    return decision;
   }
 
   async function withChatControlRecoveryGate(
@@ -19821,12 +20056,14 @@ export function heartbeatService(
         }
         return [];
       }
-      const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
-      );
+      // Company-scoped and process-scoped run-admission ceilings gate the
+      // pre-existing per-agent ceiling. `evaluateAgentRunAdmission` resolves all
+      // three at once and returns the number of promotions this batch may claim,
+      // so one agent at `maxConcurrentRuns: 20` still cannot exceed what its
+      // company or the process has left.
+      const admission = await evaluateAgentRunAdmission(agent);
+      if (!admission.allowed) return [];
+      const availableSlots = admission.availableSlots;
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
