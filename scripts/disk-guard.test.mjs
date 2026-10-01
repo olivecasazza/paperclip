@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, linkSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -164,6 +164,32 @@ function seedCargoTarget(sandbox, { name, fresh = false, symlink = false, marker
       utimesSync(markerFile, old, old);
     }
   }
+  if (!fresh) {
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(root, name), old, old);
+  }
+  if (symlink) {
+    const outside = path.join(sandbox.root, "outside-cargo-target");
+    mkdirSync(outside, { recursive: true });
+    renameSync(path.dirname(full), path.join(outside, "real"));
+    rmSync(path.join(sandbox.mount, "cargo-target-shared", name), { recursive: true, force: true });
+    symlinkSync(path.join(outside, "real"), path.join(root, name));
+  }
+  return full;
+}
+
+/**
+ * Seed `$MOUNT/cargo-target-shared/<name>/blob` for a shared, non-per-issue dir.
+ * Unlike seedCargoTarget this writes no ownership marker: a shared dir has no
+ * issue to attribute, so the marker gate does not apply to it.
+ */
+function seedSharedCargoTarget(sandbox, { name, fresh = false, symlink = false } = {}) {
+  const root = path.join(sandbox.mount, "cargo-target-shared");
+  const full = path.join(root, name, "blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
   if (!fresh) {
     const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
     utimesSync(full, old, old);
@@ -588,7 +614,7 @@ test("cargo target scope: closed issue target dir is pruned and failing gates su
     // -xdev` and `rm -rf` both refuse to descend a symlink anyway, so survival
     // alone would not catch the symlink check being deleted.
     assert.match(result.stderr, /candidate is a symlink/);
-    assert.match(result.stderr, /not a per-issue target dir/);
+    assert.match(result.stderr, /not a per-issue name, but named for a company or issue/);
     assert.match(result.stderr, /is not terminal/);
     assert.match(result.stderr, /no \.paperclip-owner ownership marker/);
     assert.match(result.stderr, /marker says 'DEF-6', dir says 'DEF-5'/);
@@ -663,6 +689,189 @@ test("--check and --status work with no company id, because neither queries issu
     assert.equal(status.status, RC_OK);
     assert.match(status.stdout, /level=critical/);
     assert.ok(existsSync(cacheBlob), "monitoring must never delete");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a stale non-per-issue dir is a candidate and a fresh one is not", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // The two real shapes on the volume: `debug` is 7GiB of shared output and
+    // `tmp` a smaller sibling, and neither names an issue, so the shared path
+    // decides on age alone. A fresh one must be left alone.
+    const stale = seedSharedCargoTarget(sandbox, { name: "debug" });
+    const fresh = seedSharedCargoTarget(sandbox, { name: "tmp", fresh: true });
+    const bytesBefore = treeBytes(sandbox.mount);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(stale), "a stale shared cargo target must be pruned");
+    assert.ok(existsSync(fresh), "a fresh shared cargo target must survive the age gate");
+    assert.match(result.stderr, /tmp \(newest mtime under 24h\)/);
+    assert.ok(
+      treeBytes(sandbox.mount) < bytesBefore,
+      "reclaiming a shared dir must actually free the space it reported",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a name attributed to a company or issue is never a shared candidate", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "done" } });
+    // These all fail the <PREFIX>-<number> shape, which is what routes a dir to
+    // the shared path, but each names a company or issue and so is not shared
+    // output. Reclaiming them here is the cross-company deletion CON-375 owns,
+    // and DEF-1 being terminal must not be what stops it: no marker is written,
+    // so these are unreclaimable on the per-issue path too.
+    const suffixVariant = seedSharedCargoTarget(sandbox, { name: "def-129-base" });
+    const doc = seedSharedCargoTarget(sandbox, { name: "def-doc" });
+    const sibling = seedSharedCargoTarget(sandbox, { name: "def-129-cold" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(suffixVariant), "a <PREFIX>-<number> variant must not be reclaimed as shared output");
+    assert.ok(existsSync(doc), "a company-named dir must not be reclaimed as shared output");
+    assert.ok(existsSync(sibling), "a second variant must not be reclaimed as shared output");
+    assert.match(result.stderr, /named for a company or issue/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a live cargo or rustc blocks the shared reclaim", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // A shared dir is likelier to be mid-build than a per-issue dir, because
+    // every build in the company can point at it, so age alone is not enough to
+    // call it idle. Shadow the process lister: the guard tries pgrep then pidof,
+    // and installing a pgrep stub in the sandbox binDir makes it deterministic
+    // regardless of what the host happens to be running.
+    const running = path.join(sandbox.binDir, "pgrep");
+    writeFileSync(running, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const target = seedSharedCargoTarget(sandbox, { name: "debug" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(target), "a shared cargo target must survive while cargo or rustc is running");
+    assert.match(result.stderr, /cargo or rustc is running/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a broken process lister falls back to /proc and still catches a live build", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // pgrep is absent from several of the images this guard runs on, and an
+    // erroring lister is not evidence of absence. The /proc scan is the real
+    // fallback, so break both tools and start a process actually named cargo:
+    // the dir must still be skipped. Without the fallback this would either
+    // crash or treat the broken tool as "nothing is running" and delete a tree
+    // a build is writing into.
+    for (const tool of ["pgrep", "pidof"]) {
+      writeFileSync(path.join(sandbox.binDir, tool), "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+    }
+    // A binary whose own comm is literally "cargo", started detached so the
+    // guard's own /proc scan can see it.
+    const cargoBin = path.join(sandbox.binDir, "cargo");
+    copyFileSync("/bin/sleep", cargoBin);
+    const build = spawn(cargoBin, ["30"], { stdio: "ignore", detached: true });
+    const target = seedSharedCargoTarget(sandbox, { name: "debug" });
+
+    try {
+      const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+      assert.equal(result.status, RC_CRITICAL);
+      assert.ok(existsSync(target), "a shared cargo target must survive while a cargo process is live");
+      assert.match(result.stderr, /cargo or rustc is running/);
+    } finally {
+      try { process.kill(-build.pid); } catch { /* already gone */ }
+    }
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a symlinked shared dir is never a candidate", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    const link = seedSharedCargoTarget(sandbox, { name: "debug", symlink: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(link), "a symlinked shared dir must survive");
+    assert.match(result.stderr, /candidate is a symlink/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("shared cargo target scope: a hardlinked shared dir is skipped, not deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // Same nlink gate as every other candidate: a shared dir whose inodes are
+    // also linked into a live tree frees nothing and must not be removed.
+    const live = seed(sandbox, "live/blob", 2 * MIB);
+    const shared = seedSharedCargoTarget(sandbox, { name: "debug" });
+    rmSync(shared, { force: true });
+    linkSync(live, shared);
+    // Linking refreshes the directory mtime, which find reports, so without
+    // re-aging the age gate would skip the dir and hide the nlink result.
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(shared, old, old);
+    utimesSync(path.dirname(shared), old, old);
+    utimesSync(path.join(sandbox.mount, "cargo-target-shared", "debug"), old, old);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(shared), "a hardlinked shared dir must survive the nlink gate");
+    assert.ok(existsSync(live), "the live tree sharing the inode must survive");
+    assert.match(result.stderr, /only 0KiB unlinked-reclaimable/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("a name that parses as <PREFIX>-<number> still routes down the per-issue path and still needs terminality", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // DEF-1 and DEF-2 are both terminal, so if either reached the shared path it
+    // would be deleted on age alone with no marker consulted. The per-issue path
+    // must still demand a matching ownership marker, and DEF-3 is terminal but
+    // unreclaimable, proving the issue query is still what gates that path.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-1": "done", "DEF-2": "done", "DEF-3": "done" },
+    });
+    const unmarked = seedCargoTarget(sandbox, { name: "def-1", marker: false });
+    const closed = seedCargoTarget(sandbox, { name: "def-2" });
+    const misattributed = seedCargoTarget(sandbox, { name: "def-3", marker: "DEF-9" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(unmarked), "a terminal per-issue dir with no marker must still survive");
+    assert.ok(existsSync(misattributed), "a dir whose marker names another issue must still survive");
+    assert.ok(!existsSync(closed), "a marked, terminal per-issue dir must still be reclaimed");
+    assert.match(result.stderr, /no \.paperclip-owner ownership marker/);
+    assert.match(result.stderr, /marker says 'DEF-9', dir says 'DEF-3'/);
+    // The shared path's own refusals must not fire for these: they are per-issue
+    // names, so the age-only judgement must never have been applied to them.
+    assert.doesNotMatch(result.stderr, /def-1 \(newest mtime/, "a per-issue dir must not be judged on age alone");
   } finally {
     sandbox.cleanup();
   }
