@@ -95,6 +95,7 @@ import {
   createProductionLoginSessionReaperRuntime,
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
+import { createProductionOrphanedProcessReaper } from "./services/orphaned-process-reaper.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -1418,6 +1419,34 @@ async function startServerWithDatabaseTeardown(
         }));
     };
 
+    // The backstop for run-spawned processes that outlived their run. A
+    // grandchild that leaves the recorded process group is adopted by pid 1 and
+    // keeps drawing on the pod's shared cpu budget with nothing left to reap it.
+    // This sweep reconciles /proc against the run rows instead of trusting the
+    // group kill, and is tenant-agnostic: it keys only on the run row. It runs
+    // on the same scheduler tick as the other reapers, so it stays independent
+    // of the scheduler suppression that gates run dispatch.
+    const orphanedProcessReaper = createProductionOrphanedProcessReaper({
+      db: db as any,
+      log: (line, fields) => logger.info(fields ?? {}, line),
+    });
+    const logOrphanedProcessReapResult = (
+      result: Awaited<ReturnType<typeof orphanedProcessReaper.sweep>>,
+    ) => {
+      if (result.reaped > 0 || result.failed > 0) {
+        logger.info(result, "orphaned run process reaper terminated processes");
+      }
+    };
+    const scheduleOrphanedProcessReaperSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(orphanedProcessReaper
+        .sweep()
+        .then(logOrphanedProcessReapResult)
+        .catch((err) => {
+          logger.error({ err }, "orphaned run process reaper sweep failed");
+        }));
+    };
+
     const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
@@ -1600,6 +1629,16 @@ async function startServerWithDatabaseTeardown(
         logger.error({ err }, "startup setup-token login reaper sweep failed");
       });
 
+    // Reap run-spawned processes left behind by a previous container generation
+    // before the scheduler starts, so a process that outlived its run in the old
+    // pod cannot keep drawing on the shared cpu budget while this one boots.
+    await orphanedProcessReaper
+      .sweep()
+      .then(logOrphanedProcessReapResult)
+      .catch((err) => {
+        logger.error({ err }, "startup orphaned run process reaper sweep failed");
+      });
+
     // Retry any orphan sandbox teardown left by a failed acquire before a server
     // restart, so a leaked sandbox does not stay allocated across the restart.
     await runEnvironmentLeaseCleanupSweep(0);
@@ -1666,6 +1705,7 @@ async function startServerWithDatabaseTeardown(
         scheduleTerminalWorkspaceSweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
+        scheduleOrphanedProcessReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
 
         if (heartbeatSchedulerStopped) return;
