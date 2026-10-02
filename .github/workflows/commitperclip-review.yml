@@ -16,6 +16,10 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Declared at job level (not step level) so the step-level `if` guards below
+    # can read it via the env context. Step-level env is not visible to `if`.
+    env:
+      COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
     steps:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -33,18 +37,25 @@ jobs:
         with:
           node-version: '24'
 
+      # A missing COMMITPERCLIP_KEY is a configuration gap, not a verdict on the
+      # PR. Dependency Review above is the security gate and still fails hard.
+      # Skip the bot-commented gates instead of failing every open PR.
       - name: Generate commitperclip token
         id: token
+        if: env.COMMITPERCLIP_KEY != ''
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
-        env:
-          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+
+      - name: Warn when commitperclip token is unavailable
+        if: env.COMMITPERCLIP_KEY == ''
+        run: |
+          echo "::warning title=commitperclip not configured::COMMITPERCLIP_KEY is not set on this repository, so the commitperclip PR quality gates (linked issue, test coverage, template, lockfile, dedup search) were skipped. Configure the repository secret to enable them. Dependency Review still ran and its result is authoritative."
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: env.COMMITPERCLIP_KEY != '' && github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
