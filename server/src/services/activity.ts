@@ -460,7 +460,7 @@ export function activityService(db: Db) {
           and(
             inArray(heartbeatRunEvents.runId, runIds),
             eq(heartbeatRunEvents.eventType, "lifecycle"),
-            sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+            eq(heartbeatRunEvents.retryExhausted, true),
           ),
         )
         .orderBy(asc(heartbeatRunEvents.runId), desc(heartbeatRunEvents.id));

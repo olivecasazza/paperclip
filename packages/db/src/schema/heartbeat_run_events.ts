@@ -8,6 +8,7 @@ import {
   index,
   bigserial,
   bigint,
+  boolean,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
@@ -34,6 +35,16 @@ export const heartbeatRunEvents = pgTable(
     sourceSeq: bigint("source_seq", { mode: "number" }),
     sourcePayloadSha256: text("source_payload_sha256"),
     protocolSchemaVersion: integer("protocol_schema_version"),
+    /**
+     * Set only on the terminal bounded-retry exhaustion lifecycle event. This
+     * replaces the `message LIKE 'Bounded retry exhausted%'` pattern match the
+     * attention, activity, and retry-dedup paths used to filter on: the message
+     * is a human-readable string that redaction and rewording can change, and
+     * an unindexed LIKE over it forced a full text scan of every one of the
+     * company's events on each board page load. A boolean predicate is
+     * indexable and survives copy changes.
+     */
+    retryExhausted: boolean("retry_exhausted").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
@@ -46,5 +57,11 @@ export const heartbeatRunEvents = pgTable(
       .where(sql`${table.sourceInstanceId} is not null and ${table.sourceSeq} is not null`),
     companyRunIdx: index("heartbeat_run_events_company_run_idx").on(table.companyId, table.runId),
     companyCreatedIdx: index("heartbeat_run_events_company_created_idx").on(table.companyId, table.createdAt),
+    // Supports the company-scoped exhaustion feed in
+    // services/attention-exhausted-runs.ts, which deduplicates by run and
+    // orders by the latest event id.
+    companyRetryExhaustedIdx: index("heartbeat_run_events_company_retry_exhausted_idx")
+      .on(table.companyId, table.runId, sql`${table.id} DESC`)
+      .where(sql`${table.retryExhausted}`),
   }),
 );
