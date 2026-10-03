@@ -858,6 +858,47 @@ test("shared cargo target scope: a broken process lister falls back to /proc and
   }
 });
 
+test("shared cargo target scope: an unreadable process table skips the reclaim instead of deleting", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // cargo_rustc_running has three outcomes, and this is the third: every
+    // lister is broken AND /proc cannot be read at all, so it cannot say
+    // whether a build is writing into the tree. That is `return 2`, and the
+    // only safe reading of it is "skip" -- the alternative bug is treating an
+    // unreadable process table as "nothing is running" and reclaiming a
+    // directory a live cargo is midway through filling.
+    //
+    // /proc is pointed at an empty directory: the fallback iterates
+    // PROC_ROOT/[0-9]*/comm, finds no readable entry, and never sets seen=1,
+    // which is exactly the "cannot tell" condition. A real /proc cannot be
+    // emptied from an unprivileged container, so PROC_ROOT is the seam.
+    const emptyProc = path.join(sandbox.root, "empty-proc");
+    mkdirSync(emptyProc);
+    for (const tool of ["pgrep", "pidof"]) {
+      writeFileSync(path.join(sandbox.binDir, tool), "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+    }
+    const target = seedSharedCargoTarget(sandbox, { name: "debug" });
+    const bytesBefore = treeBytes(sandbox.mount);
+
+    const result = run(sandbox, ["--prune"], {
+      DISK_GUARD_CRIT_PCT: "1",
+      DISK_GUARD_API_STUB: apiStub,
+      DISK_GUARD_PROC_ROOT: emptyProc,
+    });
+    assert.equal(result.status, RC_CRITICAL, `expected a critical measurement, got ${result.status}: ${result.stderr}`);
+    assert.ok(
+      existsSync(target),
+      "a shared cargo target must survive when the guard cannot tell whether a build is running",
+    );
+    assert.match(result.stderr, /cannot tell whether cargo or rustc is running/);
+    assert.equal(treeBytes(sandbox.mount), bytesBefore, "an unreadable process table must free nothing");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 test("shared cargo target scope: a symlinked shared dir is never a candidate", () => {
   const sandbox = makeSandbox();
   try {
@@ -933,14 +974,63 @@ test("a name that parses as <PREFIX>-<number> still routes down the per-issue pa
   }
 });
 
-test("the committed script stays in sync with the deployed runtime copies", { skip: process.env.DISK_GUARD_SKIP_SYNC_CHECK === "1" }, () => {
+// Expected guard_version of the committed script. This constant is the whole
+// point of DEF-294: the previous version of this test only compared against the
+// runtime copies under /paperclip, and `continue`d past any that were absent --
+// so on a GitHub runner, where /paperclip does not exist, it asserted nothing
+// at all and could not fail. A test that can only fail on the one machine that
+// already drifted is a test that did not catch the drift.
+//
+// The manifest is what makes the check mean something off-volume. A deployment
+// has to be performed by something (`install -m 0755 scripts/disk-guard.sh
+// /paperclip/bin/disk-guard.sh`), so a copy can legitimately be absent; a copy
+// that is PRESENT but reports a different version, or differs by a byte, is
+// always a bug and is checked. Set the env var only for a deliberate
+// uninstall, never to quiet a real mismatch.
+const EXPECTED_GUARD_VERSION = 4;
+const RUNTIME_COPIES = ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"];
+
+test("the committed script declares the guard_version the repo expects", () => {
+  const committed = readFileSync(SCRIPT, "utf8");
+  const declared = committed.match(/guard_version=(\d+)/);
+  assert.ok(declared, "scripts/disk-guard.sh must write a guard_version into its status file");
+  assert.equal(
+    Number(declared[1]),
+    EXPECTED_GUARD_VERSION,
+    `scripts/disk-guard.sh declares guard_version=${declared[1]} but the repo expects ${EXPECTED_GUARD_VERSION}; bump the constant deliberately and redeploy /paperclip in the same change`,
+  );
+});
+
+test("every installed runtime copy of the guard is the version the repo ships", { skip: process.env.DISK_GUARD_SKIP_SYNC_CHECK === "1" }, () => {
   const committed = readFileSync(SCRIPT);
-  for (const runtimeCopy of ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"]) {
-    if (!existsSync(runtimeCopy)) continue;
-    const deployed = readFileSync(runtimeCopy);
+  const committedVersion = committed.toString("utf8").match(/guard_version=(\d+)/)[1];
+  assert.equal(
+    committedVersion,
+    String(EXPECTED_GUARD_VERSION),
+    "bump EXPECTED_GUARD_VERSION before comparing runtime copies, or this asserts nothing",
+  );
+
+  const present = RUNTIME_COPIES.filter((copy) => existsSync(copy));
+  for (const runtimeCopy of present) {
+    const deployed = readFileSync(runtimeCopy, "utf8");
+    const deployedVersion = deployed.match(/guard_version=(\d+)/);
+    assert.equal(
+      deployedVersion && deployedVersion[1],
+      committedVersion,
+      `${runtimeCopy} reports guard_version=${deployedVersion ? deployedVersion[1] : "none"} but the repo ships ${committedVersion}; redeploy it from the repo copy`,
+    );
     assert.ok(
-      deployed.equals(committed),
+      deployed === committed.toString("utf8"),
       `${runtimeCopy} has drifted from scripts/disk-guard.sh; redeploy it from the repo copy`,
+    );
+  }
+  // No assertion on a machine that has never deployed the guard (a CI runner,
+  // a fresh contributor checkout). The version test above is what holds there.
+  if (present.length === 0) {
+    assert.equal(
+      EXPECTED_GUARD_VERSION,
+      Number(committed.toString("utf8").match(/guard_version=(\d+)/)[1]),
+      "with no runtime copy installed, the committed version is the only thing that can be checked",
     );
   }
 });

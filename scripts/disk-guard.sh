@@ -71,6 +71,10 @@ CARGO_TARGET_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_CARGO_TARGET_RECLAIM_MIN_AGE_HO
 # reclaimable. The dir name alone is a human-typed label, not proof of who owns
 # the build output inside it.
 CARGO_TARGET_OWNER_MARKER="${DISK_GUARD_CARGO_TARGET_OWNER_MARKER:-.paperclip-owner}"
+# Root of the process table consulted when pgrep and pidof are both unavailable.
+# Overridable only so the "cannot tell" branch of cargo_rustc_running is
+# testable; production never sets it.
+PROC_ROOT="${DISK_GUARD_PROC_ROOT:-/proc}"
 
 mode="${1:---check}"
 
@@ -264,7 +268,11 @@ cargo_rustc_running() {
     return 1
   done
   local comm proc seen=0
-  for proc in /proc/[0-9]*/comm; do
+  # PROC_ROOT exists so the "cannot tell" outcome is reachable in a test. The
+  # production value is /proc and nothing should override it; a mount namespace
+  # that hides /proc is not something a test can arrange in an unprivileged
+  # container, and an untestable fail-closed branch is one that rots.
+  for proc in "$PROC_ROOT"/[0-9]*/comm; do
     [ -r "$proc" ] || continue
     seen=1
     read -r comm <"$proc" 2>/dev/null || continue
