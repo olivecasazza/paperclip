@@ -171,10 +171,30 @@ newest_mtime_epoch() {
   find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
 }
 
+# The issue a branch names, or nothing when it names none.
+#
+# The leading `(.*[^A-Za-z0-9-])?` is lazy on purpose. Branch names routinely carry a
+# second identifier-shaped token that is NOT the owning issue -- `con-220-clippy-194-stacked`
+# names CLIPPY-194, `fix/nixlab-1792-rclone-500-retry-storm` names RCLONE-500 -- so a
+# greedy `.*` would capture that trailing token and make corroboration fail closed on
+# exactly the trees whose branch describes the work in most detail. The owning issue is
+# the leading one, so we take the first token whose left edge is either the start of the
+# string or a character that cannot be part of an identifier.
+#
+# A lazy prefix ALONE is not enough, and this is worth recording: with `s/^.*?\b(...)\b.*/`
+# sed backtracks through the lazy prefix to satisfy the trailing `.*` and re-selects the
+# last token anyway. Requiring the left delimiter is what actually pins the match. The
+# group is optional so a bare `def-1` branch still resolves, which the workspace scan
+# depends on.
+#
+# This only decides WHICH identifier a branch asserts. Whether the tree may actually be
+# reclaimed is settled independently: wt_corroborated_identifier requires agreement with
+# the directory name, and issue_is_terminal then requires the owning issue to be finished.
+# Resolving this token more accurately cannot widen the delete surface on its own.
 candidate_issue_identifier() {
   local checkout="$1" branch identifier
   branch="$(git -C "$checkout" branch --show-current 2>/dev/null || true)"
-  identifier="$(printf '%s\n' "$branch" | sed -nE 's/.*\b([A-Za-z]+-[0-9]+)\b.*/\U\1/p' | head -1)"
+  identifier="$(printf '%s\n' "$branch" | sed -nE 's/^(.*[^A-Za-z0-9-])?([A-Za-z]+)-([0-9]+).*/\U\2-\3/p' | head -1)"
   [ -n "$identifier" ] && printf '%s\n' "$identifier"
 }
 
@@ -191,12 +211,13 @@ wt_name_identifier() {
 # signals disagree.
 #
 # The directory name and the branch are each sufficient to look convincing and
-# each wrong on its own: `wt/con-220` is on `fix/con-220-clippy-194-stacked`, so
-# the branch alone says CLIPPY-194 (an issue that does not exist) while the name
-# alone would trust a label any process could create. Requiring agreement means a
-# tree can only ever be reclaimed for an issue both its location and its history
-# point at, and a renamed or shared branch fails closed instead of resolving to
-# whatever name happened to appear in it.
+# each wrong on its own: `wt/con-220` is on `fix/con-220-clippy-194-stacked`, whose
+# *leading* identifier token is CON-220 even though the branch also mentions
+# CLIPPY-194. Trusting the name alone would let any process mint a label that points
+# at a terminal issue it does not own. Requiring agreement means a tree can only
+# ever be reclaimed for an issue both its location and its history point at, and a
+# renamed or shared branch fails closed instead of resolving to whatever name
+# happened to appear in it.
 #
 # Prints the agreed identifier, returns 1 when they disagree or either is absent.
 wt_corroborated_identifier() {

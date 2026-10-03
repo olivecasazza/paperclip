@@ -612,23 +612,56 @@ test("wt scope: a terminal issue's worktree build output is pruned, and every fa
   }
 });
 
-test("wt scope: name and branch must agree on the issue, so a branch cannot reassign a tree", () => {
+test("wt scope: the branch's LEADING identifier is the owning issue, not a trailing one", () => {
   const sandbox = makeSandbox();
   try {
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
-    // CON-220 and CLIPPY-194 are both terminal, so only corroboration can tell
-    // them apart. This is the measured live shape of wt/con-220.
+    // CLIPPY-194 is terminal too, and deliberately so: only correct token
+    // selection can tell CON-220 from CLIPPY-194 here. These are the measured
+    // live branch shapes -- each names its owning issue first and then some other
+    // identifier-shaped token describing the work (a Rust lint, a client, a
+    // status code). A greedy `.*` resolves all of these to the trailing token and
+    // silently strands the tree.
     const apiStub = installPaperclipApiStub(sandbox, {
-      issues: { "CON-220": "done", "CLIPPY-194": "done", "CON-9": "done" },
+      issues: { "CON-220": "done", "CLIPPY-194": "done", "NIXLAB-1792": "done", "RCLONE-500": "done" },
     });
-    const mismatched = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-clippy-194-stacked" });
-    const noBranch = seedWorktree(sandbox, { dirName: "con-9", branch: "" });
+    const clippy = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-clippy-194-stacked" });
+    const rclone = seedWorktree(sandbox, { dirName: "nixlab-1792-rclone", branch: "fix/nixlab-1792-rclone-500-retry-storm" });
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
     assert.ok(
-      existsSync(mismatched.full),
-      "a tree whose branch names a different issue must survive, even when both issues are terminal",
+      !existsSync(clippy.full),
+      "a tree whose branch mentions a second issue later must still be reclaimed against its leading identifier",
+    );
+    assert.ok(
+      !existsSync(rclone.full),
+      "a trailing token that looks like another issue must not reassign the tree away from its own issue",
+    );
+    assert.doesNotMatch(result.stderr, /do not agree on an issue identifier/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: name and branch must agree on the issue, so a branch cannot reassign a tree", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // A branch that leads with a DIFFERENT issue than the directory name is a
+    // genuine disagreement and must still fail closed -- the token-selection fix
+    // must not become a way to make any tree look corroborated.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-9": "done", "CON-1": "done", "CLIPPY-194": "done" },
+    });
+    const reassigned = seedWorktree(sandbox, { dirName: "con-9", branch: "fix/con-1-clippy-194-elsewhere" });
+    const noBranch = seedWorktree(sandbox, { dirName: "con-9-detached", branch: "" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(reassigned.full),
+      "a tree whose branch names a different issue first must survive, even when both issues are terminal",
     );
     assert.ok(existsSync(noBranch.full), "a detached tree with no branch identifier must survive");
     assert.match(result.stderr, /do not agree on an issue identifier/);
