@@ -3762,6 +3762,7 @@ export function recoveryService(
     latestRun: LatestIssueRun,
     options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
   ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
+    let settledAttemptCount: number | undefined;
     const current = await db
       .select()
       .from(issues)
@@ -3792,9 +3793,31 @@ export function recoveryService(
     });
     if (episode) {
       if (!latestRun) return "skipped";
+      const runAgentId = latestRun.agentId;
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
       if (decision.kind === "skip") return "skipped";
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
+      // `exhausted` on a run that did not succeed means the last permitted
+      // attempt failed. Re-arm the budget below to the exhausted value so the
+      // existing escalation branch terminates the action instead of scheduling
+      // an attempt that can never be granted. Scope this to a real persisted
+      // action owned by the same source episode: a bare exhaustion decision
+      // must never invent an action for an unrelated or already-settled issue.
+      if (decision.kind === "exhausted" && latestRun.status !== "succeeded") {
+        const persisted = await recoveryActionsSvc.getActiveForIssue(
+          current.companyId,
+          current.id,
+        );
+        if (
+          persisted?.kind !== "deliberate_wait_without_target" ||
+          persisted.fingerprint !== state.fingerprint ||
+          persisted.ownerType !== "agent" ||
+          persisted.returnOwnerAgentId !== runAgentId
+        ) {
+          return "skipped";
+        }
+        settledAttemptCount = decision.attempt;
+      }
     }
     if (state.hasActiveExecutionPath) return "skipped";
     if (state.hasDurableWaitingPath) {
@@ -3835,7 +3858,11 @@ export function recoveryService(
     // attempts merely because the recovery-action row did not exist yet.
     const historicalAttempt = Math.min(
       maxAttempts,
-      Math.max(episode?.attempt ?? 0, Math.floor(options.historicalAttemptCount ?? 0)),
+      Math.max(
+        episode?.attempt ?? 0,
+        Math.floor(options.historicalAttemptCount ?? 0),
+        settledAttemptCount ?? 0,
+      ),
     );
     // A source run owns one successor slot. Concurrent checks must not advance
     // the counter again after another checker reserved that same successor.

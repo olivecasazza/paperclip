@@ -2054,6 +2054,80 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status: "todo", assigneeAgentId: coderId });
   });
 
+  it("lets the original owner check out a source issue after board escalation", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "deliberate_wait_without_target", ownerType: "board",
+      previousOwnerAgentId: coderId, returnOwnerAgentId: coderId, cause: "deliberate_wait_without_target",
+      fingerprint: "disposition:escalated", evidence: { terminalReason: "unchanged_source_state_exhausted", sourceAttemptCount: 2, sourceMaxAttempts: 2 },
+      nextAction: "Review the outcome.", wakePolicy: { type: "board_escalation" },
+    });
+    // The escalated hand-back must reach the original owner's claim path rather
+    // than dead-ending on the stale-retry gate.
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" })
+      .expect(200);
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" })
+      .expect(200);
+
+    const settled = (
+      await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId))
+        .then((rows) => rows[0]!)
+    );
+    expect(settled).toMatchObject({ status: "todo", assigneeAgentId: coderId });
+    // `todo` plus an agent owner is the claimable shape: no blocker, no hold.
+    expect(settled.checkoutRunId).toBeNull();
+    expect(settled.monitorNextCheckAt).toBeNull();
+    expect(await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("keeps a pending interaction blocking the escalated hand-back", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "deliberate_wait_without_target", ownerType: "board",
+      previousOwnerAgentId: coderId, returnOwnerAgentId: coderId, cause: "deliberate_wait_without_target",
+      fingerprint: "disposition:escalated-pending", evidence: { terminalReason: "unchanged_source_state_exhausted" },
+      nextAction: "Review the outcome.", wakePolicy: { type: "board_escalation" },
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId, issueId: sourceIssueId, kind: "request_confirmation", status: "pending",
+      createdByAgentId: coderId,
+      payload: { version: 1, prompt: "Confirm the escalated hand-back." },
+    });
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    const denied = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" })
+      .expect(409);
+    expect(denied.body.details?.code).toBe("disposition_recovery_interaction_pending");
+    expect(wake).not.toHaveBeenCalled();
+    // The escalated action must survive the refusal so the board can still act.
+    expect(await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      ownerType: "board",
+    });
+    expect(
+      (await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0],
+    ).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+  });
+
   it("hands restored work back to the recorded return owner and records the outcome", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
