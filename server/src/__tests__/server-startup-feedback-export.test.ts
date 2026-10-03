@@ -300,6 +300,7 @@ vi.mock("../services/index.js", () => ({
   })),
   issueThreadInteractionService: issueThreadInteractionServiceFactoryMock,
   issueService: vi.fn(() => ({ update: vi.fn(async () => null) })),
+  startHeartbeatRunPayloadRetention: vi.fn(() => vi.fn()),
   instanceSettingsService: vi.fn(() => ({
     getExperimental: vi.fn(async () => ({
       enableExternalObjects: true,
