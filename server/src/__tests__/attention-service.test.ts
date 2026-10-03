@@ -529,6 +529,7 @@ describeEmbeddedPostgres("attention service", () => {
       eventType: "lifecycle",
       message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
       payload: { retryReason: "transient_failure", maxAttempts: 4 },
+      retryExhausted: true,
       createdAt: new Date("2026-07-09T12:09:01.000Z"),
     });
 
@@ -944,17 +945,20 @@ describeEmbeddedPostgres("attention service", () => {
       await db.insert(heartbeatRunEvents).values(Array.from({ length: 500 }, (_, index) => ({
         companyId, agentId: workerId, runId: failedId, seq: batch * 500 + index + 1,
         eventType: "lifecycle", message: `Bounded retry exhausted receipt ${batch * 500 + index + 1}`,
+        retryExhausted: true,
       })));
     }
     await db.insert(heartbeatRunEvents).values([
-      { companyId, agentId: workerId, runId: timedOutId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted timeout" },
-      { companyId, agentId: workerId, runId: succeededId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted success" },
-      { companyId, agentId: reviewerId, runId: terminatedId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted terminated" },
-      { companyId: other.companyId, agentId: other.workerId, runId: foreignId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted other company" },
+      { companyId, agentId: workerId, runId: timedOutId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted timeout", retryExhausted: true },
+      { companyId, agentId: workerId, runId: succeededId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted success", retryExhausted: true },
+      { companyId, agentId: reviewerId, runId: terminatedId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted terminated", retryExhausted: true },
+      { companyId: other.companyId, agentId: other.workerId, runId: foreignId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted other company", retryExhausted: true },
       // A newer event must not replace the latest matching, company-scoped receipt.
-      { companyId: other.companyId, agentId: other.workerId, runId: failedId, seq: 2501, eventType: "lifecycle", message: "Bounded retry exhausted foreign receipt" },
-      { companyId, agentId: workerId, runId: failedId, seq: 2502, eventType: "stdout", message: "Bounded retry exhausted quoted output" },
-      { companyId, agentId: workerId, runId: failedId, seq: 2503, eventType: "lifecycle", message: "Unrelated lifecycle event" },
+      { companyId: other.companyId, agentId: other.workerId, runId: failedId, seq: 2501, eventType: "lifecycle", message: "Bounded retry exhausted foreign receipt", retryExhausted: true },
+      { companyId, agentId: workerId, runId: failedId, seq: 2502, eventType: "stdout", message: "Bounded retry exhausted quoted output", retryExhausted: true },
+      // The newest company-scoped lifecycle event for this run, but not an
+      // exhaustion receipt. It must not displace the latest real receipt.
+      { companyId, agentId: workerId, runId: failedId, seq: 2503, eventType: "lifecycle", message: "Unrelated lifecycle event", retryExhausted: false },
     ]);
 
     // Assert the database result itself: JavaScript feed deduplication used to
@@ -1019,6 +1023,7 @@ describeEmbeddedPostgres("attention service", () => {
       seq: 1,
       eventType: "lifecycle",
       message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      retryExhausted: true,
       createdAt: new Date("2026-07-09T12:00:01.000Z"),
     });
 
