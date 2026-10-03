@@ -5,7 +5,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { boundHeartbeatRunEventPayloadForStorage, heartbeatService } from "../services/heartbeat.ts";
+import { boundHeartbeatRunEventPayloadForStorage, heartbeatService, HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -99,6 +99,63 @@ describeEmbeddedPostgres("heartbeat list", () => {
         delete (heartbeatRuns as Record<string, unknown>).processGroupId;
       }
     }
+  });
+
+  it("clamps a missing limit instead of returning every run for the agent", async () => {
+    // Regression for the CON-431 pool starvation. An omitted limit used to
+    // build an unbounded list query; on the AgentDetail path that returned
+    // 5,482 rows with the full transcript projection and held a drizzle pool
+    // connection for ~15s (measured 2026-10-03). The bound must hold for the
+    // service itself, not only for the route's ?limit= parsing, so a future
+    // internal caller cannot reintroduce it by omitting the argument.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const total = HEARTBEAT_RUN_LIST_DEFAULT_LIMIT + 25;
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: total }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment" as const,
+        status: "succeeded" as const,
+        // Distinct, increasing timestamps so the ordering assertion below is
+        // stable rather than relying on insertion order.
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)),
+      })),
+    );
+
+    const unbounded = await heartbeatService(db).list(companyId, agentId);
+    expect(unbounded).toHaveLength(HEARTBEAT_RUN_LIST_DEFAULT_LIMIT);
+    // The cap keeps the newest rows, which is what a display list renders.
+    expect(unbounded[0]?.createdAt.toISOString()).toBe(
+      new Date(Date.UTC(2026, 0, 1, 0, 0, total - 1)).toISOString(),
+    );
+
+    const explicit = await heartbeatService(db).list(companyId, agentId, 5);
+    expect(explicit).toHaveLength(5);
+
+    const capped = await heartbeatService(db).list(companyId, agentId, HEARTBEAT_RUN_LIST_MAX_LIMIT + 5_000);
+    expect(capped).toHaveLength(total);
   });
 
   it("returns small result json payloads unchanged from getRun", async () => {
