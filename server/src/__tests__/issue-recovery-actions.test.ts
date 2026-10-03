@@ -2930,6 +2930,47 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(after?.status).toBe("done");
     });
 
+    it("leaves an unrelated active recovery action on the same issue alone", async () => {
+      const { coderId, sourceIssue, companyId } = await seedCompany();
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      });
+
+      // A different kind of recovery is armed on this issue. Settling the stale
+      // stranded escalation must not sweep it up as collateral: it is about a
+      // different cause, and silently resolving it would hide real work from the
+      // board.
+      const unrelated = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "missing_disposition",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: "missing-disposition:unrelated",
+        evidence: { sourceRunId: "run-unrelated" },
+        nextAction: "Write a valid issue disposition.",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, sourceIssue.id));
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: { ...sourceIssue, status: "in_progress" },
+        previousStatus: "in_progress",
+        latestRun: makeStrandedRun(coderId, sourceIssue.id),
+      });
+
+      const [unrelatedRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, unrelated.id));
+      expect(unrelatedRow?.status).toBe("active");
+    });
+
     it("still escalates a live in_progress source, so the fence is not a blanket disable", async () => {
       const { coderId, sourceIssue } = await seedCompany();
       const recovery = recoveryService(db, {

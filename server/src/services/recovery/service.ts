@@ -3971,9 +3971,15 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
   }) {
+    // Scope the settle to the stranded action this call is about. An unfiltered
+    // `resolveActiveForIssue` resolves *every* active action on the issue, so a
+    // concurrent `missing_disposition` hold about a different cause would be
+    // resolved as collateral and its real work silently dropped from the board.
     const settled = await recoveryActionsSvc.resolveActiveForIssue({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
+      kind: strandedRecoveryActionKind(input.recoveryCause),
+      cause: input.recoveryCause,
       status: "resolved",
       outcome: "false_positive",
       resolutionNote: `source_terminal:${input.issue.status}`,
