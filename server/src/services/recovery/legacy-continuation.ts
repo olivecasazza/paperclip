@@ -65,7 +65,14 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   | { kind: "enqueue"; nextAttempt: number; idempotencyKey: string; instruction: string } {
   const { run, issue, agent, gates, episode } = input;
   if (run.runtimeMode === "native") return { kind: "skip", reason: "native_finalization" };
-  if (run.status !== "succeeded") return { kind: "skip", reason: "run_not_successful" };
+  // A bounded repair budget is spent by attempts, not only by successful ones.
+  // Once the last allowed attempt has been consumed, exhaustion is a terminal
+  // source condition and must keep flowing to the board escalation decision
+  // below even when the run that spent it failed. A failed run inside a live
+  // budget still belongs to its own retry/error handling.
+  if (run.status !== "succeeded" && episode.attempt < episode.maxAttempts) {
+    return { kind: "skip", reason: "run_not_successful" };
+  }
   if (!issue || !agent || issue.companyId !== run.companyId || agent.companyId !== run.companyId || agent.id !== run.agentId) return { kind: "skip", reason: "invalid_binding" };
   if (issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return { kind: "skip", reason: "owner_changed" };
   if (!["todo", "in_progress"].includes(issue.status)) return { kind: "skip", reason: "recorded_disposition" };
