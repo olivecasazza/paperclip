@@ -21,8 +21,12 @@
 #   * .local/share/pnpm/store                — 31261 of 31417 inodes are
 #     hardlinked into node_modules, so it LOOKS like 581M but is almost
 #     entirely un-reclaimable. Purging it frees ~15M and breaks hardlink dedup.
-#   * instances/ and wt/                     — live agent homes and git worktrees
-#     on open branches. Deleting loses uncommitted work.
+#   * instances/                             — live agent homes on open branches.
+#     Deleting loses uncommitted work. Only build output (*/target, node_modules)
+#     inside a checkout whose issue is terminal is ever a candidate.
+#   * wt/                                    — shared git worktrees. Same rule:
+#     the trees themselves and any source are never touched, only regenerable
+#     build output, and only for this company's issues.
 #   * .nix-portable, .local/share/nix, .rustup — live toolchains; nix GC needs
 #     proot and is not safe to run unsupervised from a live pod.
 #
@@ -36,6 +40,25 @@
 # issue (`debug/`, `tmp/`) has no issue to be terminal, so it is reclaimed on age
 # and containment instead -- but only if its name is not attributed to some other
 # company or issue, no cargo/rustc is running, and its inodes are unshared.
+#
+# wt/ holds shared git worktrees, scanned as a second deletion-capable root. It
+# runs the *same* gate as instances/default/workspaces -- `corroborated_checkout_
+# issue`, which demands repository identity first and then directory/branch
+# agreement -- so a worktree is reclaimable only when a company clone vouches for
+# it and its name and branch name the same ticket.
+#
+# That ordering is load-bearing, and the reason wt/ needed the gate at all rather
+# than only name+branch. Measured across the 110 wt/ trees on this volume: 83 are
+# not clones of the project repo and two have no origin at all, so 74 of them
+# clear a name+branch check that carries no provenance -- including foreign
+# `nixlab-*` and `sti-*` trees whose branches are free to name tickets in our
+# namespace. A directory name is a label any process can create; `git
+# rev-parse --git-common-dir` is evidence. Only the latter keeps them out.
+#
+# Within a company-vouched tree, corroboration is still required, because the
+# names themselves disagree in the wild: `wt/con-220` is on
+# `fix/con-220-clippy-194-stacked`, so the branch alone reads as `CLIPPY-194`,
+# an issue that does not exist. Disagreement skips and fails closed.
 #
 # Usage:
 #   disk-guard.sh --check     report only; exit 2 at WARN, 3 at CRIT
@@ -67,6 +90,8 @@ WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces
 WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
 CARGO_TARGET_SHARED_DIR="${DISK_GUARD_CARGO_TARGET_SHARED_DIR:-$MOUNT/cargo-target-shared}"
 CARGO_TARGET_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_CARGO_TARGET_RECLAIM_MIN_AGE_HOURS:-24}"
+WT_DIR="${DISK_GUARD_WT_DIR:-$MOUNT/wt}"
+WT_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WT_RECLAIM_MIN_AGE_HOURS:-24}"
 # In-band ownership marker each shared cargo target dir must carry to be
 # reclaimable. The dir name alone is a human-typed label, not proof of who owns
 # the build output inside it.
@@ -330,6 +355,72 @@ workspace_reclaim_candidates() {
   done <<<"$(printf '%s' "$agents_json" | json_agent_ids)"
 }
 
+# Second deletion-capable root: shared git worktrees under wt/.
+#
+# Build output under a worktree is regenerable, so reclaiming it cannot lose
+# source -- but the tree itself can still be another company's, and this volume
+# holds `wt/nixlab-*` and `wt/sti-*` from three other repos. So this root runs
+# the identical gate the workspace root runs, via the identical function:
+# `corroborated_checkout_issue`, which refuses unless a company clone vouches for
+# the repository AND the directory name and git branch name the same ticket.
+#
+# Reusing the workspace gate rather than a wt-only name+branch helper is the point
+# of the change: name and branch agree on 74 of the 83 trees here that are not
+# clones of the project repo, so corroboration alone is a name-based check standing
+# in for a provenance-based one. Provenance first, corroboration second.
+wt_reclaim_candidates() {
+  local checkout rel p p_real identifier tracked newest cutoff
+  [ -d "$WT_DIR" ] || return 0
+  cutoff=$(( $(date +%s) - WT_RECLAIM_MIN_AGE_HOURS * 3600 ))
+  for checkout in "$WT_DIR"/*; do
+    [ -d "$checkout" ] || continue
+    [ ! -L "$checkout" ] || { log "skip  $checkout (worktree is a symlink)"; continue; }
+    [ -e "$checkout/.git" ] || continue
+    identifier="$(corroborated_checkout_issue "$checkout")"
+    if [ -z "$identifier" ]; then
+      continue
+    fi
+    if ! issue_is_terminal "$identifier"; then
+      log "skip  $checkout (issue $identifier is not terminal)"
+      continue
+    fi
+    for rel in target node_modules client/target; do
+      p="$checkout/$rel"
+      [ -e "$p" ] || continue
+      if [ -L "$p" ]; then
+        log "skip  $p (candidate is a symlink)"
+        continue
+      fi
+      p_real="$(contained_realpath "$WT_DIR" "$p")" || {
+        log "skip  $p (outside wt)"
+        continue
+      }
+      # `git check-ignore` exits 1 both for "no rule matches" and for "a rule
+      # matches but the path is tracked" -- tracked files are never ignored, so a
+      # force-added build dir reports NOT ignored here. That is what makes the
+      # check-ignore gate alone sufficient to exclude tracked files; the explicit
+      # `git ls-files` gate below re-states the same condition as a readable
+      # defence rather than a second independent one, and is deliberately kept so
+      # a future git behaviour change cannot turn a tracked path into a candidate.
+      if ! git -C "$checkout" check-ignore -q -- "$rel"; then
+        log "skip  $p (not gitignored)"
+        continue
+      fi
+      tracked="$(git -C "$checkout" ls-files -- "$rel" 2>/dev/null | wc -l | tr -d ' ')"
+      if [ "${tracked:-0}" -ne 0 ]; then
+        log "skip  $p (contains tracked files)"
+        continue
+      fi
+      newest="$(newest_mtime_epoch "$p")"
+      if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+        log "skip  $p (newest mtime under ${WT_RECLAIM_MIN_AGE_HOURS}h)"
+        continue
+      fi
+      printf '%s\n' "$p_real"
+    done
+  done
+}
+
 # A name that fails the <PREFIX>-<number> shape is not automatically shared
 # output. `def-129-base`, `def-129-cold` and `def-doc` all fail it too, but their
 # `def-` head attributes them to another company's issue namespace, and
@@ -547,6 +638,7 @@ prune() {
   local before after p freed total=0
   local lvl="" rc report_output
   local workspace_candidates=()
+  local wt_candidates=()
   local cargo_target_candidates=()
   # Everything below this point consults the issue API, so the company id must
   # resolve before any reclaim work starts.
@@ -607,6 +699,21 @@ prune() {
     fi
     remove_path "$p"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
+    total=$(( total + freed ))
+  done
+
+  while IFS= read -r p; do
+    [ -n "$p" ] && wt_candidates+=("$p")
+  done <<<"$(wt_reclaim_candidates)"
+  for p in "${wt_candidates[@]}"; do
+    [ -e "$p" ] || continue
+    freed="$(unlinked_bytes "$p")"
+    if [ "$freed" -lt 1048576 ]; then
+      log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
+      continue
+    fi
+    remove_path "$p"
+    log "prune $p (~$((freed/1024/1024))MiB reclaimable worktree build output)"
     total=$(( total + freed ))
   done
 

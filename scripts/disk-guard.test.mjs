@@ -89,6 +89,7 @@ function run(sandbox, args, env = {}) {
       DISK_GUARD_COMPANY_ID: "company-1",
       DISK_GUARD_WORKSPACES_DIR: path.join(sandbox.mount, "instances/default/workspaces"),
       DISK_GUARD_PROJECT_REPO: COMPANY_PROJECT_REPO,
+      DISK_GUARD_WT_DIR: path.join(sandbox.mount, "wt"),
       ...env,
     },
   });
@@ -106,7 +107,7 @@ function exists(sandbox, relPath) {
   return existsSync(path.join(sandbox.mount, relPath));
 }
 
-function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" }, ignoreQuery = false } = {}) {
+function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" }, ignoreQuery = false, strictScope = false } = {}) {
   const stub = path.join(sandbox.binDir, "paperclip-api-stub.mjs");
   const body = [
     "#!/usr/bin/env node",
@@ -115,9 +116,14 @@ function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DE
     "const requestPath = process.argv[2] || '';",
     "if (requestPath.includes('/agents')) { console.log(JSON.stringify(roster.map((id) => ({ id })))); process.exit(0); }",
     `const ignoreQuery = ${JSON.stringify(ignoreQuery)};`,
+    `const strictScope = ${JSON.stringify(strictScope)};`,
     "const match = requestPath.match(/[?&]q=([^&]+)/);",
     "const identifier = match ? decodeURIComponent(match[1]) : '';",
     "if (ignoreQuery) { console.log(JSON.stringify({ items: [{ identifier: 'DEF-999', status: 'done' }] })); process.exit(0); }",
+    // strictScope models the real company-scoped route: an identifier from
+    // another company's namespace simply is not in the result set, so the guard
+    // must treat it as non-terminal rather than as a status it can read.
+    "if (strictScope && !Object.prototype.hasOwnProperty.call(issues, identifier)) { console.log(JSON.stringify({ items: [] })); process.exit(0); }",
     "const status = issues[identifier] || 'todo';",
     "console.log(JSON.stringify({ items: [{ identifier, status }] }));",
     "",
@@ -276,6 +282,57 @@ function seedSharedCargoTarget(sandbox, { name, fresh = false, symlink = false }
     symlinkSync(path.join(outside, "real"), path.join(root, name));
   }
   return full;
+}
+
+/**
+ * Seed `$MOUNT/wt/<dirName>` as a git checkout with `rel` build output in it.
+ *
+ * `branch` is set explicitly rather than derived from `dirName` because the two
+ * disagree in the wild, and the guard's safety argument for this root rests on
+ * requiring agreement. Real measured case: `wt/con-220` sits on
+ * `fix/con-220-clippy-194-stacked`, where the branch alone reads as CLIPPY-194.
+ *
+ * `origin` is settable because the wt/ gate demands repository provenance *before*
+ * corroboration: a tree whose origin is not the company project repo must be
+ * refused even when its name and branch agree perfectly. That is the shape of 83
+ * of the 112 trees measured on the live volume.
+ */
+function seedWorktree(sandbox, { dirName, branch, origin = COMPANY_PROJECT_REPO, rel = "target", ignored = true, tracked = false, fresh = false, symlinkCheckout = false } = {}) {
+  const checkout = path.join(sandbox.mount, "wt", dirName);
+  mkdirSync(checkout, { recursive: true });
+  spawnSync("git", ["init", "-q"], { cwd: checkout });
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: checkout });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: checkout });
+  if (origin) spawnSync("git", ["remote", "add", "origin", origin], { cwd: checkout });
+  if (branch) spawnSync("git", ["checkout", "-q", "-b", branch], { cwd: checkout });
+  if (ignored) {
+    writeFileSync(path.join(checkout, ".gitignore"), rel + "\n");
+    // Commit the .gitignore. `git check-ignore` reads ignore rules from the
+    // working tree *and* the index, but only for tracked rules does it match a
+    // directory as a whole; an untracked .gitignore makes check-ignore answer
+    // "no" for the dir, so a fixture that leaves it untracked silently stops at
+    // the gitignore gate and never exercises the gate behind it.
+    spawnSync("git", ["add", "-f", ".gitignore"], { cwd: checkout });
+    spawnSync("git", ["commit", "-q", "-m", "ignore"], { cwd: checkout });
+  }
+  const full = path.join(checkout, rel, "blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  if (tracked) spawnSync("git", ["add", "-f", path.join(rel, "blob")], { cwd: checkout });
+  if (!fresh) {
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(checkout, rel), old, old);
+  }
+  if (symlinkCheckout) {
+    const elsewhere = path.join(sandbox.mount, "outside-wt", dirName);
+    mkdirSync(path.dirname(elsewhere), { recursive: true });
+    renameSync(checkout, elsewhere);
+    rmSync(checkout, { recursive: true, force: true });
+    symlinkSync(elsewhere, checkout);
+  }
+  return { checkout, full };
 }
 
 /** Total bytes of file content under `dir`, used to assert prune freed nothing. */
@@ -823,6 +880,216 @@ test("workspace scope: directory names and symlinks do not authorize deletion", 
     assert.equal(result.status, RC_CRITICAL);
     assert.ok(existsSync(branchOnly.full), "checkout directory names must not determine issue ownership");
     assert.ok(existsSync(path.dirname(symlinkCheckout.full)), "symlinked candidates must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: a terminal issue's worktree build output is pruned, and every failing gate survives", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-1": "done", "CON-2": "todo", "CON-3": "done", "CON-4": "done", "CON-5": "done" },
+    });
+    // The suffix in `con-1-gate` must not change the issue it resolves to.
+    const closed = seedWorktree(sandbox, { dirName: "con-1-gate", branch: "fix/con-1-retire-lanes" });
+    const open = seedWorktree(sandbox, { dirName: "con-2", branch: "fix/con-2-still-open" });
+    const tracked = seedWorktree(sandbox, { dirName: "con-3", branch: "fix/con-3-tracked", tracked: true });
+    const notIgnored = seedWorktree(sandbox, { dirName: "con-4", branch: "fix/con-4-not-ignored", ignored: false });
+    const fresh = seedWorktree(sandbox, { dirName: "con-5", branch: "fix/con-5-fresh", fresh: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(closed.full), "a terminal issue's worktree build output must be pruned");
+    assert.ok(existsSync(open.full), "an open issue's worktree build output must survive");
+    assert.ok(existsSync(tracked.full), "tracked build output must survive");
+    assert.ok(existsSync(notIgnored.full), "non-gitignored build output must survive");
+    assert.ok(existsSync(fresh.full), "fresh build output must survive");
+    // A force-added build file is reported *not ignored* by check-ignore (git
+    // never ignores a tracked path), so this fixture is what keeps the gitignore
+    // gate and the ls-files gate from being conflated: if check-ignore ever
+    // started passing tracked paths, `tracked.full` would be deleted here.
+    assert.match(result.stderr, /not gitignored/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: name and branch must agree on the issue, so a branch cannot reassign a tree", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // CON-220 and CLIPPY-194 are both terminal, so only corroboration can tell
+    // them apart. This is the measured live shape of wt/con-220.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-220": "done", "CLIPPY-194": "done", "CON-9": "done" },
+    });
+    const mismatched = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-clippy-194-stacked" });
+    const noBranch = seedWorktree(sandbox, { dirName: "con-9", branch: "" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(mismatched.full),
+      "a tree whose branch names a different issue must survive, even when both issues are terminal",
+    );
+    assert.ok(existsSync(noBranch.full), "a detached tree with no branch identifier must survive");
+    // The wt/ root now shares the workspace gate, so the refusal is reported with
+    // the two disagreeing values rather than a generic "no agreement" message.
+    // What matters is that it is refused *before* terminality is consulted, and
+    // that CLIPPY-194 being terminal changes nothing.
+    assert.match(result.stderr, /branch says 'CLIPPY-194', directory says 'CON-220'/);
+    assert.match(result.stderr, /branch does not name an issue/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: another company's worktree is never reclaimed, however its branch is named", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // strictScope: only CON-* exists in this company. Every foreign identifier
+    // comes back as no result at all, exactly as the real company-scoped route
+    // behaves, so these trees are protected by ownership rather than by luck.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      strictScope: true,
+      issues: { "CON-1": "done" },
+    });
+    const nixlab = seedWorktree(sandbox, { dirName: "nixlab-1771-timer-context", branch: "fix/nixlab-1771-timer-context" });
+    const sti = seedWorktree(sandbox, { dirName: "sti-415-v2", branch: "fix/sti-415-v2" });
+    // A foreign tree that also carries one of our identifiers in its branch.
+    const impersonating = seedWorktree(sandbox, { dirName: "sti-500", branch: "fix/con-1-impersonator" });
+    // Our own tree, to prove the ownership check is what separates them.
+    const ours = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-ours" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(ours.full), "our own terminal worktree is still reclaimed");
+    assert.ok(existsSync(nixlab.full), "another company's worktree must survive");
+    assert.ok(existsSync(sti.full), "another company's worktree must survive");
+    assert.ok(existsSync(impersonating.full), "a foreign tree must not inherit our issue's status from its branch");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: provenance outranks corroboration -- a foreign-origin clone of OUR issue is still skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // CON-1 is terminal, so terminality cannot be what saves the foreign tree.
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done" } });
+
+    // The dangerous shape, and the reason the wt/ gate checks origin first. Every
+    // name-based signal agrees: the directory is named for our issue, the branch
+    // names the same issue, and that issue is terminal. The only thing that
+    // distinguishes this from ours is that its origin is a different repository.
+    //
+    // This is not hypothetical. Of the 112 trees measured under wt/ on the live
+    // volume, 83 are not clones of the project repo and 74 of those clear a
+    // name+branch check -- so a gate that stops at corroboration reclaims on the
+    // strength of two labels that any process can create.
+    const foreignOrigin = seedWorktree(sandbox, {
+      dirName: "con-1",
+      branch: "fix/con-1-looks-totally-legitimate",
+      origin: "https://github.com/casazza-info/nixlab.git",
+    });
+    // No origin at all: a tree with no repository identity cannot be vouched for.
+    const noOrigin = seedWorktree(sandbox, {
+      dirName: "con-2",
+      branch: "fix/con-2-also-perfectly-named",
+      origin: "",
+    });
+    // The control: identical name and branch, company origin. If this one is not
+    // reclaimed, the test is passing for the wrong reason.
+    const ours = seedWorktree(sandbox, {
+      dirName: "con-3",
+      branch: "fix/con-3-ours",
+      origin: COMPANY_PROJECT_REPO,
+    });
+    const apiStubWithCon3 = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done", "CON-3": "done" } });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStubWithCon3 });
+    assert.equal(result.status, RC_CRITICAL);
+
+    assert.ok(
+      existsSync(foreignOrigin.full),
+      "a tree whose origin is another repository must survive even when name and branch both name a terminal issue of ours",
+    );
+    assert.ok(existsSync(noOrigin.full), "a tree with no origin must survive, not be guessed at");
+    assert.ok(!existsSync(ours.full), "the company-origin control must still be reclaimed, or this test proves nothing");
+
+    // Assert the gate's own words, so a deletion cannot pass by accident.
+    assert.match(result.stderr, /is not the company project repo/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: symlinked worktrees and symlinked build output are skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done" } });
+    const symlinkedCheckout = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-link", symlinkCheckout: true });
+    const symlinkedTarget = seedWorktree(sandbox, { dirName: "con-2", branch: "fix/con-2-target-link" });
+    const outside = path.join(sandbox.mount, "outside-build");
+    mkdirSync(outside);
+    rmSync(path.dirname(symlinkedTarget.full), { recursive: true, force: true });
+    symlinkSync(outside, path.dirname(symlinkedTarget.full));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(symlinkedCheckout.full), "a symlinked worktree must survive");
+    assert.ok(existsSync(path.dirname(symlinkedTarget.full)), "a symlinked build dir must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: build output that resolves outside wt/ is skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done" } });
+    const tree = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-escape" });
+    // Move the build dir outside wt/ and symlink to it. The tree passes every
+    // other gate -- real git repo, corroborated identifier, terminal issue,
+    // gitignored, untracked, old -- so only containment can stop this, and
+    // `rm -rf` would otherwise follow the link out of the root.
+    const real = path.join(sandbox.mount, "outside-build-target");
+    mkdirSync(real, { recursive: true });
+    writeFileSync(path.join(real, "blob"), Buffer.alloc(2 * MIB));
+    rmSync(path.join(tree.checkout, "target"), { recursive: true, force: true });
+    symlinkSync(real, path.join(tree.checkout, "target"));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(path.join(real, "blob")), "build output resolving outside wt/ must survive");
+    assert.match(result.stderr, /candidate is a symlink/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: the worktree itself and its sources are never deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done" } });
+    const tree = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-keep-source" });
+    const sourceFile = path.join(tree.checkout, "src.rs");
+    writeFileSync(sourceFile, "fn main() {}\n");
+    spawnSync("git", ["add", "-f", "src.rs"], { cwd: tree.checkout });
+    spawnSync("git", ["commit", "-q", "-m", "source"], { cwd: tree.checkout });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(tree.full), "the build output is reclaimed");
+    assert.ok(existsSync(tree.checkout), "the worktree itself must survive");
+    assert.ok(existsSync(sourceFile), "committed source in the worktree must survive");
   } finally {
     sandbox.cleanup();
   }
