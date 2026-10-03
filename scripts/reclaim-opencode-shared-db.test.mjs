@@ -14,6 +14,10 @@ const RC_REFUSED = 3;
 
 const SPLIT_COMMIT = "c226db7b3cb45cd66aa20005783798759af5cd03";
 const PRE_SPLIT_COMMIT = "379fc19457588eef1fbd3cc1db3aa0e22adad9d5";
+// The real split commits on olivecasazza/paperclip: the PR #6 merge, and the
+// branch commit it merged. These are what GATE 2 resolves ancestry against.
+const SPLIT_MERGE = "ef74a7a3c21c3ba9a374f723809c956338750f9e";
+const SPLIT_BRANCH = "c7165e96c5e3ca9c8b1f74dbf2d671f7147c647d";
 
 function makeSandbox() {
   const root = mkdtempSync(path.join(os.tmpdir(), "reclaim-opencode-test-"));
@@ -42,6 +46,17 @@ function writePerAgentDb(sandbox, agentId, bytes = 2048) {
   writeFileSync(path.join(dir, "opencode.db"), Buffer.alloc(bytes, 3));
 }
 
+/**
+ * Isolate GATE 2 from this machine.
+ *
+ * The tests that do not exercise the tree proof rely on the commit prefix
+ * matching the real split commits. Pinning PAPERCLIP_APP_DIR at an empty dir
+ * keeps the sandbox off `/app` (which carries the real deployment's tree on
+ * this instance), so a suite run never depends on, or acts on, live state.
+ */
+const ISOLATED_APP_DIR = path.join(os.tmpdir(), "reclaim-opencode-no-app-tree");
+const REAL_SPLIT_COMMITS = `${SPLIT_MERGE} ${SPLIT_BRANCH} ${SPLIT_COMMIT}`;
+
 function run(sandbox, args = [], env = {}) {
   return spawnSync("bash", [SCRIPT, ...args], {
     encoding: "utf8",
@@ -49,6 +64,9 @@ function run(sandbox, args = [], env = {}) {
       ...process.env,
       OPENCODE_SHARED_DATA_DIR: sandbox.shared,
       PER_AGENT_DATA_DIR: sandbox.perAgent,
+      PAPERCLIP_APP_DIR: ISOLATED_APP_DIR,
+      SPLIT_REPO_DIR: ISOLATED_APP_DIR,
+      OPENCODE_SPLIT_COMMITS: REAL_SPLIT_COMMITS,
       EXPECTED_COMMIT: SPLIT_COMMIT,
       IDLE_SECONDS: "0",
       HEALTH_URL: "",
@@ -213,27 +231,34 @@ test("does not require an idle window when IDLE_SECONDS is 0", () => {
   }
 });
 
+function runHealthStub(sandbox, commit, extraEnv = {}) {
+  const stubDir = path.join(sandbox.root, "bin");
+  mkdirSync(stubDir, { recursive: true });
+  writeFileSync(path.join(stubDir, "curl"), `#!/bin/sh\nprintf '{"status":"ok","commit":"${commit}"}\\n'\n`, { mode: 0o755 });
+  return spawnSync("bash", [SCRIPT, "--yes"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${stubDir}:${process.env.PATH}`,
+      OPENCODE_SHARED_DATA_DIR: sandbox.shared,
+      PER_AGENT_DATA_DIR: sandbox.perAgent,
+      PAPERCLIP_APP_DIR: ISOLATED_APP_DIR,
+      SPLIT_REPO_DIR: ISOLATED_APP_DIR,
+      OPENCODE_SPLIT_COMMITS: REAL_SPLIT_COMMITS,
+      EXPECTED_COMMIT: "",
+      HEALTH_URL: "https://paperclip.example.test",
+      IDLE_SECONDS: "0",
+      ...extraEnv,
+    },
+  });
+}
+
 test("reads the commit from the health endpoint when EXPECTED_COMMIT is unset", () => {
   const sandbox = makeSandbox();
   try {
     writeSharedDb(sandbox);
     writePerAgentDb(sandbox, "agent-a");
-    const stubDir = path.join(sandbox.root, "bin");
-    mkdirSync(stubDir, { recursive: true });
-    const stub = path.join(stubDir, "curl");
-    writeFileSync(stub, `#!/bin/sh\nprintf '{"status":"ok","commit":"${SPLIT_COMMIT}"}\\n'\n`, { mode: 0o755 });
-    const result = spawnSync("bash", [SCRIPT, "--yes"], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${stubDir}:${process.env.PATH}`,
-        OPENCODE_SHARED_DATA_DIR: sandbox.shared,
-        PER_AGENT_DATA_DIR: sandbox.perAgent,
-        EXPECTED_COMMIT: "",
-        HEALTH_URL: "https://paperclip.example.test",
-        IDLE_SECONDS: "0",
-      },
-    });
+    const result = runHealthStub(sandbox, SPLIT_COMMIT);
     assert.equal(result.status, RC_OK, result.stderr);
     assert.equal(existsSync(sandbox.sharedDb), false);
   } finally {
@@ -246,22 +271,7 @@ test("refuses a pre-split commit read from the health endpoint", () => {
   try {
     writeSharedDb(sandbox);
     writePerAgentDb(sandbox, "agent-a");
-    const stubDir = path.join(sandbox.root, "bin");
-    mkdirSync(stubDir, { recursive: true });
-    const stub = path.join(stubDir, "curl");
-    writeFileSync(stub, `#!/bin/sh\nprintf '{"status":"ok","commit":"${PRE_SPLIT_COMMIT}"}\\n'\n`, { mode: 0o755 });
-    const result = spawnSync("bash", [SCRIPT, "--yes"], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${stubDir}:${process.env.PATH}`,
-        OPENCODE_SHARED_DATA_DIR: sandbox.shared,
-        PER_AGENT_DATA_DIR: sandbox.perAgent,
-        EXPECTED_COMMIT: "",
-        HEALTH_URL: "https://paperclip.example.test",
-        IDLE_SECONDS: "0",
-      },
-    });
+    const result = runHealthStub(sandbox, PRE_SPLIT_COMMIT);
     refuse(result);
     assert.ok(existsSync(sandbox.sharedDb));
   } finally {
@@ -366,6 +376,127 @@ test("refuses with no tree and no way to read a commit", () => {
     const result = run(sandbox, ["--yes"], { EXPECTED_COMMIT: "", HEALTH_URL: "", PAPERCLIP_APP_DIR: missing });
     refuse(result);
     assert.ok(existsSync(sandbox.sharedDb));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+// --- GATE 2 fallback: ancestry, not prefix matching --------------------------
+//
+// PR #20 made the deployed tree the primary proof but kept the old
+// prefix-match as the dist-only fallback. That fallback still refuses every
+// descendant of the split merge, which is every image published after it --
+// including sha-cadea06, the repin target. These tests pin the corrected
+// behaviour: a real descendant passes, a sibling branch that never got the
+// split still refuses.
+
+function git(cwd, ...args) {
+  const result = spawnSync("git", ["-c", "user.email=t@example.test", "-c", "user.name=t", ...args], {
+    cwd,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+/**
+ * A repo mirroring the fork's history shape: a commit that ADDS the split file,
+ * a descendant that does not touch it, and a sibling branch cut before the
+ * merge (so it predates the split despite sharing the base).
+ */
+function makeForkRepo(root) {
+  const repo = path.join(root, "fork");
+  mkdirSync(repo, { recursive: true });
+  git(repo, "init", "-q", "-b", "master", ".");
+  const marker = path.join(repo, "marker.txt");
+  writeFileSync(marker, "base\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-qm", "base");
+  const base = git(repo, "rev-parse", "HEAD");
+
+  git(repo, "checkout", "-q", "-b", "feature");
+  const dir = path.join(repo, "packages", "adapters", "opencode-local", "src", "server");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "agent-data-home.ts"), "export const x = 1;\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-qm", "add agent-data-home");
+  const split = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "-q", "master");
+  git(repo, "merge", "-q", "--no-ff", "-m", "merge split", "feature");
+  const merge = git(repo, "rev-parse", "HEAD");
+
+  writeFileSync(marker, "later\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-qm", "later");
+  const descendant = git(repo, "rev-parse", "HEAD");
+
+  git(repo, "checkout", "-q", "-b", "sibling", base);
+  writeFileSync(marker, "sibling\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-qm", "sibling");
+  const sibling = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "-q", "master");
+
+  return { repo, split, merge, descendant, sibling };
+}
+
+test("GATE 2 fallback admits a descendant of the split commit (the repin target)", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const fork = makeForkRepo(sandbox.root);
+    const missing = path.join(sandbox.root, "no-such-app-tree");
+    // `descendant` is not in OPENCODE_SPLIT_COMMITS_DEFAULT, so a prefix match
+    // refuses it. This is the repin target and the whole point of the gate.
+    const result = run(sandbox, ["--yes"], {
+      EXPECTED_COMMIT: fork.descendant,
+      PAPERCLIP_APP_DIR: missing,
+      SPLIT_REPO_DIR: fork.repo,
+      OPENCODE_SPLIT_COMMITS: `${fork.split} ${fork.merge}`,
+    });
+    assert.equal(result.status, RC_OK, result.stderr);
+    assert.equal(existsSync(sandbox.sharedDb), false);
+    assert.match(result.stderr, /descends from/, "should log the ancestry proof that admitted it");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("GATE 2 fallback refuses a sibling branch that never received the split", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const fork = makeForkRepo(sandbox.root);
+    const missing = path.join(sandbox.root, "no-such-app-tree");
+    const result = run(sandbox, ["--yes"], {
+      EXPECTED_COMMIT: fork.sibling,
+      PAPERCLIP_APP_DIR: missing,
+      SPLIT_REPO_DIR: fork.repo,
+      OPENCODE_SPLIT_COMMITS: `${fork.split} ${fork.merge}`,
+    });
+    refuse(result);
+    assert.ok(existsSync(sandbox.sharedDb));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("GATE 2 fallback still accepts an exact split commit with no repo at all", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const missing = path.join(sandbox.root, "no-such-app-tree");
+    const result = run(sandbox, ["--yes"], {
+      EXPECTED_COMMIT: SPLIT_COMMIT,
+      PAPERCLIP_APP_DIR: missing,
+      SPLIT_REPO_DIR: path.join(sandbox.root, "also-missing"),
+      OPENCODE_SPLIT_COMMITS: SPLIT_COMMIT,
+    });
+    assert.equal(result.status, RC_OK, result.stderr);
+    assert.equal(existsSync(sandbox.sharedDb), false);
   } finally {
     sandbox.cleanup();
   }
