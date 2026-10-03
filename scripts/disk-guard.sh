@@ -21,14 +21,34 @@
 #   * .local/share/pnpm/store                — 31261 of 31417 inodes are
 #     hardlinked into node_modules, so it LOOKS like 581M but is almost
 #     entirely un-reclaimable. Purging it frees ~15M and breaks hardlink dedup.
-#   * instances/ and wt/                     — live agent homes and git worktrees
-#     on open branches. Deleting loses uncommitted work.
+#   * instances/                             — live agent homes on open branches.
+#     Deleting loses uncommitted work. Only build output (*/target, node_modules)
+#     inside a checkout whose issue is terminal is ever a candidate.
+#   * wt/                                    — shared git worktrees. Same rule:
+#     the trees themselves and any source are never touched, only regenerable
+#     build output, and only for this company's issues.
 #   * .nix-portable, .local/share/nix, .rustup — live toolchains; nix GC needs
 #     proot and is not safe to run unsupervised from a live pod.
 #
 # Everything in safe_caches/ is regenerable from the network. Reclaim is
 # verified per-path by counting only nlink==1 inodes, so a path that has been
 # hardlinked into a live tree is skipped rather than deleted.
+#
+# cargo-target-shared/ holds two kinds of dir. A dir named <PREFIX>-<number>
+# belongs to one issue and is reclaimed only once that issue is terminal and the
+# dir carries a matching .paperclip-owner marker. A dir belonging to no single
+# issue (`debug/`, `tmp/`) has no issue to be terminal, so it is reclaimed on age
+# and containment instead -- but only if its name is not attributed to some other
+# company or issue, no cargo/rustc is running, and its inodes are unshared.
+#
+# wt/ holds this company's shared worktrees, scanned as a second deletion-capable
+# root. A worktree directory name (`con-220-gate`) is a label, not proof of
+# ownership, so terminality is resolved from the *corroborated* issue: the
+# identifier parsed from the directory name and the one parsed from the git
+# branch must agree. Either signal alone is wrong in the wild -- a real tree on
+# this volume is `wt/con-220` on branch `fix/con-220-clippy-194-stacked`, where
+# the branch alone reads as `CLIPPY-194`. Disagreement skips, so a foreign
+# `wt/nixlab-*` tree can never be reclaimed by resemblance.
 #
 # Usage:
 #   disk-guard.sh --check     report only; exit 2 at WARN, 3 at CRIT
@@ -60,6 +80,8 @@ WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces
 WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
 CARGO_TARGET_SHARED_DIR="${DISK_GUARD_CARGO_TARGET_SHARED_DIR:-$MOUNT/cargo-target-shared}"
 CARGO_TARGET_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_CARGO_TARGET_RECLAIM_MIN_AGE_HOURS:-24}"
+WT_DIR="${DISK_GUARD_WT_DIR:-$MOUNT/wt}"
+WT_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WT_RECLAIM_MIN_AGE_HOURS:-24}"
 # In-band ownership marker each shared cargo target dir must carry to be
 # reclaimable. The dir name alone is a human-typed label, not proof of who owns
 # the build output inside it.
@@ -149,11 +171,63 @@ newest_mtime_epoch() {
   find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
 }
 
+# The issue a branch names, or nothing when it names none.
+#
+# The leading `(.*[^A-Za-z0-9-])?` is lazy on purpose. Branch names routinely carry a
+# second identifier-shaped token that is NOT the owning issue -- `con-220-clippy-194-stacked`
+# names CLIPPY-194, `fix/nixlab-1792-rclone-500-retry-storm` names RCLONE-500 -- so a
+# greedy `.*` would capture that trailing token and make corroboration fail closed on
+# exactly the trees whose branch describes the work in most detail. The owning issue is
+# the leading one, so we take the first token whose left edge is either the start of the
+# string or a character that cannot be part of an identifier.
+#
+# A lazy prefix ALONE is not enough, and this is worth recording: with `s/^.*?\b(...)\b.*/`
+# sed backtracks through the lazy prefix to satisfy the trailing `.*` and re-selects the
+# last token anyway. Requiring the left delimiter is what actually pins the match. The
+# group is optional so a bare `def-1` branch still resolves, which the workspace scan
+# depends on.
+#
+# This only decides WHICH identifier a branch asserts. Whether the tree may actually be
+# reclaimed is settled independently: wt_corroborated_identifier requires agreement with
+# the directory name, and issue_is_terminal then requires the owning issue to be finished.
+# Resolving this token more accurately cannot widen the delete surface on its own.
 candidate_issue_identifier() {
   local checkout="$1" branch identifier
   branch="$(git -C "$checkout" branch --show-current 2>/dev/null || true)"
-  identifier="$(printf '%s\n' "$branch" | sed -nE 's/.*\b([A-Za-z]+-[0-9]+)\b.*/\U\1/p' | head -1)"
+  identifier="$(printf '%s\n' "$branch" | sed -nE 's/^(.*[^A-Za-z0-9-])?([A-Za-z]+)-([0-9]+).*/\U\2-\3/p' | head -1)"
   [ -n "$identifier" ] && printf '%s\n' "$identifier"
+}
+
+# Identifier implied by a wt/<PREFIX>-<number><suffix> directory name, uppercased.
+# Only the leading <PREFIX>-<number> head counts: `con-220-gate` names CON-220,
+# and `def-129-base` names DEF-129, so a foreign-prefixed tree is recognised as
+# foreign here rather than being mistaken for unattributed shared output.
+wt_name_identifier() {
+  printf '%s\n' "${1##*/}" |
+    sed -nE 's/^([A-Za-z]+)-([0-9]+).*/\U\1-\2/p' | head -1
+}
+
+# The issue a wt/ tree is reclaimable against, or nothing if the two independent
+# signals disagree.
+#
+# The directory name and the branch are each sufficient to look convincing and
+# each wrong on its own: `wt/con-220` is on `fix/con-220-clippy-194-stacked`, whose
+# *leading* identifier token is CON-220 even though the branch also mentions
+# CLIPPY-194. Trusting the name alone would let any process mint a label that points
+# at a terminal issue it does not own. Requiring agreement means a tree can only
+# ever be reclaimed for an issue both its location and its history point at, and a
+# renamed or shared branch fails closed instead of resolving to whatever name
+# happened to appear in it.
+#
+# Prints the agreed identifier, returns 1 when they disagree or either is absent.
+wt_corroborated_identifier() {
+  local checkout="$1" from_name from_branch
+  from_name="$(wt_name_identifier "$checkout")"
+  from_branch="$(candidate_issue_identifier "$checkout")"
+  [ -n "$from_name" ] || return 1
+  [ -n "$from_branch" ] || return 1
+  [ "$from_name" = "$from_branch" ] || return 1
+  printf '%s\n' "$from_name"
 }
 
 issue_is_terminal() {
@@ -222,6 +296,148 @@ workspace_reclaim_candidates() {
   done <<<"$(printf '%s' "$agents_json" | json_agent_ids)"
 }
 
+# Second deletion-capable root: this company's shared worktrees under wt/.
+#
+# The gates are the same ones workspace_reclaim_candidates applies, and the
+# added one is corroboration. Build output under a worktree is regenerable, so
+# reclaiming it cannot lose source -- but the tree can still be someone else's
+# (this volume holds `wt/nixlab-*` and `wt/sti-*` from other companies), so the
+# issue must be ours *and* terminal *and* both name and branch must agree on it.
+wt_reclaim_candidates() {
+  local checkout rel p p_real identifier tracked newest cutoff
+  [ -d "$WT_DIR" ] || return 0
+  cutoff=$(( $(date +%s) - WT_RECLAIM_MIN_AGE_HOURS * 3600 ))
+  for checkout in "$WT_DIR"/*; do
+    [ -d "$checkout" ] || continue
+    [ ! -L "$checkout" ] || { log "skip  $checkout (worktree is a symlink)"; continue; }
+    [ -e "$checkout/.git" ] || continue
+    identifier="$(wt_corroborated_identifier "$checkout")"
+    if [ -z "$identifier" ]; then
+      log "skip  $checkout (name and branch do not agree on an issue identifier)"
+      continue
+    fi
+    if ! issue_is_terminal "$identifier"; then
+      log "skip  $checkout (issue $identifier is not terminal)"
+      continue
+    fi
+    for rel in target node_modules client/target; do
+      p="$checkout/$rel"
+      [ -e "$p" ] || continue
+      if [ -L "$p" ]; then
+        log "skip  $p (candidate is a symlink)"
+        continue
+      fi
+      p_real="$(contained_realpath "$WT_DIR" "$p")" || {
+        log "skip  $p (outside wt)"
+        continue
+      }
+      # `git check-ignore` exits 1 both for "no rule matches" and for "a rule
+      # matches but the path is tracked" -- tracked files are never ignored, so a
+      # force-added build dir reports NOT ignored here. That is what makes the
+      # check-ignore gate alone sufficient to exclude tracked files; the explicit
+      # `git ls-files` gate below re-states the same condition as a readable
+      # defence rather than a second independent one, and is deliberately kept so
+      # a future git behaviour change cannot turn a tracked path into a candidate.
+      if ! git -C "$checkout" check-ignore -q -- "$rel"; then
+        log "skip  $p (not gitignored)"
+        continue
+      fi
+      tracked="$(git -C "$checkout" ls-files -- "$rel" 2>/dev/null | wc -l | tr -d ' ')"
+      if [ "${tracked:-0}" -ne 0 ]; then
+        log "skip  $p (contains tracked files)"
+        continue
+      fi
+      newest="$(newest_mtime_epoch "$p")"
+      if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+        log "skip  $p (newest mtime under ${WT_RECLAIM_MIN_AGE_HOURS}h)"
+        continue
+      fi
+      printf '%s\n' "$p_real"
+    done
+  done
+}
+
+# A name that fails the <PREFIX>-<number> shape is not automatically shared
+# output. `def-129-base`, `def-129-cold` and `def-doc` all fail it too, but their
+# `def-` head attributes them to another company's issue namespace, and
+# reclaiming on name shape alone is exactly the cross-company deletion CON-375
+# exists to prevent. So a shared candidate must carry no company/issue prefix at
+# all: `debug` and `tmp` qualify, `def-129-base` does not. Failing closed here
+# leaves a labelled dir for a human to attribute rather than guessing.
+shared_name_unattributed() {
+  case "$1" in
+    [A-Za-z]*-*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# 0 = a cargo or rustc process is live, 1 = none is, 2 = cannot tell.
+#
+# A shared target dir is likelier to be mid-build than a per-issue dir, because
+# every build in the company can point at it, so this guard is what stands
+# between --prune and a build writing into the tree. pgrep is absent from some of
+# the images this guard runs on, so fall back to pidof and then to /proc. A tool
+# that errors is not evidence of absence: only a clean "no match" counts, and an
+# unreadable process table reports 2 so the caller can skip.
+cargo_rustc_running() {
+  local tool name rc
+  for tool in pgrep pidof; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    for name in cargo rustc; do
+      "$tool" -x "$name" >/dev/null 2>&1
+      rc=$?
+      [ "$rc" -eq 0 ] && return 0
+      [ "$rc" -ne 1 ] && continue 2
+    done
+    return 1
+  done
+  local comm proc seen=0
+  for proc in /proc/[0-9]*/comm; do
+    [ -r "$proc" ] || continue
+    seen=1
+    read -r comm <"$proc" 2>/dev/null || continue
+    case "$comm" in
+      cargo|rustc) return 0 ;;
+    esac
+  done
+  [ "$seen" -eq 1 ] && return 1
+  return 2
+}
+
+# Shared, non-per-issue target dirs: output that belongs to no single issue, so
+# issue_is_terminal has nothing to resolve and age/containment alone decide. All
+# five gates must pass, and any uncertainty skips.
+shared_cargo_target_candidate() {
+  local p="$1" name="$2" cutoff="$3" p_real newest running
+  if ! shared_name_unattributed "$name"; then
+    log "skip  $p (not a per-issue name, but named for a company or issue)"
+    return 1
+  fi
+  p_real="$(contained_realpath "$CARGO_TARGET_SHARED_DIR" "$p")" || {
+    log "skip  $p (outside cargo-target-shared)"
+    return 1
+  }
+  newest="$(newest_mtime_epoch "$p")"
+  if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+    log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
+    return 1
+  fi
+  cargo_rustc_running
+  running=$?
+  if [ "$running" -eq 0 ]; then
+    log "skip  $p (cargo or rustc is running)"
+    return 1
+  fi
+  if [ "$running" -ne 1 ]; then
+    log "skip  $p (cannot tell whether cargo or rustc is running)"
+    return 1
+  fi
+  # The nlink==1 count is applied by the caller, same as every other candidate:
+  # only inodes nothing else links to are counted as reclaimable, so a shared
+  # tree that shares inodes with a live build is skipped rather than deleted.
+  printf '%s\n' "$p_real"
+}
+
 cargo_target_reclaim_candidates() {
   local p p_real name identifier marked newest cutoff
   [ -d "$CARGO_TARGET_SHARED_DIR" ] || return 0
@@ -232,7 +448,9 @@ cargo_target_reclaim_candidates() {
     name="$(basename -- "$p")"
     identifier="$(printf '%s\n' "$name" | sed -nE 's/^([A-Za-z]+)-([0-9]+)$/\U\1-\2/p')"
     if [ -z "$identifier" ]; then
-      log "skip  $p (not a per-issue target dir)"
+      # No issue to be terminal, so the shared path decides instead of skipping
+      # outright. It prints the candidate on success and logs its own refusals.
+      shared_cargo_target_candidate "$p" "$name" "$cutoff"
       continue
     fi
     # A directory name is a label a person or agent typed, not evidence of who
@@ -326,7 +544,7 @@ report() {
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
     printf 'level=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\n' \
       "$level" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB"
-    printf 'guard_version=3\n'
+    printf 'guard_version=4\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -336,6 +554,7 @@ prune() {
   local before after p freed total=0
   local lvl="" rc report_output
   local workspace_candidates=()
+  local wt_candidates=()
   local cargo_target_candidates=()
   # Everything below this point consults the issue API, so the company id must
   # resolve before any reclaim work starts.
@@ -396,6 +615,21 @@ prune() {
     fi
     remove_path "$p"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
+    total=$(( total + freed ))
+  done
+
+  while IFS= read -r p; do
+    [ -n "$p" ] && wt_candidates+=("$p")
+  done <<<"$(wt_reclaim_candidates)"
+  for p in "${wt_candidates[@]}"; do
+    [ -e "$p" ] || continue
+    freed="$(unlinked_bytes "$p")"
+    if [ "$freed" -lt 1048576 ]; then
+      log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
+      continue
+    fi
+    remove_path "$p"
+    log "prune $p (~$((freed/1024/1024))MiB reclaimable worktree build output)"
     total=$(( total + freed ))
   done
 
