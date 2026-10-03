@@ -2750,4 +2750,270 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  // CON-417: an agent finished its work and wrote a valid `done`, and the
+  // recovery sweep silently clobbered it back to `blocked` on every pass. The
+  // owner then had no escape, because resolving the board escalation it was
+  // stuck behind required board access.
+  describe("a terminal disposition survives stranded-issue recovery", () => {
+    const makeStrandedRun = (agentId: string, issueId: string) =>
+      ({
+        id: randomUUID(),
+        agentId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+        livenessState: "needs_followup",
+      }) as const;
+
+    it.each(["done", "cancelled"] as const)(
+      "does not re-block a source issue already committed as %s, and settles the stale board escalation",
+      async (terminalStatus) => {
+        const { coderId, sourceIssue } = await seedCompany();
+        const recovery = recoveryService(db, {
+          enqueueWakeup: vi.fn(async () => null),
+        });
+
+        // The owner commits a real disposition after the sweep snapshotted its
+        // candidate list. The sweep must honour it.
+        await db
+          .update(issues)
+          .set({ status: terminalStatus })
+          .where(eq(issues.id, sourceIssue.id));
+
+        const result = await recovery.escalateStrandedAssignedIssue({
+          // The caller's snapshot still says in_progress. That staleness is the
+          // bug: the sweep read the candidate before the owner committed.
+          issue: { ...sourceIssue, status: "in_progress" },
+          previousStatus: "in_progress",
+          latestRun: makeStrandedRun(coderId, sourceIssue.id),
+        });
+
+        expect(result).toBeNull();
+        const [after] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, sourceIssue.id));
+        expect(after?.status).toBe(terminalStatus);
+        // No fresh board escalation is armed about finished work.
+        const actions = await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+        expect(actions).toHaveLength(0);
+      },
+    );
+
+    it("settles an already-armed board escalation once the source reaches done", async () => {
+      const { coderId, sourceIssue } = await seedCompany();
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      });
+
+      // First sweep escalates normally.
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: makeStrandedRun(coderId, sourceIssue.id),
+      });
+      const [armed] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(armed).toMatchObject({ status: "active", ownerType: "board" });
+
+      // The owner then finishes the work and writes `done`.
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, sourceIssue.id));
+
+      // A later sweep must settle that escalation rather than re-arming a new
+      // one, which is what produced the endless done/blocked flap.
+      const second = await recovery.escalateStrandedAssignedIssue({
+        issue: { ...sourceIssue, status: "in_progress" },
+        previousStatus: "in_progress",
+        latestRun: makeStrandedRun(coderId, sourceIssue.id),
+      });
+
+      expect(second).toBeNull();
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        id: armed!.id,
+        status: "resolved",
+        outcome: "false_positive",
+        resolutionNote: "source_terminal:done",
+      });
+      const [after] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, sourceIssue.id));
+      expect(after?.status).toBe("done");
+    });
+
+    it("leaves an unrelated active recovery action on the same issue alone", async () => {
+      const { coderId, sourceIssue, companyId } = await seedCompany();
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      });
+
+      // A different kind of recovery is armed on this issue. Settling the stale
+      // stranded escalation must not sweep it up as collateral: it is about a
+      // different cause, and silently resolving it would hide real work from the
+      // board.
+      const unrelated = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "missing_disposition",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: "missing-disposition:unrelated",
+        evidence: { sourceRunId: "run-unrelated" },
+        nextAction: "Write a valid issue disposition.",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, sourceIssue.id));
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: { ...sourceIssue, status: "in_progress" },
+        previousStatus: "in_progress",
+        latestRun: makeStrandedRun(coderId, sourceIssue.id),
+      });
+
+      const [unrelatedRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, unrelated.id));
+      expect(unrelatedRow?.status).toBe("active");
+    });
+
+    it("still escalates a live in_progress source, so the fence is not a blanket disable", async () => {
+      const { coderId, sourceIssue } = await seedCompany();
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async () => null),
+      });
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: makeStrandedRun(coderId, sourceIssue.id),
+      });
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(actions).toMatchObject([{ status: "active", ownerType: "board" }]);
+      const [after] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, sourceIssue.id));
+      expect(after?.status).toBe("blocked");
+    });
+  });
+
+  describe("recovery action resolution authority", () => {
+    async function seedBoardEscalatedStrandedAction() {
+      const { coderId, sourceIssueId, companyId } = await seedCompany();
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId));
+      // The source is already terminal: the owner finished the work.
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, sourceIssueId));
+      const action = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "board",
+        cause: "stranded_assigned_issue",
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stranded_assigned_issue`,
+        evidence: { routingPolicy: "board_escalation_no_takeover_v1" },
+        nextAction: "Board operator: inspect the evidence.",
+        wakePolicy: { type: "board_escalation", reason: "stranded_assigned_issue" },
+      });
+      // The resolving agent acts from inside its own live run, the only
+      // credential an agent mutation is admitted under.
+      const runId = randomUUID();
+      await seedHeartbeatRun({
+        companyId,
+        agentId: coderId,
+        runId,
+        issueId: sourceIssueId,
+        status: "running",
+      });
+      return { action, coderId, companyId, runId, issue: issue! };
+    }
+
+    it("lets the source assignee settle a stale board escalation as a false positive", async () => {
+      const { action, coderId, companyId, runId, issue } =
+        await seedBoardEscalatedStrandedAction();
+      const app = createApp({
+        type: "agent",
+        agentId: coderId,
+        companyId,
+        runId,
+        source: "agent_jwt",
+      });
+
+      const res = await request(app)
+        .post(`/api/issues/${issue.id}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "false_positive",
+          sourceIssueStatus: "done",
+          resolutionNote: "Work was already complete.",
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({ status: "resolved", outcome: "false_positive" });
+    });
+
+    it("still requires the board to cancel a recovery action", async () => {
+      const { action, coderId, companyId, runId, issue } =
+        await seedBoardEscalatedStrandedAction();
+      const app = createApp({
+        type: "agent",
+        agentId: coderId,
+        companyId,
+        runId,
+        source: "agent_jwt",
+      });
+
+      // `cancelled` destroys an escalation a board operator may be acting on,
+      // so it must stay board-only. This is the guard against the fix widening
+      // authorization instead of narrowing it to the false-positive case.
+      await request(app)
+        .post(`/api/issues/${issue.id}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "cancelled",
+          sourceIssueStatus: "done",
+        })
+        .expect(403);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow?.status).toBe("active");
+    });
+  });
 });
