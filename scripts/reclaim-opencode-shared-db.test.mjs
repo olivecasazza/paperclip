@@ -279,6 +279,98 @@ test("rejects a non-numeric --idle-seconds", () => {
   }
 });
 
+// --- GATE 2: the deployed tree is the primary proof ------------------------
+//
+// The commits that ship the repin are descendants of the split merge, so they do
+// not prefix-match OPENCODE_SPLIT_COMMITS_DEFAULT. Before GATE 2 learned to read
+// the running image's own tree it refused every published post-split image, which
+// silently made the whole reclaim path unreachable in production.
+
+function makeAppTree(root, { withSplit }) {
+  const app = path.join(root, "app");
+  const dir = path.join(app, "packages", "adapters", "opencode-local", "src", "server");
+  mkdirSync(dir, { recursive: true });
+  if (withSplit) {
+    writeFileSync(path.join(dir, "agent-data-home.ts"), "export const x = 1;\n");
+  } else {
+    writeFileSync(path.join(dir, "execute.ts"), "export const y = 2;\n");
+  }
+  return app;
+}
+
+test("accepts a real published post-split commit when the deployed tree carries the split", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const app = makeAppTree(sandbox.root, { withSplit: true });
+    // sha-cadea06c: the repin target, a descendant of the split merge. It is NOT
+    // in OPENCODE_SPLIT_COMMITS_DEFAULT, so only the tree proof can admit it.
+    const result = run(sandbox, ["--yes"], { EXPECTED_COMMIT: "cadea06cbaf64079e5781f98fedb81b5a27bf216", PAPERCLIP_APP_DIR: app });
+    assert.equal(result.status, RC_OK, result.stderr);
+    assert.equal(existsSync(sandbox.sharedDb), false);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("accepts the split proof without any commit or health endpoint at all", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const app = makeAppTree(sandbox.root, { withSplit: true });
+    const result = run(sandbox, ["--yes"], { EXPECTED_COMMIT: "", HEALTH_URL: "", PAPERCLIP_APP_DIR: app });
+    assert.equal(result.status, RC_OK, result.stderr);
+    assert.equal(existsSync(sandbox.sharedDb), false);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("refuses a published post-split commit when the deployed tree lacks the split", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const app = makeAppTree(sandbox.root, { withSplit: false });
+    refuse(run(sandbox, ["--yes"], { EXPECTED_COMMIT: "cadea06cbaf64079e5781f98fedb81b5a27bf216", PAPERCLIP_APP_DIR: app }));
+    assert.ok(existsSync(sandbox.sharedDb));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("still proves the split by ancestry when the app tree is not mounted", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const missing = path.join(sandbox.root, "no-such-app-tree");
+    // A dist-only or packaged deployment has no source tree; ancestry is then
+    // the only available evidence, and a known post-split commit must pass.
+    const result = run(sandbox, ["--yes"], { EXPECTED_COMMIT: SPLIT_COMMIT, PAPERCLIP_APP_DIR: missing });
+    assert.equal(result.status, RC_OK, result.stderr);
+    assert.equal(existsSync(sandbox.sharedDb), false);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("refuses with no tree and no way to read a commit", () => {
+  const sandbox = makeSandbox();
+  try {
+    writeSharedDb(sandbox);
+    writePerAgentDb(sandbox, "agent-a");
+    const missing = path.join(sandbox.root, "no-such-app-tree");
+    const result = run(sandbox, ["--yes"], { EXPECTED_COMMIT: "", HEALTH_URL: "", PAPERCLIP_APP_DIR: missing });
+    refuse(result);
+    assert.ok(existsSync(sandbox.sharedDb));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 test("rejects an unknown argument", () => {
   const sandbox = makeSandbox();
   try {

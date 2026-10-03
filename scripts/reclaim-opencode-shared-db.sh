@@ -22,7 +22,8 @@
 # refusing:
 #
 #   GATE 1  per-agent data homes exist and hold real per-agent DBs
-#   GATE 2  the deployed build is a commit known to contain the split
+#   GATE 2  the deployed build carries the split -- proven by the running
+#           image's own tree, falling back to commit ancestry
 #   GATE 3  no process on this host holds the shared DB open
 #   GATE 4  the shared DB is idle (no writes for --idle-seconds)
 #   GATE 5  the file being removed is the shared DB, not a per-agent one
@@ -39,7 +40,10 @@
 #   OPENCODE_SHARED_DATA_DIR  shared data dir      (default $XDG_DATA_HOME/opencode,
 #                                                       else $HOME/.local/share/opencode)
 #   PER_AGENT_DATA_DIR        per-agent data root   (default <instance>/adapter-data/opencode)
-#   OPENCODE_SPLIT_COMMITS    commits carrying the split (default: the set below)
+#   PAPERCLIP_APP_DIR         deployed app tree     (default /app; the source of
+#                                                       GATE 2's primary proof)
+#   OPENCODE_SPLIT_COMMITS    commits carrying the split, for the GATE 2 ancestry
+#                             fallback when the app tree is not mounted
 #   HEALTH_URL                base URL for the server health probe
 #   EXPECTED_COMMIT           accept this commit without consulting HEALTH_URL
 #
@@ -63,11 +67,23 @@ IDLE_SECONDS="${IDLE_SECONDS:-900}"
 ASSUME_YES=0
 BACKUP_TO=""
 
-# Commits on olivecasazza/paperclip that contain
-# packages/adapters/opencode-local/src/server/agent-data-home.ts, verified by
-# fetching that path from the fork at each revision. The fix landed in the merge
-# commit ef74a7a3 (PR #6) and every descendant carries it, so this is a prefix
-# list to match against, not an exhaustive one.
+# The one file that exists if and only if the build serving this instance carries
+# the per-agent split. It is the function this whole gate exists to verify, and
+# the image copies the whole repo to /app (Dockerfile production stage:
+# `COPY --from=build /app /app`), so the deployed tree can be inspected directly
+# instead of trusting a hard-coded commit list.
+AGENT_DATA_HOME_SRC="packages/adapters/opencode-local/src/server/agent-data-home.ts"
+APP_DIR="${PAPERCLIP_APP_DIR:-/app}"
+
+# Commits on olivecasazza/paperclip that contain $AGENT_DATA_HOME_SRC, verified
+# by fetching that path from the fork at each revision. The fix landed in the
+# merge commit ef74a7a3 (PR #6) and every descendant carries it, so this is a
+# prefix list to match against, not an exhaustive one.
+#
+# This is a FALLBACK, not the primary signal. It only proves the deployed commit
+# descends from a commit that added the file; it cannot prove that commit is the
+# one actually running, and the prefix list goes stale as the fork moves on --
+# every image published after ef74a7a3 (0fb95072, cadea06cb, 15ab3438b) fails it.
 OPENCODE_SPLIT_COMMITS_DEFAULT="ef74a7a3 c226db7b c7165e96"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -105,9 +121,14 @@ gate_per_agent_homes() {
 # ---------------------------------------------------------------------------
 # GATE 2 — the build serving this instance contains the split.
 #
-# Compares /api/health's commit against OPENCODE_SPLIT_COMMITS. A prefix match
-# is deliberate: descendants of the merge commit keep the fix, and the fork
-# moves forward without this script being updated on every commit.
+# Primary signal: the deployed tree itself. If $APP_DIR/$AGENT_DATA_HOME_SRC is
+# present, the running image carries the fix, whatever its commit is called.
+# That is direct evidence about this build, and it does not rot.
+#
+# Fallback: prefix-match the commit reported by /api/health (or --expect-commit)
+# against a known post-split commit. Kept for the case where the repo tree is not
+# mounted into the container (a dist-only or packaged deployment), where commit
+# ancestry is the best available evidence.
 # ---------------------------------------------------------------------------
 commit_is_post_split() {
   local commit="$1" known
@@ -120,17 +141,28 @@ commit_is_post_split() {
   return 1
 }
 
-gate_deployed_build() {
+deployed_commit() {
   local commit="${EXPECTED_COMMIT:-}"
   if [ -z "$commit" ]; then
-    [ -n "$HEALTH_URL" ] || fail "no EXPECTED_COMMIT and no HEALTH_URL — cannot prove the deployed build carries the per-agent split"
+    [ -n "$HEALTH_URL" ] || fail "no EXPECTED_COMMIT and no HEALTH_URL, and $APP_DIR/$AGENT_DATA_HOME_SRC is absent — cannot prove the deployed build carries the per-agent split"
     commit=$(curl -fsS --max-time 10 "${HEALTH_URL%/}/api/health" 2>/dev/null \
       | sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-fA-F]+)".*/\1/p')
     [ -n "$commit" ] || fail "could not read a commit from ${HEALTH_URL%/}/api/health"
   fi
+  printf '%s' "$commit"
+}
+
+gate_deployed_build() {
+  local commit
+  if [ -f "$APP_DIR/$AGENT_DATA_HOME_SRC" ]; then
+    log "gate 2 ok: deployed tree $APP_DIR/$AGENT_DATA_HOME_SRC is present — the running build carries the per-agent split"
+    return 0
+  fi
+  log "gate 2: $APP_DIR/$AGENT_DATA_HOME_SRC is absent (dist-only or packaged deployment); falling back to commit ancestry"
+  commit=$(deployed_commit)
   commit_is_post_split "$commit" \
     || fail "deployed build is $commit, which predates the per-agent OpenCode data-home fix (merge ef74a7a3) — deleting the shared DB now would drop every live session"
-  log "gate 2 ok: deployed build $commit carries the per-agent split"
+  log "gate 2 ok: deployed build $commit descends from a commit carrying the per-agent split"
 }
 
 # ---------------------------------------------------------------------------
