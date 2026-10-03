@@ -190,11 +190,18 @@ function seedCargoTarget(sandbox, { name, fresh = false, symlink = false, marker
  * Seed `$MOUNT/wt/<dirName>` as a git checkout with `rel` build output in it.
  *
  * `branch` is set explicitly rather than derived from `dirName` because the two
- * disagree in the wild, and the guard's whole safety argument for this root rests
- * on requiring agreement. Real measured case: `wt/con-220` sits on
- * `fix/con-220-clippy-194-stacked`, where the branch alone reads as CLIPPY-194.
+ * disagree in the wild, and the guard's corroboration argument for this root
+ * depends on being able to exercise each signal independently. Real measured
+ * cases: `wt/con-220` sits on `fix/con-220-clippy-194-stacked`, where the branch
+ * alone reads as CLIPPY-194, and `wt/con-313` sits on
+ * `fix/oom-score-adj-protection`, which names no issue at all.
+ *
+ * `marker` writes the in-band `.paperclip-owner` attestation at the tree root:
+ * `false` for no marker at all (the default), `true` for one that agrees with
+ * the identifier implied by the directory name, or an explicit string to write a
+ * contradicting claim.
  */
-function seedWorktree(sandbox, { dirName, branch, rel = "target", ignored = true, tracked = false, fresh = false, symlinkCheckout = false } = {}) {
+function seedWorktree(sandbox, { dirName, branch, rel = "target", ignored = true, tracked = false, fresh = false, symlinkCheckout = false, marker = false } = {}) {
   const checkout = path.join(sandbox.mount, "wt", dirName);
   mkdirSync(checkout, { recursive: true });
   spawnSync("git", ["init", "-q"], { cwd: checkout });
@@ -210,6 +217,12 @@ function seedWorktree(sandbox, { dirName, branch, rel = "target", ignored = true
     // the gitignore gate and never exercises the gate behind it.
     spawnSync("git", ["add", "-f", ".gitignore"], { cwd: checkout });
     spawnSync("git", ["commit", "-q", "-m", "ignore"], { cwd: checkout });
+  }
+  if (marker !== false) {
+    const owner = marker === true
+      ? dirName.replace(/^([a-z]+)-([0-9]+)/, (_m, k, n) => `${k.toUpperCase()}-${n}`)
+      : marker;
+    writeFileSync(path.join(checkout, ".paperclip-owner"), `${owner}\n`);
   }
   const full = path.join(checkout, rel, "blob");
   mkdirSync(path.dirname(full), { recursive: true });
@@ -607,6 +620,144 @@ test("wt scope: name and branch must agree on the issue, so a branch cannot reas
     );
     assert.ok(existsSync(noBranch.full), "a detached tree with no branch identifier must survive");
     assert.match(result.stderr, /do not agree on an issue identifier/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: an agreeing .paperclip-owner marker wins over a misleading branch", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // CON-220 and CLIPPY-194 are both terminal, so only corroboration can tell
+    // them apart, and both trees below are the measured live shapes this change
+    // exists for: one on a stacked branch resolving to the wrong issue, one on a
+    // descriptively-named branch resolving to no issue at all.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-220": "done", "CLIPPY-194": "done", "CON-313": "done" },
+    });
+    // The marker agrees with the directory name, so it is the answer and the
+    // branch is never read -- it is allowed to name CLIPPY-194.
+    const stacked = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-clippy-194-stacked", marker: true });
+    // The marker agrees, so a branch naming no issue at all no longer strands us.
+    const unnamed = seedWorktree(sandbox, { dirName: "con-313", branch: "fix/oom-score-adj-protection", marker: true });
+    // The marker must name the *issue*, which is only the leading
+    // <PREFIX>-<number> head of the directory name -- `con-313-lowercase` names
+    // CON-313, so the marker says con-313, not the whole directory name. Case
+    // and surrounding whitespace are then not a contradiction, which matters
+    // because directory names are lowercased on disk while issues are
+    // uppercased: read literally, a lowercase marker would contradict every
+    // tree on the volume.
+    const lower = seedWorktree(sandbox, { dirName: "con-313-lowercase", branch: "fix/con-313-lowercase", marker: "  con-313  " });
+    // Control for the disagreement test below: identical shape, prunable on the
+    // fallback path, so a delete there cannot be explained away as the marker
+    // having been ignored for some unrelated reason.
+    const fallsBack = seedWorktree(sandbox, { dirName: "con-220-control", branch: "fix/con-220-control" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      !existsSync(stacked.full),
+      "a marked tree is reclaimable even though its branch resolves to a different issue",
+    );
+    assert.ok(
+      !existsSync(unnamed.full),
+      "a marked tree is reclaimable even though its branch names no issue",
+    );
+    assert.ok(!existsSync(lower.full), "marker case and whitespace must not read as a contradiction");
+    assert.ok(!existsSync(fallsBack.full), "an unmarked tree is still reclaimed by name-vs-branch agreement");
+    // Every issue here is terminal, so any "not terminal" refusal would mean the
+    // marker path resolved something other than the identifier the name implies.
+    assert.doesNotMatch(result.stderr, /is not terminal/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: a marker disagreeing with the directory name skips rather than overriding either signal", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // Every issue named by a marker here is terminal, so the trees below survive
+    // on the *contradiction* between marker and name, not on terminality.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-220": "done", "CON-313": "done", "CON-400": "done", "CON-401": "done" },
+    });
+    // Marker contradicts the name while the branch agrees with the name: if the
+    // marker simply overrode the branch this would be reclaimed.
+    const contradictsName = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-ok", marker: "CON-313" });
+    // Marker contradicts the name while the branch resolves to a different issue.
+    const contradictsBoth = seedWorktree(sandbox, { dirName: "con-313", branch: "fix/con-400-elsewhere", marker: "CON-401" });
+    // A symlinked marker would let a file outside the worktree dictate what this
+    // tree claims to own, so it must be refused rather than followed. Refusing it
+    // falls back to name-vs-branch agreement, which is what makes this tree
+    // prunable -- deliberately no wider than the pre-marker behaviour, and
+    // asserted rather than assumed. Without this fixture, deleting the symlink
+    // check would leave every other test in this file still green.
+    const symlinkedMarker = seedWorktree(sandbox, { dirName: "con-400", branch: "fix/con-400-elsewhere" });
+    const outsideMarker = path.join(sandbox.root, "outside-marker");
+    writeFileSync(outsideMarker, "CON-401\n");
+    symlinkSync(outsideMarker, path.join(symlinkedMarker.checkout, ".paperclip-owner"));
+    // And a tree whose marker is refused *and* whose branch disagrees with the
+    // name must skip, exactly as it did before markers existed.
+    const refusedAndMismatched = seedWorktree(sandbox, { dirName: "con-401", branch: "fix/con-400-elsewhere" });
+    symlinkSync(outsideMarker, path.join(refusedAndMismatched.checkout, ".paperclip-owner"));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(contradictsName.full),
+      "a marker that contradicts the directory name must not override a branch that agrees with it",
+    );
+    assert.ok(existsSync(contradictsBoth.full), "a marker that contradicts the directory name must skip");
+    assert.ok(
+      !existsSync(symlinkedMarker.full),
+      "a symlinked marker must not be read as an in-band attestation; it must be refused, not followed",
+    );
+    assert.ok(
+      existsSync(refusedAndMismatched.full),
+      "refusing a marker must not fall back to a branch that disagrees with the name",
+    );
+    assert.match(result.stderr, /no \.paperclip-owner marker agreeing with the name/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: a marker cannot make a foreign or open tree reclaimable", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // strictScope: only CON-1 and CON-2 exist in this company, so every foreign
+    // identifier comes back as no result at all, exactly as the real
+    // company-scoped route behaves.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      strictScope: true,
+      issues: { "CON-1": "done", "CON-2": "todo" },
+    });
+    // A foreign tree that plants one of our terminal issue ids in its marker. The
+    // marker names the issue, but the name must still agree with it, and
+    // `nixlab-1771-timer-context` names NIXLAB-1771 -- so the contradiction skips.
+    const foreign = seedWorktree(sandbox, { dirName: "nixlab-1771-timer-context", branch: "fix/nixlab-1771-timer-context", marker: "CON-1" });
+    // A foreign tree whose marker agrees with its own foreign name. It now
+    // reaches the issue API, which resolves nothing for it company-scoped, so it
+    // is skipped by *ownership* rather than by corroboration. This is the
+    // property that must not regress: the marker widens reach for trees we own
+    // and makes no foreign tree reachable.
+    const foreignSelfConsistent = seedWorktree(sandbox, { dirName: "sti-415-v2", branch: "fix/sti-415-v2", marker: true });
+    // Our own tree, whose issue is still open. A marker is an ownership
+    // attestation, never a terminality one.
+    const open = seedWorktree(sandbox, { dirName: "con-2", branch: "fix/con-2-open", marker: true });
+    // Our own terminal tree, to prove ownership is what separates them.
+    const ours = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/oom-score-adj-protection", marker: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(ours.full), "our own marked terminal worktree is still reclaimed");
+    assert.ok(existsSync(foreign.full), "a marker naming our issue must not reach a foreign tree");
+    assert.ok(existsSync(foreignSelfConsistent.full), "another company's worktree must survive its own consistent marker");
+    assert.ok(existsSync(open.full), "a marker must not make an open issue's build output reclaimable");
+    assert.match(result.stderr, /is not terminal/);
   } finally {
     sandbox.cleanup();
   }
