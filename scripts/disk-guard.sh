@@ -75,6 +75,13 @@ CARGO_TARGET_OWNER_MARKER="${DISK_GUARD_CARGO_TARGET_OWNER_MARKER:-.paperclip-ow
 # Overridable only so the "cannot tell" branch of cargo_rustc_running is
 # testable; production never sets it.
 PROC_ROOT="${DISK_GUARD_PROC_ROOT:-/proc}"
+# The one repository a workspace checkout may belong to and still be reclaimable
+# for. Gate 2 binds repository identity from `origin`, because terminality is
+# read from this company's issue API and a checkout of another repo must never be
+# able to spend one of our ticket identifiers. There is deliberately no "accept
+# any origin that looks like ours" fallback: a wrong default here would be a
+# silent authorization mismatch, and an unset one fails closed.
+PROJECT_REPO="${DISK_GUARD_PROJECT_REPO:-https://github.com/olivecasazza/definitely-not-crosswords.git}"
 
 mode="${1:---check}"
 
@@ -167,6 +174,93 @@ candidate_issue_identifier() {
   [ -n "$identifier" ] && printf '%s\n' "$identifier"
 }
 
+# The ticket a directory name attributes to the <PREFIX>-<number> head, uppercased.
+# `def-235-eventbus-lagged` names DEF-235 and `def-133-cargo-test` names DEF-133,
+# matching the cargo-target rule at cargo_target_reclaim_candidates. A name with
+# no ticket head yields nothing: not an identity, so the caller fails closed.
+directory_issue_identifier() {
+  printf '%s\n' "${1##*/}" | sed -nE 's/^([A-Za-z]+)-([0-9]+).*/\U\1-\2/p' | head -1
+}
+
+# Which repository a checkout belongs to, from git metadata rather than from
+# where the directory sits.
+#
+# This is the half of gate 2 that the branch-name regex could not express at all.
+# `workspaces/<agent>/pc-guard` is a checkout of a *different repository* -- this
+# control plane's own -- whose branches are free to name tickets in our
+# namespace (`def-139-fix-paperclip-node-modules` resolves to DEF-139 under any
+# branch regex). Terminality is read from this company's issue API, so a foreign
+# repo that mentions our ticket identifiers must never be able to spend them:
+# that is the cross-repo deletion class CON-375 exists to prevent.
+#
+# `rev-parse --git-common-dir` answers "which clone owns this working tree".
+# For a worktree of a known company clone it points at that clone's .git; for an
+# independent clone it points at the checkout's own .git, which is the signal to
+# fall back to binding by origin. Returns 1 when no identity can be established
+# at all, so the caller skips rather than guessing.
+checkout_repo_is_ours() {
+  local checkout="$1" common toplevel origin
+  common="$(git -C "$checkout" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  toplevel="$(git -C "$checkout" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$common" ] && [ -n "$toplevel" ] || return 1
+  # The checkout's own .git means nothing else in this volume vouches for it, so
+  # the origin URL is the only remaining evidence and must match exactly.
+  [ "$common" = "$toplevel/.git" ] || return 0
+  origin="$(git -C "$checkout" remote get-url origin 2>/dev/null || true)"
+  [ -n "$origin" ] || return 1
+  [ "$origin" = "$PROJECT_REPO" ]
+}
+
+# The issue a workspace checkout is reclaimable against, or nothing at all.
+#
+# Three independent pieces of evidence must corroborate each other, and the
+# function prints an identifier only when they do:
+#
+#   repository  `origin` (or the owning clone) says this is the project repo.
+#               Refuses a foreign repo and a checkout with no identity at all.
+#   directory   the <PREFIX>-<number> head of the directory name.
+#   branch      the ticket token in the branch.
+#
+# The directory name and the branch are each sufficient to look convincing and
+# each wrong alone, which is why neither may decide. Measured on this volume:
+# `def-227-incorrect-state` sits on `fix/def-235-presence-ring` and
+# `def-133-cargo-test` sits on `def-103-e2e-canary` -- both terminal, both
+# disagreeing. A branch-name regex resolves those to the *branch's* issue and
+# would reclaim a directory filed under a different one, and it resolves a
+# foreign repo's branch to one of ours. Requiring all three to agree means a
+# renamed, shared or borrowed branch fails closed instead of quietly spending
+# whichever ticket it happened to mention.
+#
+# Prints the agreed identifier; returns 1 and logs the reason otherwise.
+corroborated_checkout_issue() {
+  local checkout="$1" from_dir from_branch
+  if ! checkout_repo_is_ours "$checkout"; then
+    local origin
+    origin="$(git -C "$checkout" remote get-url origin 2>/dev/null || true)"
+    if [ -n "$origin" ]; then
+      log "skip  $checkout (origin '$origin' is not the company project repo '$PROJECT_REPO')"
+    else
+      log "skip  $checkout (cannot establish the repository identity: no origin and no company clone)"
+    fi
+    return 1
+  fi
+  from_dir="$(directory_issue_identifier "$checkout")"
+  from_branch="$(candidate_issue_identifier "$checkout")"
+  if [ -z "$from_dir" ]; then
+    log "skip  $checkout (directory name does not attribute it to an issue)"
+    return 1
+  fi
+  if [ -z "$from_branch" ]; then
+    log "skip  $checkout (branch does not name an issue; a detached HEAD has no branch to agree with '$from_dir')"
+    return 1
+  fi
+  if [ "$from_dir" != "$from_branch" ]; then
+    log "skip  $checkout (branch says '$from_branch', directory says '$from_dir')"
+    return 1
+  fi
+  printf '%s\n' "$from_dir"
+}
+
 issue_is_terminal() {
   local identifier="$1" status
   [ -n "$identifier" ] || return 1
@@ -195,7 +289,10 @@ workspace_reclaim_candidates() {
     for checkout in "$workspace"/* "$workspace"/*/.paperclip/worktrees/*; do
       [ -e "$checkout" ] || continue
       [ -d "$checkout/.git" ] || [ -f "$checkout/.git" ] || continue
-      identifier="$(candidate_issue_identifier "$checkout")"
+      # Gate 2. Returns nothing when repository, directory name and branch do not
+      # corroborate one issue, and has already logged why, so the refusal is
+      # visible in --prune output rather than being an undecided-looking skip.
+      identifier="$(corroborated_checkout_issue "$checkout")"
       if ! issue_is_terminal "$identifier"; then
         for rel in client/target target node_modules; do
           [ -e "$checkout/$rel" ] && log "skip  $checkout/$rel (issue ${identifier:-unknown} is not terminal)"

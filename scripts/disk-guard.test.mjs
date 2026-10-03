@@ -16,6 +16,18 @@ const RC_CRITICAL = 3;
 
 const MIB = 1024 * 1024;
 
+// The one repository a workspace checkout may belong to and still be reclaimed
+// for. Gate 2 binds repository identity from `origin`, and any other origin --
+// including a checkout of this control plane's own repo -- is refused, because
+// the issue terminality that authorizes deletion is this company's, read from
+// this company's API.
+const COMPANY_PROJECT_REPO = "https://github.com/olivecasazza/definitely-not-crosswords.git";
+// A different repository on the same account. Its branches name tickets in our
+// namespace (a branch called `def-139-...` on a foreign repo resolves to DEF-139
+// under any branch-string regex), which is exactly the confusion that makes
+// deleting from it a cross-repo deletion.
+const FOREIGN_REPO = "https://github.com/olivecasazza/paperclip.git";
+
 function makeSandbox() {
   const root = mkdtempSync(path.join(os.tmpdir(), "disk-guard-test-"));
   const mount = path.join(root, "mnt");
@@ -76,6 +88,7 @@ function run(sandbox, args, env = {}) {
       DISK_GUARD_STATUS_FILE: sandbox.statusFile,
       DISK_GUARD_COMPANY_ID: "company-1",
       DISK_GUARD_WORKSPACES_DIR: path.join(sandbox.mount, "instances/default/workspaces"),
+      DISK_GUARD_PROJECT_REPO: COMPANY_PROJECT_REPO,
       ...env,
     },
   });
@@ -114,26 +127,72 @@ function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DE
   return stub;
 }
 
-function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "repo", issue = "DEF-1", rel = "client/target", ignored = true, tracked = false, fresh = false, worktree = false } = {}) {
+/**
+ * Initialise a git clone at `dir` with an `origin` remote. `origin: false` leaves
+ * the clone with no remote, which is a third case gate 2 must refuse rather than
+ * guess at: a checkout with no remote and no company clone to resolve through
+ * has no repository identity to corroborate anything against.
+ */
+function seedGitClone(dir, { origin = COMPANY_PROJECT_REPO } = {}) {
+  mkdirSync(dir, { recursive: true });
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: dir });
+  if (origin !== false) {
+    spawnSync("git", ["remote", "add", "origin", origin], { cwd: dir });
+  }
+  return dir;
+}
+
+/**
+ * Seed a roster workspace checkout at
+ * `$MOUNT/instances/default/workspaces/<agentId>/<checkoutName>`.
+ *
+ * Gate 2 resolves the owning issue from git metadata, so the shape of the seed
+ * matters as much as its size:
+ *
+ *   `origin`        the checkout's `origin` remote URL. Defaults to the company
+ *                   project repo, which is the only value that may be reclaimed.
+ *                   Pass another URL to model a checkout of a foreign repo, or
+ *                   `false` for a checkout with no `origin` at all.
+ *   `dirIssue`      the ticket token written into the directory name, which
+ *                   gate 2 corroborates the branch against. Defaults to `issue`.
+ *   `branchName`    the branch to check out. Defaults to `issue` lowercased, which
+ *                   agrees with the directory name. Pass a branch naming a
+ *                   different ticket to model a renamed or shared branch.
+ *   `linked`        register the checkout as a worktree of `baseClone` instead of
+ *                   leaving it an independent clone, so the git-common-dir gate
+ *                   has something inside the company clone to resolve to.
+ */
+function seedWorkspaceCheckout(sandbox, { agentId = "agent-1", checkoutName = "repo", issue = "DEF-1", rel = "client/target", ignored = true, tracked = false, fresh = false, worktree = false, origin = COMPANY_PROJECT_REPO, dirIssue, branchName, linked = false } = {}) {
   const workspace = path.join(sandbox.mount, "instances/default/workspaces", agentId);
   const checkout = worktree
     ? path.join(workspace, "repo", ".paperclip", "worktrees", checkoutName)
     : path.join(workspace, checkoutName);
+  const branch = branchName ?? issue.toLowerCase();
   if (worktree) {
     const base = path.join(workspace, "repo");
-    mkdirSync(base, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: base });
-    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: base });
-    spawnSync("git", ["config", "user.name", "Test"], { cwd: base });
+    seedGitClone(base, { origin });
     writeFileSync(path.join(base, "README.md"), "test\n");
     spawnSync("git", ["add", "README.md"], { cwd: base });
     spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: base });
     mkdirSync(path.dirname(checkout), { recursive: true });
-    spawnSync("git", ["worktree", "add", "-q", "-b", issue.toLowerCase(), checkout, "HEAD"], { cwd: base });
+    spawnSync("git", ["worktree", "add", "-q", "-b", branch, checkout, "HEAD"], { cwd: base });
   } else {
     mkdirSync(checkout, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: checkout });
-    spawnSync("git", ["checkout", "-b", issue.toLowerCase()], { cwd: checkout });
+    if (linked) {
+      // Register with a base clone so `rev-parse --git-common-dir` resolves into
+      // the company clone rather than to the checkout's own .git.
+      const baseClone = path.join(sandbox.root, "clones", checkoutName);
+      seedGitClone(baseClone, { origin });
+      writeFileSync(path.join(baseClone, "README.md"), "test\n");
+      spawnSync("git", ["add", "README.md"], { cwd: baseClone });
+      spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: baseClone });
+      spawnSync("git", ["worktree", "add", "-q", "-b", branch, checkout, "HEAD"], { cwd: baseClone });
+    } else {
+      seedGitClone(checkout, { origin });
+      spawnSync("git", ["checkout", "-q", "-b", branch], { cwd: checkout });
+    }
   }
   if (ignored) writeFileSync(path.join(checkout, ".gitignore"), `${rel}\n`);
   const full = path.join(checkout, rel, "blob");
@@ -516,12 +575,12 @@ test("workspace scope: closed issue build output is pruned and failing gates sur
       roster: ["agent-1"],
       issues: { "DEF-1": "done", "DEF-2": "todo", "DEF-3": "done", "DEF-4": "done", "DEF-5": "done", "DEF-6": "done" },
     });
-    const closed = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-1", issue: "DEF-1" });
-    const open = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-2", issue: "DEF-2" });
-    const tracked = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-3", issue: "DEF-3", tracked: true });
-    const notIgnored = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-4", issue: "DEF-4", ignored: false });
-    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-5", issue: "DEF-5", fresh: true });
-    const outsider = seedWorkspaceCheckout(sandbox, { agentId: "agent-2", checkoutName: "repo-6", issue: "DEF-6" });
+    const closed = seedWorkspaceCheckout(sandbox, { checkoutName: "def-1-closed", issue: "DEF-1" });
+    const open = seedWorkspaceCheckout(sandbox, { checkoutName: "def-2-open", issue: "DEF-2" });
+    const tracked = seedWorkspaceCheckout(sandbox, { checkoutName: "def-3-tracked", issue: "DEF-3", tracked: true });
+    const notIgnored = seedWorkspaceCheckout(sandbox, { checkoutName: "def-4-not-ignored", issue: "DEF-4", ignored: false });
+    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "def-5-fresh", issue: "DEF-5", fresh: true });
+    const outsider = seedWorkspaceCheckout(sandbox, { agentId: "agent-2", checkoutName: "def-6-outsider", issue: "DEF-6" });
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
@@ -541,7 +600,7 @@ test("workspace scope: ignored issue filters and rejects mismatched issue identi
   try {
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
     const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], ignoreQuery: true });
-    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "repo", issue: "DEF-7" });
+    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "def-7-mismatch", issue: "DEF-7" });
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
@@ -556,11 +615,193 @@ test("workspace scope: linked worktrees with .git files are scanned", () => {
   try {
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
     const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-8": "done" } });
-    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "linked", issue: "DEF-8", worktree: true });
+    const checkout = seedWorkspaceCheckout(sandbox, { checkoutName: "def-8-linked", issue: "DEF-8", worktree: true });
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
     assert.equal(result.status, RC_CRITICAL);
     assert.ok(!existsSync(checkout.full), "linked worktree build output must be pruned when all gates pass");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+/*
+ * Gate 2: which issue owns this checkout, and therefore whether the issue is
+ * terminal and its build output may be deleted.
+ *
+ * Every test in this block fails against the branch-name regex this gate used to
+ * be: a `sed -nE` substitution matching a `[A-Za-z]+-[0-9]+` token anywhere in
+ * `git branch --show-current` and upper-casing it, which reads the owning issue
+ * out of a label a person typed. A regex is right whenever the branch happens to
+ * be well-named, which is precisely when its answer does not matter.
+ */
+
+test("gate 2: a branch whose ticket disagrees with the directory name is not reclaimed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // Every issue the branch names is terminal, so the only thing standing
+    // between this checkout and deletion is that its two identity signals
+    // disagree. Under the old regex the branch alone decided, and DEF-41 won.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-41": "done", "DEF-40": "done" },
+    });
+    const divergent = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "def-40-thing",
+      dirIssue: "DEF-40",
+      branchName: "def-41-thing",
+    });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(divergent.full),
+      "a checkout whose branch names a different issue than its directory must not be reclaimed",
+    );
+    // Assert the gate's own refusal, not just survival: the build output is
+    // gitignored, untracked and stale, so only gate 2 can be holding it.
+    assert.match(
+      result.stderr,
+      /branch says 'DEF-41', directory says 'DEF-40'/,
+      "the disagreement must be reported, not silently skipped",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a checkout of a foreign repo naming one of our terminal issues is not reclaimed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // The branch names a terminal issue of *our* company while the repository is
+    // somebody else's. This is the live pc-guard shape with the branch renamed,
+    // and it is the cross-repo deletion class CON-375 exists to prevent.
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-139": "done" } });
+    const foreign = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "pc-guard",
+      dirIssue: "DEF-139",
+      branchName: "def-139-fix-paperclip-node-modules",
+      origin: FOREIGN_REPO,
+    });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(foreign.full),
+      "build output in a checkout of another repository must never be reclaimed against our issue API",
+    );
+    assert.match(
+      result.stderr,
+      /is not the company project repo/,
+      "a repo-identity mismatch must be refused with its reason logged",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a checkout whose issue cannot be established is skipped, not guessed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // DEF-51 is terminal. The first checkout has no origin and no company clone
+    // to resolve through, so nothing binds it to a repository at all; the second
+    // is a detached HEAD, so there is no branch to corroborate a directory name
+    // against. Both look reclaimable to a regex and to a terminality query.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-51": "done", "DEF-52": "done" },
+    });
+    const noOrigin = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "def-51-orphan",
+      dirIssue: "DEF-51",
+      branchName: "def-51-orphan",
+      origin: false,
+    });
+    const detached = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "def-52-detached",
+      dirIssue: "DEF-52",
+      branchName: "def-52-detached",
+      linked: true,
+    });
+    // A worktree whose branch is gone reads as a detached HEAD: there is no
+    // branch left to agree with the directory name, so identity cannot be
+    // established even though the repository is ours.
+    spawnSync("git", ["checkout", "-q", "--detach", "HEAD"], { cwd: detached.checkout });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(noOrigin.full), "a checkout with no repository identity must survive");
+    assert.ok(existsSync(detached.full), "a checkout with no branch to corroborate against must survive");
+    assert.match(
+      result.stderr,
+      /cannot establish the repository identity/,
+      "unestablished identity must be reported with a reason",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: the 3.3G live case is refused with a reason naming identity, not skipped silently", () => {
+  const sandbox = makeSandbox();
+  try {
+    // The real /paperclip measurement this gate was written for: a stale,
+    // gitignored, untracked 3.3G client/target under a roster workspace whose
+    // branch reads DEF-235. Every other gate passes; gate 2 is the only thing
+    // that can hold it.
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-235": "blocked" } });
+    const live = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "def-235-eventbus-lagged",
+      dirIssue: "DEF-235",
+      branchName: "fix/def-235-eventbus-lagged",
+    });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(live.full), "the 3.3G live case must not be reclaimed");
+    assert.match(result.stderr, /def-235-eventbus-lagged\/client\/target/);
+    // Whatever the reason, it must be a decision gate 2 made and reported. A
+    // silent skip is the failure mode this issue exists to close: it reads as
+    // "nothing here to reclaim" rather than "the guard declined to attribute it".
+    assert.match(
+      result.stderr,
+      /identity|issue DEF-235 is not terminal/,
+      "the refusal must name the identity decision that produced it",
+    );
+    assert.doesNotMatch(
+      result.stderr,
+      /dry-run rm -rf .*def-235-eventbus-lagged/,
+      "the 3.3G live case must never reach the removal path",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: agreeing name, branch and origin still reclaim a worktree inside the company clone", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-53": "done" } });
+    // The positive control. If gate 2 could not resolve a well-formed checkout,
+    // every test above would pass against a guard that reclaims nothing.
+    const agreeing = seedWorkspaceCheckout(sandbox, {
+      checkoutName: "def-53-agreeing",
+      dirIssue: "DEF-53",
+      branchName: "fix/def-53-agreeing",
+      linked: true,
+    });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      !existsSync(agreeing.full),
+      "a checkout whose name, branch and origin all agree must still be reclaimable",
+    );
   } finally {
     sandbox.cleanup();
   }
@@ -572,7 +813,7 @@ test("workspace scope: directory names and symlinks do not authorize deletion", 
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
     const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-9": "done", "DEF-10": "done" } });
     const branchOnly = seedWorkspaceCheckout(sandbox, { checkoutName: "def-9", issue: "feature-open" });
-    const symlinkCheckout = seedWorkspaceCheckout(sandbox, { checkoutName: "repo-symlink", issue: "DEF-10" });
+    const symlinkCheckout = seedWorkspaceCheckout(sandbox, { checkoutName: "def-10-symlink", issue: "DEF-10" });
     const outside = path.join(sandbox.mount, "outside");
     mkdirSync(outside);
     rmSync(path.dirname(symlinkCheckout.full), { recursive: true, force: true });
