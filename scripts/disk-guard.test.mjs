@@ -36,16 +36,29 @@ function makeSandbox() {
  * filesystem. The script calls `df --block-size=1 -P "$MOUNT"`; size/used/avail
  * are emitted in 1-byte blocks, matching what the script's awk expects.
  *
+ * The Use% column is computed the way GNU df computes it: 100*used/(used+avail)
+ * taken to the ceiling, which is how coreutils arrives at its figure (82.4977%
+ * prints as 83%, not 82%). The guard escalates on the Use% it is handed, so a
+ * stub whose percentage contradicts the byte columns beside it would make every
+ * level assertion in this file meaningless.
+ *
+ * `usePct: N` overrides that, for the cases where the point under test is what
+ * the guard does when df's own column is unusable.
+ *
  * `broken: true` makes the stub fail the way an unmounted or unreadable volume
  * does, which is how we exercise the measurement-failure path.
  */
-function installDfStub(sandbox, { size, used, avail, broken = false }) {
+function installDfStub(sandbox, { size, used, avail, broken = false, usePct }) {
+  const pct =
+    usePct !== undefined
+      ? usePct
+      : Math.ceil((100 * used) / (used + avail || 1));
   const lines = broken
     ? "#!/bin/sh\nexit 1\n"
     : [
         "#!/bin/sh",
         'echo "Filesystem 1024-blocks Used Available Capacity Mounted on"',
-        `echo "stub ${size} ${used} ${avail} 50% /mnt"`,
+        `echo "stub ${size} ${used} ${avail} ${pct}% /mnt"`,
         "",
       ].join("\n");
   const stub = path.join(sandbox.binDir, "df");
@@ -221,6 +234,49 @@ test("a healthy volume under both thresholds yields rc=0", () => {
     const result = run(sandbox, ["--check"]);
     assert.equal(result.status, RC_OK);
     assert.match(result.stdout, /level=ok/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("use_pct equals the Use% df itself prints, not a truncated recomputation", () => {
+  // The /paperclip PVC as measured on 2026-10-03: df printed Use%=83 while the
+  // guard published use_pct=77/82. The disagreement was truncation against total
+  // blocks versus df's rounding against used+avail, and it read as a 6-point
+  // drift to anyone cross-checking the status file (DEF-291). A guard is only
+  // trustworthy if the number an operator can reproduce with `df -h /paperclip`
+  // is the number the guard escalated on, so pin them together here.
+  const sandbox = makeSandbox();
+  try {
+    const size = 211182436352;
+    const used = 174206820352;
+    const avail = 36958838784;
+    // 82.498% of used+avail: truncating against total blocks gives 82, df
+    // rounds to 83. The stub emits the df-accurate 83.
+    installDfStub(sandbox, { size, used, avail });
+    const result = run(sandbox, ["--check"]);
+    // stdout carries the operator summary, the status file the key/value form.
+    assert.match(result.stdout, />83%\)/);
+    assert.match(result.stdout, /level=ok/);
+
+    const status = readFileSync(sandbox.statusFile, "utf8");
+    assert.match(status, /^use_pct=83$/m);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("a df that omits Use% still measures from the byte columns", () => {
+  // Falling back must not turn into failing to measure: the byte columns are
+  // always present, so a blank or zero percentage still yields a real level
+  // rather than a spurious measurement error.
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB, usePct: 0 });
+    const result = run(sandbox, ["--check"]);
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, />5%\)/);
+    assert.doesNotMatch(result.stderr, /cannot measure/);
   } finally {
     sandbox.cleanup();
   }

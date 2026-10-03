@@ -273,10 +273,25 @@ measure() {
   # df -P columns: 1=filesystem 2=size 3=used 4=avail 5=capacity 6=mount
   # Use awk so column positions and the percentage are explicit rather than
   # depending on locale, field wrapping, or bash having a ternary operator.
+  #
+  # The percentage is taken from df's own Use% column (5) rather than
+  # recomputed here. df reports Use% against used+avail, rounded up to the
+  # ceiling, while `int(used*100/size)` truncates against total blocks. On
+  # the /paperclip PVC reserved space is only 16MiB of 197GiB (0.008%), so the
+  # two denominators agree to within rounding and the difference is truncation:
+  # at 82.498% the guard published 82 while `df -h` printed 83, and a
+  # human comparing the status file against the df they just ran read that as a
+  # 6-point disagreement and escalated it (DEF-291). Adopting df's own value
+  makes the number the guard escalates on identical to the one an operator
+  # sees, which is the whole point of a guard humans must be able to cross-check.
   df --block-size=1 -P "$MOUNT" 2>/dev/null | awk '
     NR>1 && NF>=5 {
       size=$2+0; used=$3+0; avail=$4+0
-      printf "%d %d %d %d\n", size, used, avail, (size>0 ? int(used*100/size) : 0)
+      pct=$5+0
+      # A df that omits a usable Use% still yields a usable measurement from
+      # the byte columns; fall back to the truncation rather than failing.
+      if (pct <= 0) pct=(size>0 ? int(used*100/size) : 0)
+      printf "%d %d %d %d\n", size, used, avail, pct
     }' | tail -1
 }
 
