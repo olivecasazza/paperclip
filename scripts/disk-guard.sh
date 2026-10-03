@@ -43,12 +43,27 @@
 #
 # wt/ holds this company's shared worktrees, scanned as a second deletion-capable
 # root. A worktree directory name (`con-220-gate`) is a label, not proof of
-# ownership, so terminality is resolved from the *corroborated* issue: the
-# identifier parsed from the directory name and the one parsed from the git
-# branch must agree. Either signal alone is wrong in the wild -- a real tree on
-# this volume is `wt/con-220` on branch `fix/con-220-clippy-194-stacked`, where
-# the branch alone reads as `CLIPPY-194`. Disagreement skips, so a foreign
-# `wt/nixlab-*` tree can never be reclaimed by resemblance.
+# ownership, so terminality is resolved from the *corroborated* issue, and
+# corroboration is two-step:
+#   1. a .paperclip-owner marker agreeing with the directory name wins, and the
+#      branch is not read at all -- it is allowed to disagree;
+#   2. with no marker, the identifier parsed from the directory name and the one
+#      parsed from the git branch must agree, exactly as before.
+#
+# Either in-band signal alone is wrong in the wild. `wt/con-220` sits on
+# `fix/con-220-clippy-194-stacked`, where the branch alone reads as CLIPPY-194
+# (an issue that does not exist), and `wt/con-313` sits on
+# `fix/oom-score-adj-protection`, which names no issue at all -- 2636MiB and
+# 2583MiB of unlinked build output stranded on two trees we own outright. The
+# marker is how the owning company says which issue a tree belongs to, so it
+# substitutes for the branch rather than being argued with.
+#
+# Every gate after the identifier is untouched by that widening: the marker only
+# replaces one corroborating signal with another. Terminality is still resolved
+# company-scoped, so a foreign `wt/nixlab-*` tree still has to name one of *our*
+# terminal issues to be reclaimed and does not. And because the name stays
+# load-bearing, one stray or forged marker cannot nominate an arbitrary tree:
+# the marker has to agree with the directory name before it is believed.
 #
 # Usage:
 #   disk-guard.sh --check     report only; exit 2 at WARN, 3 at CRIT
@@ -86,6 +101,11 @@ WT_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WT_RECLAIM_MIN_AGE_HOURS:-24}"
 # reclaimable. The dir name alone is a human-typed label, not proof of who owns
 # the build output inside it.
 CARGO_TARGET_OWNER_MARKER="${DISK_GUARD_CARGO_TARGET_OWNER_MARKER:-.paperclip-owner}"
+# Same marker, same meaning, for a wt/ worktree. A worktree carries it at its
+# own root and names the issue that owns the tree, so a stacked branch
+# (`fix/con-220-clippy-194-stacked`) or a descriptively-named one
+# (`fix/oom-score-adj-protection`) no longer leaves the tree unattributable.
+WT_OWNER_MARKER="${DISK_GUARD_WT_OWNER_MARKER:-.paperclip-owner}"
 
 mode="${1:---check}"
 
@@ -187,23 +207,67 @@ wt_name_identifier() {
     sed -nE 's/^([A-Za-z]+)-([0-9]+).*/\U\1-\2/p' | head -1
 }
 
-# The issue a wt/ tree is reclaimable against, or nothing if the two independent
-# signals disagree.
+# Read the in-band ownership marker at the root of a wt/ tree, if any.
 #
-# The directory name and the branch are each sufficient to look convincing and
-# each wrong on its own: `wt/con-220` is on `fix/con-220-clippy-194-stacked`, so
-# the branch alone says CLIPPY-194 (an issue that does not exist) while the name
-# alone would trust a label any process could create. Requiring agreement means a
-# tree can only ever be reclaimed for an issue both its location and its history
-# point at, and a renamed or shared branch fails closed instead of resolving to
-# whatever name happened to appear in it.
+# Whitespace is stripped rather than trimmed, matching how cargo-target-shared
+# reads its own marker, so `  CON-313\n` and `CON-313\n` are the same claim, and
+# the case is folded the same way, so a lowercase marker is not read as a
+# contradiction with an uppercased directory name.
 #
-# Prints the agreed identifier, returns 1 when they disagree or either is absent.
+# A marker that is a symlink is refused rather than followed: a link here would
+# let a file outside the worktree dictate what this tree claims to own, which is
+# why cargo-target-shared refuses one too. Refusing means "no usable marker",
+# so the caller falls back to name-vs-branch agreement -- the behaviour that
+# predates markers, and strictly no wider than it.
+wt_owner_marker() {
+  local checkout="$1" marked
+  [ -f "$checkout/$WT_OWNER_MARKER" ] || return 1
+  [ -L "$checkout/$WT_OWNER_MARKER" ] && return 1
+  marked="$(tr -d '[:space:]' <"$checkout/$WT_OWNER_MARKER" 2>/dev/null || true)"
+  printf '%s\n' "$marked" | tr '[:lower:]' '[:upper:]'
+}
+
+# The issue a wt/ tree is reclaimable against, or nothing if it cannot be
+# corroborated.
+#
+# Step 1 -- marker. If the tree carries a marker that agrees with the identifier
+# implied by its directory name, that identifier is the answer and the branch is
+# never read. The marker is an attestation by the owning company, which is a
+# stronger signal than a branch string: it is written in-band by whoever owns the
+# tree, it does not get rewritten by a rebase onto a shared trunk, and it is not
+# mangled by a stacked-branch convention that reads the *other* issue's id
+# first. Two measured trees on this volume are stranded precisely because their
+# branches do not carry their own issue id, and both are ours with terminal
+# issues. They stay reclaimable now, and neither gains anything they did not
+# already have: the name must still agree with the marker, and the issue it
+# names must still be terminal in *our* company.
+#
+# Step 2 -- name vs branch, unchanged, for a tree with no marker. This is what
+# keeps a tree reclaimed without any attestation at all, and disagreement between
+# name and branch still skips.
+#
+# Prints the agreed identifier, returns 1 when the tree cannot be corroborated.
 wt_corroborated_identifier() {
-  local checkout="$1" from_name from_branch
+  local checkout="$1" from_name from_branch marked
   from_name="$(wt_name_identifier "$checkout")"
-  from_branch="$(candidate_issue_identifier "$checkout")"
+  # No <PREFIX>-<number> head means the directory name attributes nothing, so
+  # there is nothing for a marker to agree with either. Fail closed and leave the
+  # space for a human to attribute.
   [ -n "$from_name" ] || return 1
+
+  marked="$(wt_owner_marker "$checkout" || true)"
+  if [ -n "$marked" ]; then
+    # A marker that disagrees with the directory name is a contradiction, not a
+    # licence: skip rather than pick a winner. This is also the property that
+    # stops one planted marker from nominating a tree the name does not support.
+    [ "$marked" = "$from_name" ] || return 1
+    printf '%s\n' "$from_name"
+    return 0
+  fi
+
+  # No marker (or a symlinked one we refused to follow): fall back to PR #19's
+  # name-vs-branch agreement, unchanged.
+  from_branch="$(candidate_issue_identifier "$checkout")"
   [ -n "$from_branch" ] || return 1
   [ "$from_name" = "$from_branch" ] || return 1
   printf '%s\n' "$from_name"
@@ -281,7 +345,7 @@ workspace_reclaim_candidates() {
 # added one is corroboration. Build output under a worktree is regenerable, so
 # reclaiming it cannot lose source -- but the tree can still be someone else's
 # (this volume holds `wt/nixlab-*` and `wt/sti-*` from other companies), so the
-# issue must be ours *and* terminal *and* both name and branch must agree on it.
+# issue must be ours *and* terminal *and* corroborated by wt_corroborated_identifier.
 wt_reclaim_candidates() {
   local checkout rel p p_real identifier tracked newest cutoff
   [ -d "$WT_DIR" ] || return 0
@@ -292,7 +356,9 @@ wt_reclaim_candidates() {
     [ -e "$checkout/.git" ] || continue
     identifier="$(wt_corroborated_identifier "$checkout")"
     if [ -z "$identifier" ]; then
-      log "skip  $checkout (name and branch do not agree on an issue identifier)"
+      # Either no marker agreeing with the directory name, or no marker and a
+      # branch that does not agree with the directory name. Both skip.
+      log "skip  $checkout (no $WT_OWNER_MARKER marker agreeing with the name, and name and branch do not agree on an issue identifier)"
       continue
     fi
     if ! issue_is_terminal "$identifier"; then
