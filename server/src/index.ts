@@ -83,6 +83,7 @@ import {
   statusCardService,
   toolAccessService,
   workspaceOperationService,
+  pruneHeartbeatRunPayloads,
 } from "./services/index.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
@@ -1673,6 +1674,9 @@ async function startServerWithDatabaseTeardown(
         }));
         trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
+        }));
+        trackHeartbeatSchedulerWork(pruneHeartbeatRunPayloads(db as any).catch((err: unknown) => {
+          logger.error({ err }, "heartbeat run payload retention sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {

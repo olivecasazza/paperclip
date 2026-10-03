@@ -78,6 +78,11 @@ export { attentionService } from "./attention.js";
 export { captureDecisionSnapshot, decisionTrainingService } from "./decision-training.js";
 export { decisionService } from "./decisions.js";
 export { decisionRetentionService } from "./decision-retention.js";
+export {
+  pruneHeartbeatRunPayloads,
+  startHeartbeatRunPayloadRetention,
+  TERMINAL_RUN_STATUSES,
+} from "./heartbeat-run-payload-retention.js";
 export type {
   WorkTimelineActor,
   WorkTimelineEdge,
