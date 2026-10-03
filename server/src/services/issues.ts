@@ -10541,6 +10541,7 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        expectedStatus?: string[];
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10558,14 +10559,28 @@ export function issueService(db: Db) {
       // call is not a boundary: `issues.company_id` can change between
       // that check and this write, so the predicate must carry the
       // company itself.
+      //
+      // `expectedStatus` is the same idea for the status column. A caller
+      // that read `todo` and decided to write `blocked` can lose that race
+      // to a concurrent disposition, and re-reading first is not enough: the
+      // other write can still land between the read and the UPDATE. Carrying
+      // the observed status in every predicate turns a lost race into a no-op
+      // (`null`, no write) instead of a silent clobber of a decision somebody
+      // else already made. The predicate is applied to the non-locking
+      // pre-check, to the `for("update")` locked read, and to the UPDATE.
+      const expectedStatus = data.expectedStatus;
       const idPredicate =
         data.companyGuard !== undefined
           ? and(eq(issues.id, id), eq(issues.companyId, data.companyGuard))
           : eq(issues.id, id);
+      const writePredicate = (predicate: any) =>
+        expectedStatus === undefined
+          ? predicate
+          : and(predicate, inArray(issues.status, expectedStatus));
       const existing = await dbOrTx
         .select()
         .from(issues)
-        .where(idPredicate)
+        .where(writePredicate(idPredicate))
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
       if (data.parentId !== undefined && data.parentId !== existing.parentId) {
@@ -10588,6 +10603,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        expectedStatus: _expectedStatus,
         ...issueData
       } = data;
       if (
@@ -10922,7 +10938,7 @@ export function issueService(db: Db) {
         const receiptExisting = await tx
           .select()
           .from(issues)
-          .where(idPredicate)
+          .where(writePredicate(idPredicate))
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
@@ -10985,7 +11001,7 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(writePredicate(idPredicate))
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

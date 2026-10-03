@@ -9227,7 +9227,15 @@ export function issueRoutes(
         resolutionNote,
         executionReconciliation,
       } = req.body;
-      if (outcome === "false_positive" || outcome === "cancelled") {
+      if (outcome === "cancelled") {
+        // Cancelling a recovery action destroys the escalation a board operator
+        // may still be acting on, so it stays board-only. `false_positive` is
+        // different: it records that the escalation was wrong about an issue
+        // that has already reached a terminal status, which is exactly the
+        // state the source assignee is best placed to attest. Blocking it
+        // behind `assertBoard` made a completed issue permanently unrepresentable
+        // — the owner could not write `done` (the sweep re-blocked it) and could
+        // not clear the action either, and `status` is machine-written.
         assertBoard(req);
       }
 
