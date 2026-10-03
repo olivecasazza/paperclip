@@ -3289,6 +3289,13 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
+// Row cap for heartbeat_runs list queries. The route layer already clamps an
+// explicit ?limit= into [1, 1000]; these bound the *service* so an omitted or
+// out-of-range limit from any caller cannot build an unbounded scan. See the
+// list() guard below for the measurement that motivated the default.
+export const HEARTBEAT_RUN_LIST_DEFAULT_LIMIT = 200;
+export const HEARTBEAT_RUN_LIST_MAX_LIMIT = 1000;
+
 const heartbeatRunListColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
@@ -29320,7 +29327,17 @@ export function heartbeatService(
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      const rows = limit ? await query.limit(limit) : await query;
+      // Never build an unbounded list query. An omitted limit used to mean
+      // "every run for the company/agent", which on the AgentDetail path
+      // returned 5,482 rows with the full transcript payload selected and
+      // held the drizzle pool for ~15s (measured 2026-10-03). The board
+      // list renders the newest runs; a caller that genuinely wants
+      // everything pages explicitly rather than by omission.
+      const rows = await query.limit(
+        limit === undefined || limit === null
+          ? HEARTBEAT_RUN_LIST_DEFAULT_LIMIT
+          : Math.max(1, Math.min(limit, HEARTBEAT_RUN_LIST_MAX_LIMIT)),
+      );
       return rows.map((row) => {
         const {
           contextIssueId,
