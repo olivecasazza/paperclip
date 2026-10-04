@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -27,6 +27,7 @@ import {
   pruneHeartbeatRunPayloads,
   TRIM_BATCH_SIZE,
 } from "../services/heartbeat-run-payload-retention.ts";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -40,6 +41,11 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const DAY_MS = 86_400_000;
+
+beforeEach(() => {
+  vi.mocked(logger.warn).mockClear();
+  vi.mocked(logger.info).mockClear();
+});
 
 describeEmbeddedPostgres("pruneHeartbeatRunPayloads", () => {
   let db!: ReturnType<typeof createDb>;
@@ -287,4 +293,65 @@ describeEmbeddedPostgres("pruneHeartbeatRunPayloads", () => {
     expect(second).toBe(25);
     expect(await pruneHeartbeatRunPayloads(db, 30)).toBe(0);
   }, 120_000);
+
+  it("reports the real backlog remainder when it stops on the per-sweep row cap", async () => {
+    // CON-468 defect 3: the live backlog (18,385 candidates) is larger than one
+    // sweep's 10,000-row ceiling on every single run, so the cap is the normal
+    // path. The old code logged "some runs may remain untrimmed" with no
+    // number, which hid that. Pin the count and the derived drain estimate.
+    const backlog = MAX_ITERATIONS * TRIM_BATCH_SIZE + 40;
+    const base = daysAgo(300);
+    const chunkSize = 500;
+    for (let start = 0; start < backlog; start += chunkSize) {
+      const size = Math.min(chunkSize, backlog - start);
+      await db.insert(heartbeatRuns).values(
+        Array.from({ length: size }, (_, offset) => {
+          const index = start + offset;
+          return {
+            companyId,
+            agentId,
+            status: "failed",
+            createdAt: new Date(base.getTime() - index * 1000),
+            finishedAt: new Date(base.getTime() - index * 1000),
+            contextSnapshot: { issueId: randomUUID(), paperclipIssue: { a: 1 } },
+            resultJson: { output: "x".repeat(64) },
+          };
+        }),
+      );
+    }
+
+    await pruneHeartbeatRunPayloads(db, 30);
+
+    const capped = logger.warn.mock.calls.filter((call) =>
+      String(call[1] ?? "").includes("per-sweep row cap"),
+    );
+    expect(capped.length).toBeGreaterThanOrEqual(1);
+
+    const payload = capped.at(-1)![0] as Record<string, unknown>;
+    expect(payload.totalTrimmed).toBe(MAX_ITERATIONS * TRIM_BATCH_SIZE);
+    expect(payload.maxRowsPerSweep).toBe(MAX_ITERATIONS * TRIM_BATCH_SIZE);
+    expect(payload.sweepsToDrain).toBe(1);
+  }, 120_000);
+
+  it("does not claim to return disk space in the success log", async () => {
+    // CON-468 defect 1: the sweep cannot return freed TOAST to the OS, so the
+    // log line has to say so rather than let an operator infer it did.
+    const id = await insertRun({
+      status: "succeeded",
+      createdAt: daysAgo(70),
+      resultJson: { output: "x".repeat(1000) },
+      contextSnapshot: { issueId: randomUUID(), paperclipIssue: { a: 1 } },
+    });
+    expect(id).toBeTruthy();
+
+    await pruneHeartbeatRunPayloads(db, 30);
+
+    const info = logger.info.mock.calls.filter((call) =>
+      String(call[1] ?? "").includes("Trimmed payload on aged terminal heartbeat runs"),
+    );
+    expect(info.length).toBeGreaterThanOrEqual(1);
+    const payload = info.at(-1)![0] as Record<string, unknown>;
+    expect(payload.spaceReturnedToOs).toBe(false);
+    expect(payload.totalTrimmed).toBeGreaterThan(0);
+  });
 });
