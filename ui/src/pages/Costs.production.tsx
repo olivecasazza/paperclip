@@ -25,6 +25,7 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProviderQuotaCard } from "../components/ProviderQuotaCard";
 import { StatusBadge } from "../components/StatusBadge";
+import { TenantCpuCard } from "../components/TenantCpuCard";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
@@ -337,6 +338,21 @@ export function Costs() {
     refetchInterval: 300_000,
     staleTime: 60_000,
   });
+
+  // Per-tenant CPU attribution. Polled slowly because it is a live /proc sample
+  // of long-running workers, not a per-minute cost delta.
+  const {
+    data: tenantCpuData,
+    isLoading: tenantCpuLoading,
+    error: tenantCpuError,
+  } = useQuery({
+    queryKey: queryKeys.usageTenantCpu(companyId),
+    queryFn: () => costsApi.tenantCpu(companyId),
+    enabled: !!selectedCompanyId && mainTab === "overview" && customReady,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+
 
   const byProvider = useMemo(() => {
     const map = new Map<string, CostByProviderModel[]>();
@@ -657,6 +673,11 @@ export function Costs() {
               ) : null}
 
               <div className="grid gap-4 xl:grid-cols-(--gtc-31)">
+                <TenantCpuCard
+                  report={tenantCpuData}
+                  isLoading={tenantCpuLoading}
+                  error={tenantCpuError}
+                />
                 <Card>
                   <CardHeader className="px-5 pt-5 pb-2">
                     <CardTitle className="text-base">Inference ledger</CardTitle>
