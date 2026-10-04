@@ -470,8 +470,7 @@ wt_reclaim_candidates() {
         log "skip  $p (contains tracked files)"
         continue
       fi
-      newest="$(newest_mtime_epoch "$p")"
-      if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+      if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
         log "skip  $p (newest mtime under ${WT_RECLAIM_MIN_AGE_HOURS}h)"
         continue
       fi
