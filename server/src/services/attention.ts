@@ -49,6 +49,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
+import { listAttentionSuppressedRunIds } from "./attention-failed-run-recency.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1663,50 +1664,22 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
       const failedRows = await listAttentionExhaustedRuns(db, companyId);
       const failedIssueIds = failedRows.map((row) => readRunIssueId(row.contextSnapshot));
-      const failedAgentIds = [...new Set(failedRows.map((row) => row.agentId))];
-      const oldestFailedRunCreatedAt = failedRows.reduce<Date | null>((oldest, row) => {
-        if (!oldest || row.createdAt < oldest) return row.createdAt;
-        return oldest;
-      }, null);
-      const [failedIssueMap, failedImageMap, newerRuns] = await Promise.all([
+      // Ask "does a newer run exist for this (agent, issue)?" once per bounded
+      // failed run instead of enumerating every newer run. The old lookup had no
+      // row bound and scanned the whole run history per feed build; see
+      // attention-failed-run-recency.ts for the measurement.
+      const [failedIssueMap, failedImageMap, suppressedRunIds] = await Promise.all([
         issueSummaryMap(
           db,
           companyId,
           failedIssueIds,
         ),
         issueImageMap(db, companyId, failedIssueIds),
-        oldestFailedRunCreatedAt && failedAgentIds.length > 0
-          ? db
-            .select({
-              agentId: heartbeatRuns.agentId,
-              createdAt: heartbeatRuns.createdAt,
-              // Project just the ids readRunIssueId needs; pulling the whole
-              // context_snapshot detoasts megabytes per feed build.
-              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-              runTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
-            })
-            .from(heartbeatRuns)
-            .where(and(
-              eq(heartbeatRuns.companyId, companyId),
-              inArray(heartbeatRuns.agentId, failedAgentIds),
-              gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
-            ))
-          : Promise.resolve([]),
+        listAttentionSuppressedRunIds(db, companyId, failedRows),
       ]);
-      const latestRunCreatedAtByKey = new Map<string, Date>();
-      for (const newerRun of newerRuns) {
-        const newerRunIssueId = readRunIssueId({ issueId: newerRun.runIssueId, taskId: newerRun.runTaskId });
-        const newerRunKey = `${newerRun.agentId}:${newerRunIssueId ?? ""}`;
-        const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
-        if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
-          latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
-        }
-      }
       for (const run of failedRows) {
+        if (suppressedRunIds.has(run.id)) continue;
         const issueId = readRunIssueId(run.contextSnapshot);
-        const runKey = `${run.agentId}:${issueId ?? ""}`;
-        const hasNewerRun = (latestRunCreatedAtByKey.get(runKey)?.getTime() ?? 0) > run.createdAt.getTime();
-        if (hasNewerRun) continue;
 
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
         const dedupKey = `run:${run.id}`;
