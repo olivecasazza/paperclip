@@ -6970,6 +6970,11 @@ describe("native session bounded recovery", () => {
             wakePolicy: null,
           }),
         );
+        // The descriptor reuses the instruction recorded on the failure detail,
+        // so it must name whichever cause actually fired. With no checkpoint the
+        // recovery mode is `ambiguous_state`, which the executor classifies
+        // ahead of the integrity branch, so this mirrors that same precedence
+        // rather than assuming the integrity wording.
         expect(updateIssue).toHaveBeenCalledWith(
           execution.binding.issueId,
           {
@@ -6977,7 +6982,9 @@ describe("native session bounded recovery", () => {
             unblockDescriptor: {
               owner: "board",
               action: expect.stringContaining(
-                "source-sequence integrity conflict",
+                checkpointExists
+                  ? "source-sequence integrity conflict"
+                  : "replacement provider session is forbidden",
               ),
             },
           },
@@ -7074,9 +7081,20 @@ describe("native session bounded recovery", () => {
           ),
         }),
       );
+      // Cleanup quarantine parks the issue with no dependency to resolve, so the
+      // operator instruction is carried onto the issue as its unblock path
+      // rather than dropped on the recovery action alone.
       expect(updateIssue).toHaveBeenCalledWith(
         execution.binding.issueId,
-        { status: "blocked" },
+        {
+          status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: expect.stringContaining(
+              "Clearing a task session does not resolve this quarantine",
+            ),
+          },
+        },
         expect.anything(),
       );
     } finally {
