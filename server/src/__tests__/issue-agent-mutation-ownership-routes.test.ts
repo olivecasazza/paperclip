@@ -322,8 +322,21 @@ function createRunContextDb(
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
   chatBindings: Array<{ id: string; companyId: string; issueId: string; state: string }> = [],
+  humanGated: {
+    pendingInteraction?: { id: string; kind: string } | null;
+    pendingApproval?: { id: string } | null;
+  } = {},
 ) {
   const chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[] = [];
+  const pendingInteraction = humanGated.pendingInteraction ?? null;
+  const pendingApproval = humanGated.pendingApproval ?? null;
+  const HUMAN_GATED_INTERACTION_KINDS = [
+    "connection_intent",
+    "ask_user_questions",
+    "request_confirmation",
+    "request_checkbox_confirmation",
+    "request_item_verdicts",
+  ] as const;
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
     : [{
@@ -376,8 +389,27 @@ function createRunContextDb(
     transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn((table: Parameters<typeof getTableName>[0]) => {
+        const terminalRows = (rows: unknown[]) => {
+          const chain: Record<string, unknown> = {
+            innerJoin: vi.fn(() => chain),
+            where: vi.fn(() => chain),
+            orderBy: vi.fn(() => chain),
+            limit: vi.fn(async () => rows),
+            for: vi.fn(() => chain),
+            then: (resolve: (value: unknown[]) => unknown) => resolve(rows),
+          };
+          return chain;
+        };
         if (getTableName(table) === "issue_thread_interactions") {
-          return { where: vi.fn(() => ({ limit: vi.fn(async () => []) })) };
+          // The route filters on kind, so the stub honours it rather than returning every
+          // pending row regardless of whether a human can discharge it.
+          const gated = HUMAN_GATED_INTERACTION_KINDS.includes(pendingInteraction?.kind as never)
+            ? [pendingInteraction]
+            : [];
+          return terminalRows(gated);
+        }
+        if (getTableName(table) === "issue_approvals") {
+          return terminalRows(pendingApproval ? [pendingApproval] : []);
         }
         return buildQuery(selection, getTableName(table) === "chat_conversations", getTableName(table) === "issue_recovery_actions");
       }),
@@ -1727,6 +1759,92 @@ describe("agent issue mutation checkout ownership", () => {
     const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
       unblockDescriptor: { owner: unblockOwner, action: "Review the blocker" },
     });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a pending connection intent", "connection_intent"],
+    ["a pending confirmation", "request_confirmation"],
+  ])(
+    "allows an agent to record %s as the unblock owner",
+    async (_label, interactionKind) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "in_progress" }),
+        ...patch,
+      }));
+
+      const res = await request(
+        await createApp(
+          ownerActor(),
+          createRunContextDb({}, ownerAgentId, ownerRunId, [], {
+            pendingInteraction: { id: "interaction", kind: interactionKind },
+          }),
+        ),
+      )
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "blocked",
+          unblockDescriptor: { owner: "board", action: "olive approves the connection card" },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          status: "blocked",
+          unblockDescriptor: { owner: "board", action: "olive approves the connection card" },
+        }),
+      );
+    },
+  );
+
+  it("allows an agent to record a company user as the unblock owner when a pending approval is linked", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked" }),
+      ...patch,
+    }));
+
+    const res = await request(
+      await createApp(
+        ownerActor(),
+        createRunContextDb({}, ownerAgentId, ownerRunId, [], { pendingApproval: { id: "approval" } }),
+      ),
+    )
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        unblockDescriptor: { owner: { userId: "board-user" }, action: "olive approves the linked approval" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        unblockDescriptor: { owner: { userId: "board-user" }, action: "olive approves the linked approval" },
+      }),
+    );
+  });
+
+  it("refuses an agent naming the board as unblock owner when the only pending interaction is agent-resolvable", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(
+      await createApp(
+        ownerActor(),
+        createRunContextDb({}, ownerAgentId, ownerRunId, [], {
+          pendingInteraction: { id: "interaction", kind: "suggest_tasks" },
+        }),
+      ),
+    )
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Review the blocker" },
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");

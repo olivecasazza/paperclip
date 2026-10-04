@@ -3410,6 +3410,59 @@ function estimatedJsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
+/**
+ * Kinds of pending interaction that only a board/user can discharge. A `connection_intent`
+ * card, for example, is a human setup obligation even though it is stored in the same table.
+ */
+const HUMAN_GATED_INTERACTION_KINDS = [
+  "connection_intent",
+  "ask_user_questions",
+  "request_confirmation",
+  "request_checkbox_confirmation",
+  "request_item_verdicts",
+] as const;
+
+/**
+ * An agent may name a human/board `unblockDescriptor.owner` only when it is recording
+ * someone else's obligation, which requires a pending human-gated interaction to be the
+ * thing that unblocks. Without one there is nothing to point at, so the descriptor would be
+ * an unverifiable claim and the agent keeps ownership of its own exit.
+ */
+async function hasHumanGatedUnblockTarget(
+  db: Db,
+  input: { companyId: string; issueId: string },
+): Promise<boolean> {
+  const [pendingInteraction, pendingApproval] = await Promise.all([
+    db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, input.companyId),
+          eq(issueThreadInteractions.issueId, input.issueId),
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issueThreadInteractions.kind, [...HUMAN_GATED_INTERACTION_KINDS]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+    db
+      .select({ id: approvals.id })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, input.companyId),
+          eq(issueApprovals.issueId, input.issueId),
+          inArray(approvals.status, ["pending", "revision_requested"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+  ]);
+  return Boolean(pendingInteraction ?? pendingApproval);
+}
+
 function logIssueListRequest(input: {
   req: Request;
   res: Response;
@@ -13265,7 +13318,11 @@ export function issueRoutes(
         const owner = descriptor.owner;
         if (
           req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
+          (owner === "board" || "userId" in owner) &&
+          !(await hasHumanGatedUnblockTarget(db, {
+            companyId: existing.companyId,
+            issueId: existing.id,
+          }))
         ) {
           throw forbidden(
             "Agents may only name themselves as an unblock owner",
