@@ -22,7 +22,11 @@ vi.mock("../middleware/logger.js", () => ({
   httpLogger: vi.fn(),
 }));
 
-import { pruneHeartbeatRunPayloads } from "../services/heartbeat-run-payload-retention.ts";
+import {
+  MAX_ITERATIONS,
+  pruneHeartbeatRunPayloads,
+  TRIM_BATCH_SIZE,
+} from "../services/heartbeat-run-payload-retention.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -245,4 +249,42 @@ describeEmbeddedPostgres("pruneHeartbeatRunPayloads", () => {
     const after = await readRun(id);
     expect(after.contextSnapshot).toEqual({});
   });
+
+  it("bounds one sweep to a fixed number of rows so it cannot hold a single unbounded lock", async () => {
+    // The first cut updated every candidate row in one statement and used
+    // TRIM_BATCH_SIZE only as a post-hoc break test, so a single sweep rewrote
+    // the whole aged backlog at once. These rows must survive one call.
+    const backlog = MAX_ITERATIONS * TRIM_BATCH_SIZE + 25;
+    const base = daysAgo(200);
+    const chunkSize = 500;
+    for (let start = 0; start < backlog; start += chunkSize) {
+      const size = Math.min(chunkSize, backlog - start);
+      await db.insert(heartbeatRuns).values(
+        Array.from({ length: size }, (_, offset) => {
+          const index = start + offset;
+          return {
+            companyId,
+            agentId,
+            status: "succeeded",
+            createdAt: new Date(base.getTime() - index * 1000),
+            finishedAt: new Date(base.getTime() - index * 1000),
+            contextSnapshot: { issueId: randomUUID(), paperclipIssue: { a: 1 } },
+            resultJson: { output: "x".repeat(64) },
+            usageJson: { totalTokens: 1 },
+          };
+        }),
+      );
+    }
+
+    const trimmed = await pruneHeartbeatRunPayloads(db, 30);
+    const ceiling = MAX_ITERATIONS * TRIM_BATCH_SIZE;
+
+    expect(trimmed).toBe(ceiling);
+
+    // Work remains, and it is picked up by the next sweep rather than forced
+    // into this one.
+    const second = await pruneHeartbeatRunPayloads(db, 30);
+    expect(second).toBe(25);
+    expect(await pruneHeartbeatRunPayloads(db, 30)).toBe(0);
+  }, 120_000);
 });

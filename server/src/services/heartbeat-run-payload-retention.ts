@@ -1,4 +1,4 @@
-import { and, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -14,10 +14,15 @@ import { logger } from "../middleware/logger.js";
 const DEFAULT_RETENTION_DAYS = 30;
 
 /** Maximum rows touched per batch, to keep each statement's footprint bounded. */
-const TRIM_BATCH_SIZE = 500;
+export const TRIM_BATCH_SIZE = 500;
 
-/** Maximum batches per sweep so a backlog cannot monopolise the connection. */
-const MAX_ITERATIONS = 20;
+/**
+ * Maximum batches per sweep so a backlog cannot monopolise the connection.
+ *
+ * At `TRIM_BATCH_SIZE` this caps a single sweep at 10,000 rows. A larger backlog
+ * is not an error: the next sweep continues where this one stopped.
+ */
+export const MAX_ITERATIONS = 20;
 
 /** How often the sweep runs (default: 6 hours). */
 const DEFAULT_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
@@ -95,6 +100,31 @@ function buildTrimmedContextSql() {
 }
 
 /**
+ * Rows that are still worth trimming: terminal, past the window, and not
+ * already trimmed.
+ *
+ * Kept as a shared predicate so the id-select and the id-scoped update can
+ * never drift apart — if they did, the update could touch rows the select did
+ * not admit, which is exactly the unbounded statement this batching exists to
+ * prevent.
+ */
+function trimCandidates(cutoff: Date) {
+  return and(
+    inArray(heartbeatRuns.status, [...TERMINAL_RUN_STATUSES]),
+    lt(heartbeatRuns.createdAt, cutoff),
+    // Skip rows already trimmed so repeat sweeps are a cheap no-op
+    // rather than rewriting every aged row on every tick.
+    or(
+      sql`${heartbeatRuns.resultJson} is not null`,
+      sql`${heartbeatRuns.usageJson} is not null`,
+      sql`${heartbeatRuns.stdoutExcerpt} is not null`,
+      sql`${heartbeatRuns.stderrExcerpt} is not null`,
+      sql`coalesce(pg_column_size(${heartbeatRuns.contextSnapshot}), 0) > 512`,
+    ),
+  );
+}
+
+/**
  * Trim the stored payload on terminal runs older than the retention window.
  *
  * Unlike a delete, this keeps the row: id, status, timings, exit metadata and
@@ -107,6 +137,13 @@ function buildTrimmedContextSql() {
  * recovers the space without foreclosing that decision, and because the heavy
  * columns live in TOAST, nulling them lets the space be returned to the OS
  * instead of only shrinking future inserts.
+ *
+ * Batching matters here and is not an optimisation. These columns live in
+ * TOAST, so one statement over an unbounded candidate set rewrites hundreds of
+ * megabytes while holding a row lock per touched row for its whole duration —
+ * long enough to collide with a concurrent run write on the same table. Each
+ * batch therefore claims at most `TRIM_BATCH_SIZE` ids, updates only those, and
+ * yields between batches, so the sweep cannot monopolise the connection.
  *
  * @returns The number of rows trimmed.
  */
@@ -121,6 +158,18 @@ export async function pruneHeartbeatRunPayloads(
   let iterations = 0;
 
   while (iterations < MAX_ITERATIONS) {
+    // Oldest first, so a backlog drains in age order rather than in whatever
+    // order the heap happens to return.
+    const batchIds = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(trimCandidates(cutoff))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(TRIM_BATCH_SIZE)
+      .then((rows) => rows.map((row) => row.id));
+
+    if (batchIds.length === 0) break;
+
     const trimmed = await db
       .update(heartbeatRuns)
       .set({
@@ -130,28 +179,15 @@ export async function pruneHeartbeatRunPayloads(
         stderrExcerpt: null,
         contextSnapshot: buildTrimmedContextSql(),
       })
-      .where(
-        and(
-          inArray(heartbeatRuns.status, [...TERMINAL_RUN_STATUSES]),
-          lt(heartbeatRuns.createdAt, cutoff),
-          // Skip rows already trimmed so repeat sweeps are a cheap no-op
-          // rather than rewriting every aged row on every tick.
-          or(
-            sql`${heartbeatRuns.resultJson} is not null`,
-            sql`${heartbeatRuns.usageJson} is not null`,
-            sql`${heartbeatRuns.stdoutExcerpt} is not null`,
-            sql`${heartbeatRuns.stderrExcerpt} is not null`,
-            sql`coalesce(pg_column_size(${heartbeatRuns.contextSnapshot}), 0) > 512`,
-          ),
-        ),
-      )
+      .where(and(trimCandidates(cutoff), inArray(heartbeatRuns.id, batchIds)))
       .returning({ id: heartbeatRuns.id })
       .then((rows) => rows.length);
 
     totalTrimmed += trimmed;
     iterations++;
 
-    if (trimmed < TRIM_BATCH_SIZE) break;
+    // The batch was fully claimed, so a full batch means there is more to do.
+    if (batchIds.length < TRIM_BATCH_SIZE) break;
   }
 
   if (iterations >= MAX_ITERATIONS) {
