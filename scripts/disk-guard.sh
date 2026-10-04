@@ -80,6 +80,20 @@
 
 set -uo pipefail
 
+# Per-run memo directory for issue-terminality lookups. Torn down on exit so no
+# cached decision from one invocation can be read by the next.
+RUN_CACHE_DIR=""
+cleanup_run_cache() {
+  [ -n "$RUN_CACHE_DIR" ] && [ -d "$RUN_CACHE_DIR" ] && rm -rf -- "$RUN_CACHE_DIR" 2>/dev/null
+  return 0
+}
+trap cleanup_run_cache EXIT
+init_run_cache() {
+  RUN_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/disk-guard-cache.XXXXXX" 2>/dev/null)" || RUN_CACHE_DIR=""
+  [ -n "$RUN_CACHE_DIR" ] || return 1
+  chmod 700 "$RUN_CACHE_DIR" 2>/dev/null
+}
+
 MOUNT="${DISK_GUARD_MOUNT:-/paperclip}"
 WARN_PCT="${DISK_GUARD_WARN_PCT:-88}"
 CRIT_PCT="${DISK_GUARD_CRIT_PCT:-94}"
@@ -162,13 +176,18 @@ remove_path() {
 }
 
 api_get() {
-  local path="$1"
+  local path="$1" max_time="${2:-}"
   if [ -n "${DISK_GUARD_API_STUB:-}" ]; then
     "$DISK_GUARD_API_STUB" "$path"
     return $?
   fi
   [ -n "${PAPERCLIP_API_KEY:-}" ] || return 1
+  # Every request is bounded: one hung endpoint must not be able to consume a
+  # whole heartbeat. Callers that legitimately expect a larger body pass their
+  # own ceiling.
   curl -fsS \
+    --max-time "${max_time:-${DISK_GUARD_API_MAX_TIME:-15}}" \
+    --connect-timeout "${DISK_GUARD_API_CONNECT_TIMEOUT:-5}" \
     -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     -H "X-Paperclip-Run-Id: ${PAPERCLIP_RUN_ID:-disk-guard}" \
     "${API_URL%/}/api$path"
@@ -289,8 +308,190 @@ corroborated_checkout_issue() {
 issue_is_terminal() {
   local identifier="$1" status
   [ -n "$identifier" ] || return 1
-  status="$(api_get "/companies/$COMPANY_ID/issues?q=$identifier&limit=10" 2>/dev/null | json_issue_status "$identifier" 2>/dev/null || true)"
+  [ -n "$RUN_CACHE_DIR" ] || return 1
+
+  # A terminal decision for one identifier is a property of the issue, not of the
+  # checkout that mentions it, so it is memoised for the rest of the run. The memo
+  # records only a status we actually recognised: a transport failure leaves no
+  # memo, so the lookup below retries and the caller still fails closed.
+  local memo="$RUN_CACHE_DIR/issue-${identifier}"
+  if [ -f "$memo" ]; then
+    read -r status <"$memo"
+    log "issue_cache hit $identifier -> $status"
+    [ "$status" = "done" ] || [ "$status" = "cancelled" ]
+    return
+  fi
+
+  status="$(_lookup_issue_status "$identifier")"
+  case "$status" in
+    done|cancelled|active|blocked|in_progress|todo|backlog|in_review)
+      printf '%s\n' "$status" >"$memo" 2>/dev/null
+      ;;
+    *)
+      # Unknown or empty: not ours to reclaim. Deliberately uncached so the next
+      # checkout that names it is judged on its own evidence, never on a guess.
+      ;;
+  esac
   [ "$status" = "done" ] || [ "$status" = "cancelled" ]
+}
+
+# Resolve one identifier to a status, spending at most one network request.
+#
+# The question "is <identifier> terminal?" is asked once per checkout, and the
+# answer must come from *this* company's issues -- that tenant scoping is what
+# stops a foreign repository that happens to name our ticket from spending it.
+# It was previously answered with one unbounded `?q=<identifier>` fuzzy search per
+# checkout, which is a full server-side scan: ~7s and ~38KB to return ten issues.
+# Across a `--prune` over 116 checkouts that was 76 sequential round trips, ~193s
+# of a ~197s run, against a heartbeat with a finite ceiling (DEF-304, DEF-307).
+#
+# Two facts make one page fetch sufficient instead:
+#
+#   1. The snapshot is this company's whole issue list, so any identifier we own is
+#      in it. `?q=` could only ever find an issue the snapshot also contains.
+#   2. An identifier outside this company's namespace cannot match anything here,
+#      so its answer is "not ours" without a request. Fuzzy `?q=` on a foreign
+#      identifier returns unrelated issues that merely contain the string, which
+#      is exactly what the fail-closed branch below treats as not-ours anyway.
+#
+# Fail-closed is preserved throughout: no snapshot, or an unreadable one, falls
+# back to the original per-identifier search.
+_lookup_issue_status() {
+  local identifier="$1" snapshot=""
+  case "$identifier" in
+    "" ) return 0 ;;
+    *-* ) ;;
+    * ) return 0 ;;
+  esac
+
+  if [ ! -f "$RUN_CACHE_DIR/snapshot.done" ]; then
+    # The bulk page is much larger than a ten-issue search (1MB/296 issues here),
+    # so it gets its own, longer ceiling -- but still a bounded one.
+    #
+    # A failed attempt is remembered for the rest of the run. Without that, every
+    # checkout retries a request we have already seen fail or exceed its ceiling,
+    # which is how one expensive probe becomes the entire heartbeat: the failure
+    # costs as much as the success, times the number of checkouts.
+    if [ ! -f "$RUN_CACHE_DIR/snapshot.failed" ]; then
+      if snapshot="$(api_get "/companies/$COMPANY_ID/issues?limit=500" 2>/dev/null \
+                       "${DISK_GUARD_API_BULK_MAX_TIME:-45}")" \
+         && [ -n "$snapshot" ] \
+         && snapshot="$(_slim_issue_list "$snapshot")" \
+         && _snapshot_is_issue_list "$snapshot"; then
+        printf '%s' "$snapshot" >"$RUN_CACHE_DIR/snapshot.json" 2>/dev/null
+        : >"$RUN_CACHE_DIR/snapshot.done" 2>/dev/null
+        _company_prefixes >"$RUN_CACHE_DIR/prefixes.txt" 2>/dev/null
+        : >"$RUN_CACHE_DIR/prefixes.ready" 2>/dev/null
+      else
+        # Not a list of issues we can read, or too slow to fetch. Do not trust it.
+        # Fall back to the per-identifier search for the rest of this run.
+        log "issue_snapshot unusable; falling back to per-issue search"
+        : >"$RUN_CACHE_DIR/snapshot.failed" 2>/dev/null
+      fi
+    fi
+  fi
+
+  if [ -s "$RUN_CACHE_DIR/snapshot.json" ]; then
+    local status
+    status="$(json_issue_status "$identifier" <"$RUN_CACHE_DIR/snapshot.json" 2>/dev/null || true)"
+    if [ -n "$status" ]; then
+      log "issue_snapshot hit $identifier -> $status"
+      printf '%s\n' "$status"
+      return 0
+    fi
+    # Absent from our own issue list: not ours, definitively. No request needed.
+    log "issue_snapshot miss $identifier (not in this company's issues)"
+    return 0
+  fi
+
+  # No usable snapshot. An identifier in a namespace this company does not use
+  # still cannot resolve, and a fuzzy search for it only returns unrelated
+  # issues -- which the caller already reads as not-ours. Decline it locally
+  # rather than spend a request to learn nothing.
+  if _identifier_outside_company_namespace "$identifier"; then
+    log "issue_namespace_miss $identifier (not a prefix this company uses; not searched)"
+    return 0
+  fi
+
+  api_get "/companies/$COMPANY_ID/issues?q=$identifier&limit=10" 2>/dev/null \
+    | json_issue_status "$identifier" 2>/dev/null || true
+}
+
+# The set of identifier prefixes this company actually uses, learned from the
+# snapshot rather than assumed. `?q=` is a fuzzy server-side scan, so searching
+# for another company's ticket cannot return that ticket -- it returns whatever
+# unrelated issue happens to contain the string, which the caller already treats
+# as "not ours". Knowing the prefixes lets us decline those searches outright.
+#
+# Only ever *adds* to the skip set, and only from data this company served, so a
+# wrong or empty answer costs requests but can never authorise a delete.
+_company_prefixes() {
+  [ -s "$RUN_CACHE_DIR/snapshot.json" ] || return 0
+  node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(0); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
+    const prefixes = new Set();
+    for (const i of items) {
+      const m = /^([A-Za-z]+)-[0-9]+$/.exec(String(i && i.identifier || ""));
+      if (m) prefixes.add(m[1].toUpperCase());
+    }
+    console.log([...prefixes].sort().join(" "));
+  ' <"$RUN_CACHE_DIR/snapshot.json"
+}
+
+# True when this identifier is in a namespace this company demonstrably does not
+# use, so no request can resolve it and its answer is already known.
+_identifier_outside_company_namespace() {
+  local identifier="$1" prefixes prefix
+  [ -n "${DISK_GUARD_ASSUME_NAMESPACE:-}" ] && return 1
+  [ -f "$RUN_CACHE_DIR/prefixes.ready" ] || return 1
+  read -r prefixes <"$RUN_CACHE_DIR/prefixes.txt" 2>/dev/null || return 1
+  [ -n "$prefixes" ] || return 1
+  case "${identifier%%-*}" in
+    [A-Za-z]*) prefix="$(printf '%s' "${identifier%%-*}" | tr '[:lower:]' '[:upper:]')" ;;
+    *) return 1 ;;
+  esac
+  case " $prefixes " in
+    *" $prefix "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Keep only the two fields the terminality decision reads. A 296-issue page
+# carries descriptions, conversation state and counters that cost bytes on the
+# wire and time to parse, none of which any reclaim gate consults.
+_slim_issue_list() {
+  printf '%s' "$1" | node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : null);
+    if (!items) process.exit(1);
+    console.log(JSON.stringify(items
+      .filter((i) => i && i.identifier && i.status)
+      .map((i) => ({ identifier: i.identifier, status: i.status }))));
+  '
+}
+
+# True only when the payload really is a list of issues carrying a usable
+# identifier and status. This is the guard on the guard: a 200 response that is
+# not an issue list (an error envelope, an empty object, a filtered page with no
+# identifying fields) must not be able to read as "this company has no such
+# issue", because that reading is what licenses a delete.
+_snapshot_is_issue_list() {
+  printf '%s' "$1" | node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : null);
+    if (!items) process.exit(1);
+    // An empty list is a legitimate answer only if the route really returned an
+    // issue list; require the envelope to look like one.
+    if (items.length === 0) process.exit(1);
+    process.exit(items.some((i) => i && i.identifier && i.status) ? 0 : 1);
+  '
 }
 
 contained_realpath() {
@@ -628,7 +829,7 @@ report() {
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
     printf 'level=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\n' \
       "$level" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB"
-    printf 'guard_version=4\n'
+    printf 'guard_version=5\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -643,6 +844,7 @@ prune() {
   # Everything below this point consults the issue API, so the company id must
   # resolve before any reclaim work starts.
   require_company_id
+  init_run_cache
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
   # "because the routine ran" costs a slow re-download for no gain. Only prune
