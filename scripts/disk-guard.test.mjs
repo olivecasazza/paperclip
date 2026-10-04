@@ -949,6 +949,216 @@ test("gate 2: a checkout whose issue cannot be established is skipped, not guess
   }
 });
 
+/**
+ * Seed a checkout whose `origin/main` already contains its HEAD, then detach.
+ *
+ * This is the `def-299-verify` shape: a checkout left detached at a commit that
+ * is already merged, holding stale gitignored build output behind a done issue.
+ * A detached HEAD is the one case where gate 2 has no branch name to corroborate
+ * a directory name against, so it needs `origin/main` to exist as real ancestry
+ * evidence -- which a single-clone `seedWorkspaceCheckout` cannot provide, since
+ * nothing has ever pushed anything anywhere.
+ *
+ * `merged` selects which side of the new rule is under test: true detaches at a
+ * commit that IS an ancestor of origin/main, false at a commit that is not.
+ */
+function seedDetachedCheckoutWithMainline(sandbox, { agentId = "agent-1", checkoutName, issue = "DEF-1", merged = true } = {}) {
+  const checkout = path.join(sandbox.mount, "instances/default/workspaces", agentId, checkoutName);
+
+  // A bare stand-in for the project's real remote. `src` pushes to it so
+  // origin/main is a ref that genuinely exists, rather than one invented by
+  // update-ref -- otherwise the ancestry test would prove nothing.
+  const bare = path.join(sandbox.root, `${checkoutName}-origin.git`);
+  mkdirSync(bare, { recursive: true });
+  spawnSync("git", ["init", "-q", "--bare", "-b", "main", bare]);
+  const src = path.join(sandbox.root, `${checkoutName}-src`);
+  seedGitClone(src, { origin: false });
+  writeFileSync(path.join(src, "README.md"), "merged\n");
+  spawnSync("git", ["add", "."], { cwd: src });
+  spawnSync("git", ["commit", "-q", "-m", "docs(ci): correct a stale comment (#232)"], { cwd: src });
+  spawnSync("git", ["push", "-q", bare, "HEAD:main"], { cwd: src });
+
+  // When the commit must NOT be a mainline ancestor, main gets a commit the
+  // checkout never saw *and* the checkout is left at a commit that diverged from
+  // main instead of one behind it. The distinction matters: ancestry is
+  // transitive, so simply leaving HEAD one commit behind main still makes it an
+  // ancestor of main, which is the `merged` case and not the negative one. Only
+  // a commit that is not on main's history at all fails `--is-ancestor`.
+  if (!merged) {
+    spawnSync("git", ["checkout", "-q", "-b", "side", "HEAD~1"], { cwd: src });
+    writeFileSync(path.join(src, "SIDE.md"), "work that was never merged\n");
+    spawnSync("git", ["add", "."], { cwd: src });
+    spawnSync("git", ["commit", "-q", "-m", "wip: unmerged work off to the side"], { cwd: src });
+    spawnSync("git", ["push", "-q", bare, "HEAD:side"], { cwd: src });
+  }
+
+  spawnSync("git", ["clone", "-q", bare, checkout]);
+  // The checkout's `origin` must be the company project repo for the
+  // repository-identity gate to pass, and origin/main must be the ref this seed
+  // built. A later `git fetch` against the real remote would overwrite the latter,
+  // so the fetch is rewritten to read the local bare repo; without the rewrite a
+  // real network fetch would silently replace the ancestry under test.
+  spawnSync("git", ["config", "remote.origin.url", bare], { cwd: checkout });
+  spawnSync(
+    "git",
+    ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+    { cwd: checkout },
+  );
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: checkout });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: checkout });
+  // Fetch the branch this case hangs on, then point origin at the company repo so
+  // identity passes while refs/remotes/origin/main stays exactly what was seeded.
+  spawnSync("git", ["fetch", "-q", "origin"], { cwd: checkout });
+  spawnSync("git", ["remote", "set-url", "origin", COMPANY_PROJECT_REPO], { cwd: checkout });
+  spawnSync(
+    "git",
+    ["config", `remote.${COMPANY_PROJECT_REPO}.url`, bare],
+    { cwd: checkout },
+  );
+  spawnSync(
+    "git",
+    ["config", `remote.${COMPANY_PROJECT_REPO}.fetch`, "+refs/heads/*:refs/remotes/origin/*"],
+    { cwd: checkout },
+  );
+
+  writeFileSync(path.join(checkout, ".gitignore"), "client/target\n");
+  const full = path.join(checkout, "client/target/blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+  utimesSync(full, old, old);
+  utimesSync(path.dirname(full), old, old);
+  utimesSync(path.join(checkout, "client/target"), old, old);
+
+  spawnSync("git", ["checkout", "-q", "--detach", merged ? "origin/main" : "origin/side"], { cwd: checkout });
+  // Assert the seed is the shape the test claims, so a broken seed fails as a
+  // seed rather than silently passing for the wrong reason.
+  assert.notEqual(
+    spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd: checkout }).status,
+    0,
+    "seed must leave HEAD detached or this case is not the detached-HEAD rule",
+  );
+  const isAncestor =
+    spawnSync("git", ["merge-base", "--is-ancestor", "HEAD", "origin/main"], { cwd: checkout }).status === 0;
+  assert.equal(isAncestor, merged, "seed must produce the mainline ancestry the case under test needs");
+
+  return { checkout, full };
+}
+
+test("workspace scope: a checkout with no .git is named in the log, not dropped in silence", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-275": "done" } });
+
+    // The `def-275-outbox-replay` shape on /paperclip: an abandoned build scratch
+    // copy with `client/` and `env.sh` and no `.git` anywhere. 7.62 GiB of
+    // nlink==1, the largest such block on the volume.
+    const checkout = path.join(sandbox.mount, "instances/default/workspaces/agent-1/def-275-outbox-replay");
+    const full = path.join(checkout, "client/target/debug/blob");
+    mkdirSync(path.dirname(full), { recursive: true });
+    writeFileSync(full, Buffer.alloc(2 * MIB));
+    writeFileSync(path.join(checkout, "env.sh"), "# run environment for the trimmed client/ build copy\n");
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(checkout, "client/target"), old, old);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    // The refusal itself is correct and unchanged: no repository, no commit, no
+    // corroboration, so nothing under it may be deleted.
+    assert.ok(existsSync(full), "build output under an unauditable checkout must survive");
+
+    // What was broken is that it produced no line at all. A skip the owner cannot
+    // see is indistinguishable from a tree that does not exist, so the whole tree
+    // left the books silently.
+    assert.match(
+      result.stderr,
+      /def-275-outbox-replay \(no \.git; cannot corroborate ownership\)/,
+      "a checkout with no .git must be named with an explicit reason",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a detached HEAD that is a merged ancestor of origin/main is corroborated by its directory name", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-299": "done" } });
+    const detached = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "def-299-verify", issue: "DEF-299" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    // HEAD is merged, so the tree is a snapshot of mainline: the branch check has
+    // nothing to say, but the commit itself is evidence that the content belongs.
+    assert.ok(!existsSync(detached.full), "a detached HEAD already on origin/main must be reclaimable");
+    assert.match(
+      result.stderr,
+      /prune .*def-299-verify\/client\/target/,
+      "the reclaim must be reported, so the freed bytes are auditable too",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a detached HEAD that is NOT on origin/main, or whose name names no issue, still fails closed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-299": "done", "DEF-300": "done" },
+    });
+    // Half the new rule removed at a time: unmerged commit, and a merged commit
+    // in a directory that names no ticket. Either alone must still refuse.
+    const unmerged = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "def-299-unmerged", issue: "DEF-299", merged: false });
+    const unnamed = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "scratch-tree", issue: "DEF-300", merged: true });
+    // Ancestry is orthogonal to every other gate, so a merged detached HEAD must
+    // still lose to them. This is the live shape from DEF-322: `def-300-rustfmt`
+    // was refused for age alone, and the age gate is the one thing the new rule
+    // must not have disturbed.
+    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "def-300-rustfmt", issue: "DEF-300", fresh: true });
+    // And to the repo-identity gate: `pc-guard` is a clone of *this* control
+    // plane's own repo, so no ancestry claim about its mainline authorises a
+    // deletion read from our issue API.
+    const foreign = seedWorkspaceCheckout(sandbox, { checkoutName: "pc-guard", issue: "DEF-300", origin: FOREIGN_REPO });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.ok(existsSync(unmerged.full), "a detached HEAD with work not on main must survive");
+    assert.ok(existsSync(unnamed.full), "a merged detached HEAD in a directory naming no issue must survive");
+    assert.ok(existsSync(fresh.full), "build output under the min-age threshold must still survive");
+    assert.ok(existsSync(foreign.full), "a checkout of a foreign repo must survive");
+    assert.match(
+      result.stderr,
+      /def-300-rustfmt\/client\/target \(newest mtime under 24h\)/,
+      "the min-age gate must still report why it refused",
+    );
+    assert.match(
+      result.stderr,
+      /pc-guard \(origin .* is not the company project repo/,
+      "the repo-identity gate must still report why it refused",
+    );
+    assert.match(
+      result.stderr,
+      /def-299-unmerged \(branch does not name an issue; a detached HEAD is not an ancestor of origin\/main\)/,
+      "an unmerged detached HEAD must be refused with a reason that names the missing ancestry",
+    );
+    assert.match(
+      result.stderr,
+      /scratch-tree \(directory name does not attribute it to an issue\)/,
+      "ancestry is not a substitute for a directory name that names a ticket",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 test("gate 2: the 3.3G live case is refused with a reason naming identity, not skipped silently", () => {
   const sandbox = makeSandbox();
   try {
@@ -2360,7 +2570,7 @@ test("trend: --check needs no company id, so the signal cannot be lost to a tena
 // that is PRESENT but reports a different version, or differs by a byte, is
 // always a bug and is checked. Set the env var only for a deliberate
 // uninstall, never to quiet a real mismatch.
-const EXPECTED_GUARD_VERSION = 7;
+const EXPECTED_GUARD_VERSION = 8;
 const RUNTIME_COPIES = ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"];
 
 test("the committed script declares the guard_version the repo expects", () => {

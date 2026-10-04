@@ -340,6 +340,45 @@ checkout_repo_is_ours() {
   [ "$origin" = "$PROJECT_REPO" ]
 }
 
+# Whether a detached HEAD's commit is already part of the project's mainline.
+#
+# A detached HEAD has no branch name, so `candidate_issue_identifier` yields
+# nothing and gate 2's name-and-branch agreement cannot be evaluated. That refusal
+# is right -- but it was reached for the wrong reason. The branch check exists
+# because a *branch name* can be renamed, shared or borrowed: it is evidence
+# about which ticket someone was working on, not proof of it. A detached HEAD at a
+# commit that is an ancestor of `origin/main` is different in kind: the commit
+# itself is already merged, so its content provably belongs to mainline and no
+# branch name could be moved onto it without changing the commit.
+#
+# That is the provenance `def-299-verify` had and the gate did not look for: HEAD
+# at 44b403e, an ancestor of origin/main, holding 1.77 GiB of client/target
+# behind a done issue. Both halves are required and neither substitutes for the
+# other:
+#
+#   - repository identity is already settled by checkout_repo_is_ours above, so
+#     this cannot be used to vouch for a foreign repo.
+#   - `merge-base --is-ancestor` is ancestry in the *project's* mainline. It says
+#     the commit is already merged; it says nothing about which ticket the
+#     directory belongs to, which is why the caller still requires the directory
+#     name to name an issue.
+#
+# Note that ancestry is transitive: a commit one behind main is still an ancestor
+# of it. That is correct -- it *is* mainline content -- and it is why the negative
+# case in the suite has to diverge from main rather than lag it.
+#
+# Returns 0 when HEAD is a merged ancestor of origin/main. Any inability to
+# decide -- no origin/main ref, a shallow clone that cannot resolve history, an
+# empty repo -- returns 1, so the caller fails closed and keeps skipping.
+head_is_merged_ancestor() {
+  local checkout="$1"
+  # A ref that does not exist is not evidence, and --is-ancestor against a
+  # missing ref exits non-zero for the same reason a real mismatch does, so the
+  # ref is confirmed first to keep the two failures distinguishable in review.
+  git -C "$checkout" rev-parse --verify --quiet 'refs/remotes/origin/main' >/dev/null 2>&1 || return 1
+  git -C "$checkout" merge-base --is-ancestor HEAD refs/remotes/origin/main >/dev/null 2>&1
+}
+
 # The issue a workspace checkout is reclaimable against, or nothing at all.
 #
 # Three independent pieces of evidence must corroborate each other, and the
@@ -380,7 +419,19 @@ corroborated_checkout_issue() {
     return 1
   fi
   if [ -z "$from_branch" ]; then
-    log "skip  $checkout (branch does not name an issue; a detached HEAD has no branch to agree with '$from_dir')"
+    # No branch name to corroborate the directory against. A detached HEAD is
+    # the only way to get here with a real commit, and it is corroborable on
+    # evidence the branch check was only approximating: when HEAD is already an
+    # ancestor of origin/main the commit is merged, so the tree is a snapshot of
+    # mainline and the directory name is the only remaining claim about which
+    # ticket owns it. Requiring the directory name to name an issue keeps the
+    # ticket attribution sourced rather than invented. Both the ancestry and the
+    # name are required; either alone still fails closed.
+    if head_is_merged_ancestor "$checkout"; then
+      printf '%s\n' "$from_dir"
+      return 0
+    fi
+    log "skip  $checkout (branch does not name an issue; a detached HEAD is not an ancestor of origin/main)"
     return 1
   fi
   if [ "$from_dir" != "$from_branch" ]; then
@@ -836,7 +887,21 @@ workspace_reclaim_candidates() {
     [ -d "$workspace" ] || continue
     for checkout in "$workspace"/* "$workspace"/*/.paperclip/worktrees/*; do
       [ -e "$checkout" ] || continue
-      [ -d "$checkout/.git" ] || [ -f "$checkout/.git" ] || continue
+      # A checkout with no git metadata is unauditable: there is no origin to
+      # bind it to a repository and no commit to corroborate a directory name
+      # against, so gate 2 cannot resolve an issue and nothing under it may be
+      # deleted. The `continue` is correct -- an unauditable tree must survive.
+      # What was wrong was that it was reached in silence: the bare `continue`
+      # fired before any log call, so the largest nlink==1 block on this volume
+      # (workspaces/<agent>/def-275-outbox-replay, 7.62 GiB, 99.2% client/target
+      # with 840K of source) never appeared in --prune output at all and simply
+      # vanished from the books. An owner comparing the guard's report against
+      # `du` had no way to tell a skipped tree from a tree that does not exist.
+      # Name it and say why, so the invisible is at least auditable.
+      if [ ! -d "$checkout/.git" ] && [ ! -f "$checkout/.git" ]; then
+        log "skip  $checkout (no .git; cannot corroborate ownership)"
+        continue
+      fi
       # Gate 2. Returns nothing when repository, directory name and branch do not
       # corroborate one issue, and has already logged why, so the refusal is
       # visible in --prune output rather than being an undecided-looking skip.
@@ -1289,7 +1354,7 @@ report() {
       "${prev_avail_mb:-}" "${delta_mb:-}" "${elapsed_min:-}" "${rate_mb_hour:-}"
     printf 'level=%s\nlevel_snapshot=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
       "$level" "${level_snapshot:-}" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$FALL_RATE_MB_PER_HOUR"
-    printf 'guard_version=7\n'
+    printf 'guard_version=8\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
