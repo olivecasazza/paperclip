@@ -66,6 +66,8 @@ HEALTH_URL="${HEALTH_URL:-${PAPERCLIP_API_URL:-}}"
 IDLE_SECONDS="${IDLE_SECONDS:-900}"
 ASSUME_YES=0
 BACKUP_TO=""
+# Set by commit_is_post_split so gate 2 can log which check actually passed.
+SPLIT_PROOF=""
 
 # The one file that exists if and only if the build serving this instance carries
 # the per-agent split. It is the function this whole gate exists to verify, and
@@ -75,16 +77,20 @@ BACKUP_TO=""
 AGENT_DATA_HOME_SRC="packages/adapters/opencode-local/src/server/agent-data-home.ts"
 APP_DIR="${PAPERCLIP_APP_DIR:-/app}"
 
-# Commits on olivecasazza/paperclip that contain $AGENT_DATA_HOME_SRC, verified
-# by fetching that path from the fork at each revision. The fix landed in the
-# merge commit ef74a7a3 (PR #6) and every descendant carries it, so this is a
-# prefix list to match against, not an exhaustive one.
+# The minimal set of commits that ADD $AGENT_DATA_HOME_SRC on this fork. The
+# fix landed in the merge commit ef74a7a3 (PR #6); c7165e96 and c226db7b are
+# the branch commits it merged. Every descendant carries the fix too, so this
+# list is used for a real ANCESTRY query, never a string comparison.
 #
-# This is a FALLBACK, not the primary signal. It only proves the deployed commit
-# descends from a commit that added the file; it cannot prove that commit is the
-# one actually running, and the prefix list goes stale as the fork moves on --
-# every image published after ef74a7a3 (0fb95072, cadea06cb, 15ab3438b) fails it.
-OPENCODE_SPLIT_COMMITS_DEFAULT="ef74a7a3 c226db7b c7165e96"
+# This is a FALLBACK for dist-only deployments where the app tree is not
+# mounted. It used to be prefix-matched against the deployed commit, which
+# refused every descendant of these commits -- i.e. every image published after
+# the merge, including the one the repin exists to install.
+OPENCODE_SPLIT_COMMITS_DEFAULT="ef74a7a3c21c3ba9a374f723809c956338750f9e c7165e96c5e3ca9c8b1f74dbf2d671f7147c647d"
+
+# Where to run the ancestry query. $APP_DIR is preferred when it is a git
+# checkout; otherwise $SPLIT_REPO_DIR, then any repo containing the object.
+SPLIT_REPO_DIR="${SPLIT_REPO_DIR:-$APP_DIR}"
 
 log() { printf '%s\n' "$*" >&2; }
 usage() { sed -n '2,45p' "$0" >&2; exit 1; }
@@ -130,14 +136,46 @@ gate_per_agent_homes() {
 # mounted into the container (a dist-only or packaged deployment), where commit
 # ancestry is the best available evidence.
 # ---------------------------------------------------------------------------
+# Provenance evidence that the deployed commit carries the split: ancestry is
+# the load-bearing question. A descendant of a split commit has the file; a
+# sibling branch cut before the merge does not, and must be refused.
+#
+# Ancestry, not prefix matching. `case "$commit" in "$known"*)` answered "is
+# this the introducing commit?", which is false for every descendant -- so the
+# gate refused the live pod and the repin target while looking correctly gated.
+split_repo() {
+  local candidate
+  for candidate in "$APP_DIR" "$SPLIT_REPO_DIR"; do
+    [ -n "$candidate" ] || continue
+    if git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 commit_is_post_split() {
-  local commit="$1" known
+  local commit="$1" known repo
   [ -n "$commit" ] || return 1
   for known in ${OPENCODE_SPLIT_COMMITS:-$OPENCODE_SPLIT_COMMITS_DEFAULT}; do
     case "$commit" in
       "$known"*) return 0 ;;
     esac
   done
+  if repo=$(split_repo); then
+    for known in ${OPENCODE_SPLIT_COMMITS:-$OPENCODE_SPLIT_COMMITS_DEFAULT}; do
+      # Objects we do not hold yet are fetched on demand; a repo without
+      # network access to the fork simply cannot answer, and says so below.
+      if git -C "$repo" merge-base --is-ancestor "$known" "$commit" >/dev/null 2>&1; then
+        SPLIT_PROOF="ancestry in $repo: $commit descends from $known"
+        return 0
+      fi
+    done
+    log "gate 2: $repo holds neither a split commit nor an ancestor of $commit"
+  else
+    log "gate 2: no git repository at $APP_DIR or $SPLIT_REPO_DIR to resolve ancestry"
+  fi
   return 1
 }
 
@@ -154,6 +192,7 @@ deployed_commit() {
 
 gate_deployed_build() {
   local commit
+  SPLIT_PROOF=""
   if [ -f "$APP_DIR/$AGENT_DATA_HOME_SRC" ]; then
     log "gate 2 ok: deployed tree $APP_DIR/$AGENT_DATA_HOME_SRC is present — the running build carries the per-agent split"
     return 0
@@ -162,7 +201,7 @@ gate_deployed_build() {
   commit=$(deployed_commit)
   commit_is_post_split "$commit" \
     || fail "deployed build is $commit, which predates the per-agent OpenCode data-home fix (merge ef74a7a3) — deleting the shared DB now would drop every live session"
-  log "gate 2 ok: deployed build $commit descends from a commit carrying the per-agent split"
+  log "gate 2 ok: ${SPLIT_PROOF:-$commit carries the split}"
 }
 
 # ---------------------------------------------------------------------------
