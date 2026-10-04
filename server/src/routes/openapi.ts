@@ -5190,7 +5190,7 @@ registry.registerPath({
   tags: ["costs"],
   summary: "Per-tenant CPU attribution rollup for one company",
   description:
-    "Joins this company's unfinished run pids against /proc/<pid>/stat and buckets CPU by company. Readable under the same rules as the per-company cost rollup. Observability only: it gates nothing.",
+    "Joins this company's unfinished run pids against /proc/<pid>/stat and buckets CPU by company. Readable under the same rules as the per-company cost rollup. Observability only: it gates no work.",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
