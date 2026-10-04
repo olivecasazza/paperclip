@@ -432,7 +432,11 @@ async function scanForBackendChanges() {
 
 async function getDevHealthPayload() {
   const serverPort = env.PORT ?? process.env.PORT ?? "3100";
-  const response = await fetch(`http://127.0.0.1:${serverPort}/api/health`, {
+  // Readiness, not the default liveness path: the auto-restart gate below reads
+  // `devServer.activeRunCount`, which is a database read and is only returned
+  // when the caller opts in. On liveness the block is absent, `devServer` is
+  // undefined, and auto-restart-on-idle would silently never fire again.
+  const response = await fetch(`http://127.0.0.1:${serverPort}/api/health?database=required`, {
     headers: devServerStatusToken ? { [devServerStatusTokenHeader]: devServerStatusToken } : undefined,
   });
   if (!response.ok) {

@@ -1811,6 +1811,15 @@ registry.registerPath({
         // unavailable. Present on every response shape, including redacted ones.
         commit: z.string().nullable(),
         deploymentMode: z.string().optional(),
+        // Which contract answered. `probed: false` means this was a liveness
+        // request and no database query was issued, so a saturated pool cannot
+        // make this process look dead.
+        database: z
+          .object({
+            probed: z.boolean(),
+            reachable: z.boolean().nullable(),
+          })
+          .strict(),
         cloud: z
           .object({
             managed: z.literal(true),
@@ -1871,11 +1880,12 @@ registry.registerPath({
         serverInfo: healthServerInfoSchema.optional(),
       }),
     ),
-    // The database-unreachable body still carries version and commit so
-    // deployment tooling can verify the running build during an outage;
-    // serverInfo rides only on full-details (board/agent) responses.
+    // Only a readiness request (`?database=required`) can reach 503: the
+    // database-unreachable body still carries version and commit so deployment
+    // tooling can verify the running build during an outage; serverInfo rides
+    // only on full-details (board/agent) responses.
     503: {
-      description: "Service unavailable",
+      description: "Service unavailable (readiness request only)",
       content: {
         "application/json": {
           schema: z.object({
@@ -1883,7 +1893,13 @@ registry.registerPath({
             version: z.string(),
             serverVersion: z.string(),
             commit: z.string().nullable(),
-            error: z.literal("database_unreachable"),
+            error: z.enum(["database_unreachable", "database_unavailable"]),
+            database: z
+              .object({
+                probed: z.boolean(),
+                reachable: z.boolean().nullable(),
+              })
+              .strict(),
             serverInfo: healthServerInfoSchema.optional(),
           }),
         },

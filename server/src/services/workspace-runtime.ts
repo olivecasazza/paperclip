@@ -39,6 +39,7 @@ import { resolveHomeAwarePath } from "../home-paths.js";
 import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
+  buildWorkspaceReadinessHealthUrl,
   logManagedWorkspaceReadinessRejection,
   probeManagedWorkspaceHandoffSubjects,
   probeManagedWorkspaceReadiness,
@@ -5359,7 +5360,10 @@ function resolveRuntimeServiceHealthUrl(
       parsed.pathname = "/api/health";
       parsed.search = "";
       parsed.hash = "";
-      return parsed.toString();
+      // This URL is the input to `probeManagedWorkspaceReadiness`, which reads
+      // the `workspace` block that only the readiness contract returns. Opt in
+      // here, at the one place the URL is built, so no call site can forget.
+      return buildWorkspaceReadinessHealthUrl(parsed.toString());
     }
   } catch {
     return url;

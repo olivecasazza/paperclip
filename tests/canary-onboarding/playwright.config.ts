@@ -74,7 +74,10 @@ export default defineConfig({
   ],
   webServer: {
     command,
-    url: `${baseUrl}/api/health`,
+    // Readiness gate, not the default liveness path: this has to mean "the server
+    // is actually serving". The liveness default returns 200 before migrations
+    // finish, which would hand Playwright a not-yet-ready server.
+    url: `${baseUrl}/api/health?database=required`,
     reuseExistingServer: false,
     timeout: 300_000,
     env: {

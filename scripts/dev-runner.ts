@@ -674,7 +674,10 @@ async function scanForBackendChanges() {
 }
 
 async function getDevHealthPayload() {
-  const response = await fetch(`http://127.0.0.1:${serverPort}/api/health`, {
+  // This caller reads `devServer.activeRunCount` and the experimental-settings
+  // flag, both database reads, so it opts into the readiness contract. A plain
+  // liveness probe deliberately returns neither.
+  const response = await fetch(`http://127.0.0.1:${serverPort}/api/health?database=required`, {
     headers: devServerStatusToken ? { [devServerStatusTokenHeader]: devServerStatusToken } : undefined,
   });
   if (!response.ok) {
