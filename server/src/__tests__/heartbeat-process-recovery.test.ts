@@ -6855,9 +6855,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             ),
           ),
       ]);
+    // The escalation parks with no blocker to resolve, so the operator
+    // instruction recorded on the recovery action must also land on the issue as
+    // its unblockDescriptor. Without it the issue is stranded by construction:
+    // `issue_blockers_resolved` can never fire and no heartbeat will pick it up.
     expect(sourceAfter).toMatchObject({
       status: "blocked",
       assigneeAgentId: agentId,
+      unblockDescriptor: {
+        owner: "board",
+        action: expect.stringContaining("Inspect the evidence"),
+      },
     });
     expect(action).toMatchObject({
       kind: "deliberate_wait_without_target",
