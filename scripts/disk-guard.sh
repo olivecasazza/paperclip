@@ -185,10 +185,70 @@ json_issue_status() {
 unlinked_bytes() {
   # Bytes held by inodes with nlink==1 under $1. This is the only figure that
   # predicts space actually returned to the filesystem.
+  #
+  # The walk cannot be shortened: a sum over every unlinked inode is what the
+  # figure means, and the nlink==1 test is the gate itself. What changed in
+  # DEF-306 is only how many times it runs -- see candidate_age_and_unlinked_bytes,
+  # which answers the mtime question in the same walk.
   find "$1" -xdev -type f -links 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
 }
 
+# Whether anything under $1 is newer than the cutoff epoch.
+#
+# This replaces taking the newest mtime with a full sort. The only question any
+# caller asks is "is anything here newer than the cutoff", so `find` can stop at
+# the first entry that answers it: `-print -quit` short-circuits, and nothing is
+# sorted, so the cost becomes the position of the first fresh entry rather than
+# the size of the tree.
+#
+# The comparison is `-newermt "@$((cutoff - 1))"`, not `"@$cutoff"`, and the
+# difference is load-bearing. Callers skip when `newest >= cutoff`, while
+# -newermt is *strictly* newer. Testing only the cutoff would let an entry whose
+# mtime is exactly the cutoff through as a candidate where the old gate skipped
+# it -- a candidate that must be skipped no longer is. Stepping the cutoff back
+# one second makes "mtime > cutoff-1" identical to "mtime >= cutoff" on whole
+# seconds, which is the resolution %T@ is compared at here.
+#
+# Prints nothing when nothing is newer. A caller that skips on a non-empty
+# result is unchanged: an empty tree is still empty, and the "cannot tell" case
+# that used to be an empty `newest` becomes an empty result too.
+tree_has_entry_newer_than() {
+  local cutoff="$1" dir="$2"
+  [ -d "$dir" ] || return 1
+  find "$dir" -xdev -newermt "@$(( cutoff - 1 ))" -print -quit 2>/dev/null
+}
+
+# Age and size in ONE walk of the candidate, for the enumeration path that needs
+# both answers per candidate.
+#
+# Enumeration used to walk every candidate twice: newest_mtime_epoch sorted the
+# whole tree, then unlinked_bytes walked it again to sum it. On the 78 build
+# output trees this volume actually holds that was 265s for a single --prune
+# enumeration (DEF-306), and one of them was so slow the run had to be killed at
+# a 280s ceiling without reaching the last candidate.
+#
+# Both facts come from the same directory entries, so one `find` answers both:
+#   -type f -links 1 -printf '%s\n'  the unlinked-byte total, unchanged
+#   -newermt "@cutoff-1" -printf F   a freshness sentinel, and -quit ends the
+#                                     walk the moment one is found
+#
+# The nlink==1 accounting and the cutoff are both preserved exactly; only the
+# number of walks changes. Echoes "<bytes> <fresh|stale>".
+candidate_age_and_unlinked_bytes() {
+  local dir="$1" cutoff="$2"
+  [ -d "$dir" ] || { printf '0 stale\n'; return 0; }
+  find "$dir" -xdev \
+    \( -type f -links 1 -printf '%s\n' \) \
+    -o \( -newermt "@$(( cutoff - 1 ))" -printf 'F\n' -quit \) \
+    2>/dev/null |
+    awk '/^F$/ { fresh = 1; next } { sum += $1 } END { printf "%d %s\n", sum + 0, (fresh ? "fresh" : "stale") }'
+}
+
 newest_mtime_epoch() {
+  # Retained for the call sites that report a specific newest mtime. The
+  # enumeration gate uses candidate_age_and_unlinked_bytes instead; this stays a
+  # full sort because answering "what is the exact newest epoch" is not a
+  # question that short-circuits.
   find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
 }
 
@@ -344,8 +404,7 @@ workspace_reclaim_candidates() {
           log "skip  $p (contains tracked files)"
           continue
         fi
-        newest="$(newest_mtime_epoch "$p")"
-        if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+        if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
           log "skip  $p (newest mtime under ${WORKSPACE_RECLAIM_MIN_AGE_HOURS}h)"
           continue
         fi
@@ -485,8 +544,7 @@ shared_cargo_target_candidate() {
     log "skip  $p (outside cargo-target-shared)"
     return 1
   }
-  newest="$(newest_mtime_epoch "$p")"
-  if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+  if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
     log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
     return 1
   fi
@@ -546,8 +604,7 @@ cargo_target_reclaim_candidates() {
       log "skip  $p (outside cargo-target-shared)"
       continue
     }
-    newest="$(newest_mtime_epoch "$p")"
-    if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+    if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
       log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
       continue
     fi
