@@ -10730,7 +10730,15 @@ export function issueService(db: Db) {
       // terminal-run-recovery classifier call this service directly, so the
       // zero-signal check lives here and covers every writer. Actor type is
       // deliberately not consulted.
-      if (patch.status === "blocked") {
+      //
+      // Only a real transition *into* blocked is checked, matching the route
+      // guard. Writers that re-persist an existing `blocked` status while
+      // changing something else (reassignment, version bumps) must not be
+      // rejected: they do not create the stranded state, and the issue was
+      // already blocked before they ran.
+      const enteringBlocked =
+        patch.status === "blocked" && existing.status !== "blocked";
+      if (enteringBlocked) {
         const nextUnblockDescriptor =
           issueData.unblockDescriptor !== undefined
             ? issueData.unblockDescriptor

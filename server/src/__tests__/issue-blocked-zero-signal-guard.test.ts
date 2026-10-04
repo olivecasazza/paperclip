@@ -109,4 +109,22 @@ describeEmbeddedPostgres("issueService blocked zero-signal guard", () => {
     expect(updated?.priority).toBe("critical");
     expect(updated?.status).toBe("blocked");
   });
+
+  it("allows a status-preserving write on a blocked issue that has no unblock path", async () => {
+    // A pre-existing stranded blocked issue must stay repairable: writers that
+    // re-persist `blocked` while changing the owner (reassignment) or bumping
+    // the status version are not creating the stranded state and must not be
+    // rejected by the guard, or the issue can never be fixed in place.
+    const { db, issueId } = await seed("blocked");
+    const svc = issueService(db);
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      assigneeAgentId: null,
+    });
+
+    expect(updated?.status).toBe("blocked");
+    // The write landed instead of being rejected by the zero-signal guard.
+    expect(updated?.assigneeAgentId).toBeNull();
+  });
 });

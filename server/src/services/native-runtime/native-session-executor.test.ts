@@ -6972,7 +6972,15 @@ describe("native session bounded recovery", () => {
         );
         expect(updateIssue).toHaveBeenCalledWith(
           execution.binding.issueId,
-          { status: "blocked" },
+          {
+            status: "blocked",
+            unblockDescriptor: {
+              owner: "board",
+              action: expect.stringContaining(
+                "source-sequence integrity conflict",
+              ),
+            },
+          },
           expect.anything(),
         );
       } finally {
