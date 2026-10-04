@@ -43,6 +43,10 @@ type ProbeRow = {
   createdAt: Date;
   /** `readRunIssueId` of the failed run's stored context. */
   issueId: string | null;
+  /** Raw `issueId` from the stored context, kept to detect disagreement. */
+  runIssueId: string | null;
+  /** Raw `taskId` from the stored context, kept to detect disagreement. */
+  runTaskId: string | null;
 };
 
 function chunk<T>(values: readonly T[], size: number): T[][] {

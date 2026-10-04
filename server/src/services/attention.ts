@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -11,7 +11,6 @@ import {
   decisionTrainingExamples,
   decisionTriage,
   decisions,
-  heartbeatRuns,
   inboxDismissals,
   invites,
   issueApprovals,
