@@ -32,6 +32,15 @@ export type HealthStatus = {
   authReady?: boolean;
   bootstrapStatus?: "ready" | "bootstrap_pending";
   bootstrapInviteActive?: boolean;
+  /**
+   * Which contract answered. `probed: false` means the default liveness probe
+   * ran and issued no database query, so a saturated pool cannot make this
+   * process look dead. Absent only on a server that predates the split.
+   */
+  database?: {
+    probed: boolean;
+    reachable: boolean | null;
+  };
   features?: {
     companyDeletionEnabled?: boolean;
   };
@@ -46,8 +55,15 @@ export type HealthStatus = {
 };
 
 export const healthApi = {
+  /**
+   * Readiness fetch.
+   *
+   * The browser reads `bootstrapStatus` and `devServer`, both of which are
+   * database-backed, so it opts into the readiness contract explicitly. The
+   * server's default path is liveness and answers without those fields.
+   */
   get: async (): Promise<HealthStatus> => {
-    const res = await fetch("/api/health", {
+    const res = await fetch("/api/health?database=required", {
       credentials: "include",
       headers: { Accept: "application/json" },
     });

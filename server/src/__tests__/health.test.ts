@@ -76,7 +76,14 @@ describe("GET /health", () => {
     const app = createApp();
     const res = await request(app).get("/health");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: "ok", version: serverVersion, serverVersion: serverVersion, commit: testServerInfo.git.fullSha, serverInfo: testServerInfo });
+    expect(res.body).toEqual({
+      status: "ok",
+      version: serverVersion,
+      serverVersion: serverVersion,
+      commit: testServerInfo.git.fullSha,
+      serverInfo: testServerInfo,
+      database: { probed: false, reachable: null },
+    });
   }, 15_000);
 
   it("keeps the self-hosted health response byte-identical and omits cloud", async () => {
@@ -90,6 +97,7 @@ describe("GET /health", () => {
       serverVersion,
       commit: testServerInfo.git.fullSha,
       serverInfo: testServerInfo,
+      database: { probed: false, reachable: null },
     };
     expect(res.text).toBe(JSON.stringify(baseline));
     expect(Object.prototype.hasOwnProperty.call(res.body, "cloud")).toBe(false);
@@ -152,30 +160,30 @@ describe("GET /health", () => {
     expect(second.body.hiddenSettings).not.toContain("instance.experimental.enableMemoryConnectors");
   });
 
-  it("returns 200 when the database probe succeeds", async () => {
+  it("returns 200 when the readiness probe succeeds", async () => {
     const db = {
       execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
     } as unknown as Db;
     const app = createApp(db);
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(db.execute).toHaveBeenCalledTimes(1);
     expect(res.body).toMatchObject({
       status: "ok",
       version: serverVersion,
-      serverInfo: testServerInfo,
+      database: { probed: true, reachable: true },
     });
   });
 
-  it("returns 503 when the database probe fails", async () => {
+  it("returns 503 when the readiness probe fails", async () => {
     const db = {
       execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")),
     } as unknown as Db;
     const app = createApp(db);
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(503);
     expect(res.body).toEqual({
@@ -184,8 +192,84 @@ describe("GET /health", () => {
       serverVersion,
       commit: testServerInfo.git.fullSha,
       error: "database_unreachable",
+      database: { probed: true, reachable: false },
       serverInfo: testServerInfo,
     });
+  });
+
+  it("issues no database query on the default liveness path", async () => {
+    const db = {
+      execute: vi.fn().mockRejectedValue(new Error("liveness must not query")),
+      select: vi.fn(() => {
+        throw new Error("liveness must not query");
+      }),
+    } as unknown as Db;
+    const app = createApp(db);
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    // Asserted on the stub, not the body: a body-only assertion would still
+    // pass while the query ran and its result was discarded.
+    expect(db.execute).not.toHaveBeenCalled();
+    expect(db.select).not.toHaveBeenCalled();
+    expect(res.body.database).toEqual({ probed: false, reachable: null });
+  });
+
+  it("stays 200 on liveness while readiness reports the saturated pool", async () => {
+    const db = {
+      execute: vi.fn().mockRejectedValue(new Error("timeout: pool saturated")),
+      select: vi.fn(() => {
+        throw new Error("unreachable on this path");
+      }),
+    } as unknown as Db;
+    const app = createApp(db);
+
+    const liveness = await request(app).get("/health");
+    const readiness = await request(app).get("/health?database=required");
+
+    expect(liveness.status).toBe(200);
+    expect(liveness.body.status).toBe("ok");
+    expect(readiness.status).toBe(503);
+    expect(readiness.body.database).toEqual({ probed: true, reachable: false });
+  });
+
+  it("treats only an affirmative database value as the readiness opt-in", async () => {
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+    } as unknown as Db;
+    const app = createApp(db);
+
+    for (const query of ["?database", "?database=", "?database=1", "?database=true", "?database=REQUIRED"]) {
+      db.execute.mockClear();
+      const res = await request(app).get(`/health${query}`);
+      expect(res.status, query).toBe(200);
+      expect(db.execute, query).toHaveBeenCalledTimes(1);
+      expect(res.body.database, query).toEqual({ probed: true, reachable: true });
+    }
+
+    // No parameter, and every value that does not affirm the opt-in, must stay
+    // on the query-free liveness path.
+    for (const query of ["", "?database=0", "?database=false", "?database=optional"]) {
+      db.execute.mockClear();
+      const res = await request(app).get(`/health${query}`);
+      expect(res.status, query).toBe(200);
+      expect(db.execute, query).not.toHaveBeenCalled();
+      expect(res.body.database, query).toEqual({ probed: false, reachable: null });
+    }
+  });
+
+  it("answers readiness without a database as unavailable, but stays live", async () => {
+    const app = createApp();
+
+    const liveness = await request(app).get("/health");
+    const readiness = await request(app).get("/health?database=required");
+
+    expect(liveness.status).toBe(200);
+    expect(liveness.body.database).toEqual({ probed: false, reachable: null });
+    expect(readiness.status).toBe(503);
+    expect(readiness.body.error).toBe("database_unavailable");
+    expect(readiness.body.database).toEqual({ probed: false, reachable: null });
   });
 
   it("returns safe server info fallbacks when git metadata is unavailable", async () => {
@@ -352,7 +436,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
@@ -361,6 +445,7 @@ describe("GET /health", () => {
       deploymentExposure: "public",
       localAiLoginSupported: false,
       commit: testServerInfo.git.fullSha,
+      database: { probed: true, reachable: true },
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
       databaseBackup: {
@@ -410,7 +495,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
@@ -419,6 +504,7 @@ describe("GET /health", () => {
       deploymentExposure: "public",
       localAiLoginSupported: false,
       commit: testServerInfo.git.fullSha,
+      database: { probed: true, reachable: true },
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
@@ -449,7 +535,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
@@ -458,6 +544,7 @@ describe("GET /health", () => {
       deploymentExposure: "public",
       localAiLoginSupported: false,
       commit: testServerInfo.git.fullSha,
+      database: { probed: true, reachable: true },
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
@@ -492,7 +579,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
@@ -537,7 +624,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
@@ -574,7 +661,7 @@ describe("GET /health", () => {
       }),
     );
 
-    const res = await request(app).get("/health");
+    const res = await request(app).get("/health?database=required");
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({

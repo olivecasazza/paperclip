@@ -20,7 +20,10 @@ const BASE = process.env.PAPERCLIP_E2E_BASE_URL ?? "http://127.0.0.1:3104";
 
 /** Ensure the server is bootstrapped (claimed) before running tests. */
 async function ensureBootstrapped(request: APIRequestContext): Promise<void> {
-  const healthRes = await request.get(`${BASE}/api/health`);
+  // Readiness, not the default liveness path: `bootstrapStatus` is a database
+  // read that only the readiness contract returns. On liveness it is undefined
+  // and this helper would silently fall through every branch.
+  const healthRes = await request.get(`${BASE}/api/health?database=required`);
   const health = await healthRes.json();
   if (health.bootstrapStatus === "ready") return;
 

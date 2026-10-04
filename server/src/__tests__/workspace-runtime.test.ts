@@ -4407,7 +4407,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const serviceScript =
       "const http=require('node:http');"
       + "http.createServer((req,res)=>{"
-      + "if(req.url==='/api/health'){res.setHeader('content-type','application/json');"
+      + "if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');"
       + "res.end(JSON.stringify({status:'ok'}));return;}"
       + "res.end(process.env.PAPERCLIP_UI_DEV_MIDDLEWARE||'missing');"
       + "}).listen(Number(process.env.PORT),'127.0.0.1');";
@@ -4474,7 +4474,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const serviceScript =
       "const http=require('node:http');"
       + "http.createServer((req,res)=>{"
-      + "if(req.url==='/api/health'){res.setHeader('content-type','application/json');"
+      + "if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');"
       + "res.end(JSON.stringify({status:'ok'}));return;}"
       + `res.end(process.env.${MANAGED_RUNTIME_PUBLIC_URL_ENV}||'missing');`
       + "}).listen(Number(process.env.PORT),'127.0.0.1');";
@@ -4546,7 +4546,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const workspace = buildWorkspace(workspaceRoot);
     const runId = "run-paperclip-health";
     const serviceCommand =
-      "node -e \"const http=require('node:http'); http.createServer((req,res)=>{ if (req.url==='/api/health') { res.statusCode=503; res.end('database_unreachable'); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"const http=require('node:http'); http.createServer((req,res)=>{ if (new URL(req.url,'http://x').pathname==='/api/health') { res.statusCode=503; res.end('database_unreachable'); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
 
     try {
       await expect(
@@ -4591,7 +4591,7 @@ describe("ensureRuntimeServicesForRun", () => {
         // readiness check fails for the health URL. Do not assert the exact reason
         // string: under load the last probe near the deadline can get a small
         // budget and abort with a timeout before it reads the HTTP 503 response.
-      ).rejects.toThrow(/Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health/);
+      ).rejects.toThrow(/Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health\?database=required/);
     } finally {
       await releaseRuntimeServicesForRun(runId);
     }
@@ -4601,7 +4601,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-misreported-health-"));
     const workspace = buildWorkspace(workspaceRoot);
     const serviceCommand =
-      "node -e \"let healthy=true;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/misreport'){healthy=false;res.end('failed');return;}if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify(healthy?{status:'ok'}:{status:'unhealthy',error:'database_unreachable'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
+      "node -e \"let healthy=true;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/misreport'){healthy=false;res.end('failed');return;}if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify(healthy?{status:'ok'}:{status:'unhealthy',error:'database_unreachable'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
     const input = {
       actor: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
       issue: null,
@@ -4646,7 +4646,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-transient-health-"));
     const workspace = buildWorkspace(workspaceRoot);
     const serviceCommand =
-      "node -e \"let failNext=false;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/fail-next'){failNext=true;res.end('armed');return;}if(req.url==='/api/health'){res.setHeader('content-type','application/json');const healthy=!failNext;failNext=false;res.end(JSON.stringify({status:healthy?'ok':'unhealthy'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
+      "node -e \"let failNext=false;const http=require('node:http');http.createServer((req,res)=>{if(req.url==='/fail-next'){failNext=true;res.end('armed');return;}if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');const healthy=!failNext;failNext=false;res.end(JSON.stringify({status:healthy?'ok':'unhealthy'}));return;}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"";
     const input = {
       actor: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
       issue: null,
@@ -4686,7 +4686,7 @@ describe("ensureRuntimeServicesForRun", () => {
     const workspace = buildWorkspace(workspaceRoot);
     const runId = "run-paperclip-explicit-readiness";
     const serviceCommand =
-      "node -e \"const http=require('node:http'); http.createServer((req,res)=>{ if (req.url==='/api/health') { res.end('ok'); return; } res.statusCode=404; res.end('not found'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"const http=require('node:http'); http.createServer((req,res)=>{ if (new URL(req.url,'http://x').pathname==='/api/health') { res.end('ok'); return; } res.statusCode=404; res.end('not found'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
 
     try {
       await expect(ensureRuntimeServicesForRun({
@@ -4847,7 +4847,7 @@ describe("ensureRuntimeServicesForRun", () => {
     // A Paperclip dev runtime must answer `/api/health` semantically before it may
     // be published, so the fake serves the same shape a real one does.
     const serviceCommand =
-      "node -e \"require('node:http').createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end(process.env.PAPERCLIP_HOME)}).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"require('node:http').createServer((req,res)=>{if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end(process.env.PAPERCLIP_HOME)}).listen(Number(process.env.PORT), '127.0.0.1')\"";
     const config = {
       workspaceRuntime: {
         services: [
@@ -6893,7 +6893,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const delayedHmrScript = [
       "const http=require('node:http');",
       "const port=Number(process.env.PORT);",
-      "http.createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(port,'127.0.0.1');",
+      "http.createServer((req,res)=>{if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(port,'127.0.0.1');",
       "setTimeout(()=>http.createServer((_req,res)=>res.end('hmr')).listen(port+10000,'127.0.0.1'),750);",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -7775,7 +7775,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const projectWorkspaceId = randomUUID();
     // Binds the app port and its HMR companion, both loopback-only.
     const command =
-      "node -e \"const http=require('node:http');const p=Number(process.env.PORT);for(const q of [p,p+10000])http.createServer((req,res)=>{if(req.url==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(q,'127.0.0.1');setInterval(()=>{},1000)\"";
+      "node -e \"const http=require('node:http');const p=Number(process.env.PORT);for(const q of [p,p+10000])http.createServer((req,res)=>{if(new URL(req.url,'http://x').pathname==='/api/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));return;}res.end('ok')}).listen(q,'127.0.0.1');setInterval(()=>{},1000)\"";
     const workspaceRuntime = {
       services: [
         {
@@ -8319,7 +8319,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const executionWorkspaceId = randomUUID();
     const stoppedServiceId = randomUUID();
     const serviceCommand =
-      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (req.url==='/api/health') { if (stale) { res.statusCode=503; res.end('database_unreachable'); return; } res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:'ok'})); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (new URL(req.url,'http://x').pathname==='/api/health') { if (stale) { res.statusCode=503; res.end('database_unreachable'); return; } res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:'ok'})); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
     const scopeType = "agent";
     const scopeId = agentId;
     const reuseKey = createHash("sha256")

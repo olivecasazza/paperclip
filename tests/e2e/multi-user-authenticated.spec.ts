@@ -265,7 +265,10 @@ test.describe("Multi-user: authenticated mode", () => {
   }) => {
     test.setTimeout(180_000);
 
-    const healthRes = await page.request.get(`${BASE}/api/health`);
+    // Readiness: `bootstrapStatus` below is a database read, only returned when
+    // the caller opts in. On the liveness path it is undefined and this
+    // precondition would stop being checked.
+    const healthRes = await page.request.get(`${BASE}/api/health?database=required`);
     expect(healthRes.ok()).toBe(true);
     const health = (await healthRes.json()) as {
       deploymentMode?: string;
