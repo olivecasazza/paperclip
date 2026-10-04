@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import {
   activityLog,
   companies,
@@ -15,17 +15,13 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
-import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { getEmbeddedPostgresTestSupport, resolveEmbeddedPostgresDescribe, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { secretService } from "../services/secrets.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping owner-scoped secrets service tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
-}
+const describeEmbeddedPostgres = resolveEmbeddedPostgresDescribe(embeddedPostgresSupport, {
+  sourceFile: "server/src/__tests__/secrets-service-user-secret-owner-scoped.test.ts",
+});
 
 describeEmbeddedPostgres("secretService resolveAdapterConfigForRuntime — userSecretMediation", () => {
   let stopDb: (() => Promise<void>) | null = null;

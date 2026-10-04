@@ -378,6 +378,33 @@ verifying Vite/HMR behavior.
 
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
+### Embedded Postgres test suites fail loudly on CI
+
+Many server and db suites run against a real embedded Postgres cluster and gate on
+`getEmbeddedPostgresTestSupport()`. When a host cannot start that cluster the gate
+behaves differently by environment:
+
+- **Supported host** — the suites run.
+- **CI host** — a CI host missing embedded Postgres is a hard, named failure
+  (`embedded Postgres suites did not run`) rather than a silent skip. The suites
+  cannot silently evaporate on a CI runner, which previously reported green while
+  executing zero cross-tenant and authz assertions.
+- **Local developer machine** — the suites skip with a visible warning naming the
+  reason, so a laptop without the native runtime stays usable.
+
+CI is detected from `CI`, `CONTINUOUS_INTEGRATION`, `BUILD_NUMBER`,
+`GITHUB_ACTIONS`, or `GITLAB_CI`. If CI detection is wrong for a specific host,
+override the policy explicitly:
+
+```sh
+PAPERCLIP_EMBEDDED_POSTGRES_UNAVAILABLE_POLICY=fail    # never skip silently
+PAPERCLIP_EMBEDDED_POSTGRES_UNAVAILABLE_POLICY=skip    # opt out of the hard failure
+```
+
+The policy lives in `packages/db/src/test-embedded-postgres.ts`
+(`resolveEmbeddedPostgresGate`) and is applied to suites through
+`server/src/__tests__/helpers/embedded-postgres.ts` (`resolveEmbeddedPostgresDescribe`).
+
 ### Task search evaluation
 
 The task search relevance rubric and regression corpus are documented in

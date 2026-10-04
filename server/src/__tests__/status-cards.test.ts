@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   activityLog,
@@ -33,11 +33,14 @@ import { issueService } from "../services/issues.js";
 import { statusCardService } from "../services/status-cards.js";
 import {
   getEmbeddedPostgresTestSupport,
+  resolveEmbeddedPostgresDescribe,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const describeEmbeddedPostgres = resolveEmbeddedPostgresDescribe(embeddedPostgresSupport, {
+  sourceFile: "server/src/__tests__/status-cards.test.ts",
+});
 
 type Db = ReturnType<typeof createDb>;
 
@@ -707,7 +710,15 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(generationIssueId).toBeTruthy();
 
     // The setup run gets stuck and blocks the task instead of writing a summary.
-    await issueService(db).update(generationIssueId, { status: "blocked" });
+    // The service-layer zero-signal guard requires a real unblock signal, so
+    // block it the way a system writer must.
+    await issueService(db).update(generationIssueId, {
+      status: "blocked",
+      unblockDescriptor: {
+        owner: "board",
+        action: "Inspect the stalled status-card setup run.",
+      },
+    });
 
     // The card releases its generation claim, so the tile stops spinning and the
     // board offers "Run now" again (generatingIssueId null → not "setup running").

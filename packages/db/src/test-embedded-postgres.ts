@@ -44,6 +44,102 @@ export type EmbeddedPostgresTestDatabase = {
   cleanup(): Promise<void>;
 };
 
+// How a host that cannot run embedded Postgres should behave. "fail" turns a
+// silently skipped suite into a hard failure; "skip" keeps the old behaviour.
+export type EmbeddedPostgresUnavailablePolicy = "fail" | "skip";
+
+export type EmbeddedPostgresGate = {
+  /** Whether embedded Postgres-backed suites may run and are expected to execute. */
+  readonly runnable: boolean;
+  /** Whether an unsupported host is a hard failure rather than a visible skip. */
+  readonly policy: EmbeddedPostgresUnavailablePolicy;
+  /** CI hosts fail loudly; local developer machines may skip with a warning. */
+  readonly isCi: boolean;
+  /** A one-line, human-readable explanation of the resolved decision. */
+  readonly message: string;
+};
+
+// Environment variables that mark a host as CI. Mirrors the list telemetry
+// already uses in packages/shared/src/telemetry/config.ts, so "is this CI?"
+// has one shape across the repo.
+export const EMBEDDED_POSTGRES_CI_ENV_VARS = Object.freeze([
+  "CI",
+  "CONTINUOUS_INTEGRATION",
+  "BUILD_NUMBER",
+  "GITHUB_ACTIONS",
+  "GITLAB_CI",
+]);
+
+/**
+ * Reads `process.env` looking like CI. Accepts the conventional truthy values
+ * and treats a bare non-empty string (for example `CI=true`) as CI too. Exported
+ * for tests so they can assert the decision without mutating global env.
+ */
+export function isEmbeddedPostgresCiHost(env: NodeJS.ProcessEnv = process.env): boolean {
+  return EMBEDDED_POSTGRES_CI_ENV_VARS.some((key) => {
+    const value = env[key];
+    if (typeof value !== "string") return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized !== "" && normalized !== "0" && normalized !== "false";
+  });
+}
+
+/**
+ * Explicit host-policy override. `PAPERCLIP_EMBEDDED_POSTGRES_UNAVAILABLE_POLICY`
+ * wins over CI detection so an operator can force either behaviour on a host
+ * CI detection gets wrong. Anything else falls back to `defaultPolicy`.
+ */
+export function resolveEmbeddedPostgresUnavailablePolicy(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { defaultPolicy?: EmbeddedPostgresUnavailablePolicy } = {},
+): EmbeddedPostgresUnavailablePolicy {
+  const configured = env.PAPERCLIP_EMBEDDED_POSTGRES_UNAVAILABLE_POLICY?.trim().toLowerCase();
+  if (configured === "fail" || configured === "skip") return configured;
+  return options.defaultPolicy ?? "skip";
+}
+
+/**
+ * Resolves how an embedded-Postgres suite must behave on this host.
+ *
+ * A supported host always runs. An unsupported host fails on CI and skips with
+ * a visible warning on a local machine — a supported host is the only way to
+ * get `skip`, so this cannot silently swallow coverage on a CI runner that lost
+ * embedded Postgres. `describe.skip` on CI reported green while executing zero
+ * cross-tenant/authz assertions, so that combination is deliberately
+ * unresolvable.
+ */
+export function resolveEmbeddedPostgresGate(
+  support: EmbeddedPostgresTestSupport,
+  env: NodeJS.ProcessEnv = process.env,
+  options: { defaultPolicy?: EmbeddedPostgresUnavailablePolicy } = {},
+): EmbeddedPostgresGate {
+  if (support.supported) {
+    return {
+      runnable: true,
+      policy: "fail",
+      isCi: isEmbeddedPostgresCiHost(env),
+      message: "embedded Postgres is available; running the full suite",
+    };
+  }
+
+  const isCi = isEmbeddedPostgresCiHost(env);
+  const policy = resolveEmbeddedPostgresUnavailablePolicy(env, {
+    defaultPolicy: isCi ? "fail" : options.defaultPolicy ?? "skip",
+  });
+  const reason = support.reason ?? "unsupported environment";
+  const envLabel = isCi ? "CI host" : "local host";
+
+  return {
+    runnable: false,
+    policy,
+    isCi,
+    message:
+      policy === "fail"
+        ? `embedded Postgres is unavailable on this ${envLabel}; failing instead of skipping the embedded-Postgres suites: ${reason}`
+        : `Skipping embedded-Postgres suites on this ${envLabel}: ${reason}`,
+  };
+}
+
 let embeddedPostgresSupportPromise: Promise<EmbeddedPostgresTestSupport> | null = null;
 
 const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
