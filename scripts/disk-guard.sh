@@ -34,6 +34,36 @@
 # verified per-path by counting only nlink==1 inodes, so a path that has been
 # hardlinked into a live tree is skipped rather than deleted.
 #
+# .cache/nix is deliberately NOT in safe_caches/. The nix git-fetch and tarball
+# caches hold entries a *running* build may still need, so deleting the tree
+# wholesale trades a rare orphan for a routine cache miss on a live build. Instead
+# nix_orphan_temp_pack_candidates sweeps only what can be *proven* abandoned: a
+# tmp_pack_*/tmp_idx_* that nix will never rename into place because the fetch
+# died before it wrote a ref or an origin. Nix writes a fetch into
+# `objects/pack/tmp_pack_*` and renames it into place only on success, so an
+# interrupted fetch leaves the file there permanently, and nothing else on this
+# volume ever cleaned them up. Three of them, abandoned 2026-09-28, held 9.3GiB
+# that no authorized path could reach, which is why two consecutive runs
+# escalated "prune insufficient" and blamed the PVC when the PVC was fine
+# (CON-453, CON-458).
+#
+# `nix copy`, `nix-store --delete` and `nix store gc` are NOT reclaim paths here,
+# and must not become one. This volume's nix store is effectively empty
+# (`$MOUNT/nixstore` is 1MiB, `.local/state/nix/profiles/` is empty) while the
+# toolchains that matter live outside it, so GC roots would not cover them: a
+# `nix store gc` here would collect the paths nothing appears to be using and
+# leave the toolchains it cannot see. Proving roots cover the real toolchain is a
+# precondition, not something to assume.
+#
+# A level alone cannot see a leak, so the guard also trends free space against its
+# own previous measurement. On 2026-10-04 free space fell 13,022 -> 8,052 MiB in
+# about an hour (~240 MiB/min) while the routine was a periodic ok-check: two runs
+# read "critical but unexplainable", and the gap between the two facts -- the
+# volume was critical *and* falling fast -- was only visible by hand, from
+# diffing prose. A steady warn with reclaimable headroom is not an incident; an ok
+# that is actively collapsing is. The rate, the delta and the previous value are
+# all written to the status file so the trend is machine-readable.
+#
 # cargo-target-shared/ holds two kinds of dir. A dir named <PREFIX>-<number>
 # belongs to one issue and is reclaimed only once that issue is terminal and the
 # dir carries a matching .paperclip-owner marker. A dir belonging to no single
@@ -71,6 +101,13 @@
 # floor is max(MIN_FREE_MB, 3% of total) so it stays correct after a resize.
 # Set DISK_GUARD_MIN_FREE_MB=0 to disable the floor entirely.
 #
+# Trend thresholds: FALL_RATE_MB_PER_HOUR (default -1024, i.e. "losing more than
+# 1GiB/hour") escalates a falling trend to warn even when the snapshot level is
+# still ok, and TREND_MIN_INTERVAL_MINUTES (default 5) is the shortest gap between
+# two checks for the rate to be believed at all. Set FALL_RATE_MB_PER_HOUR=0 to
+# disable the rate test and escalate only on an absolute level or a level
+# regression.
+#
 # Exit codes: 0 ok, 1 usage error, 2 warn, 3 critical. Exit 1 also covers a
 # failed measurement: if df cannot be read we cannot know the level, and the
 # guard reports that rather than guessing a level it did not measure.
@@ -79,6 +116,20 @@
 # and two arrays. Keep it that way -- do not "simplify" it to sh.
 
 set -uo pipefail
+
+# Per-run memo directory for issue-terminality lookups. Torn down on exit so no
+# cached decision from one invocation can be read by the next.
+RUN_CACHE_DIR=""
+cleanup_run_cache() {
+  [ -n "$RUN_CACHE_DIR" ] && [ -d "$RUN_CACHE_DIR" ] && rm -rf -- "$RUN_CACHE_DIR" 2>/dev/null
+  return 0
+}
+trap cleanup_run_cache EXIT
+init_run_cache() {
+  RUN_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/disk-guard-cache.XXXXXX" 2>/dev/null)" || RUN_CACHE_DIR=""
+  [ -n "$RUN_CACHE_DIR" ] || return 1
+  chmod 700 "$RUN_CACHE_DIR" 2>/dev/null
+}
 
 MOUNT="${DISK_GUARD_MOUNT:-/paperclip}"
 WARN_PCT="${DISK_GUARD_WARN_PCT:-88}"
@@ -100,6 +151,28 @@ CARGO_TARGET_OWNER_MARKER="${DISK_GUARD_CARGO_TARGET_OWNER_MARKER:-.paperclip-ow
 # Overridable only so the "cannot tell" branch of cargo_rustc_running is
 # testable; production never sets it.
 PROC_ROOT="${DISK_GUARD_PROC_ROOT:-/proc}"
+# Nix git-fetch cache. Swept by a targeted rule rather than by adding `.cache/nix`
+# to safe_caches[]: the gitv3 and tarball caches hold entries a running build may
+# still need, so only evidence-of-abandonment is eligible, never the whole tree.
+# See nix_orphan_temp_pack_candidates.
+NIX_GIT_CACHE_DIR="${DISK_GUARD_NIX_GIT_CACHE_DIR:-$MOUNT/.cache/nix/gitv3}"
+# How old a tmp_pack_* must be before it can be an abandoned fetch rather than an
+# in-flight one. Nix renames a temp pack into place only when a fetch completes, so
+# the file cannot be renamed at all while git holds it open; but a *threshold* is
+# still the honest gate, because age is what separates the two cases without
+# trusting a process table. The orphans reclaimed by hand on 2026-10-04 were 6 days
+# old (CON-458), and a large pack takes minutes to hours to fetch, so a day leaves
+# a wide margin on both sides and still catches the class within a routine.
+NIX_ORPHAN_MIN_AGE_HOURS="${DISK_GUARD_NIX_ORPHAN_MIN_AGE_HOURS:-24}"
+# Free space falling faster than this (MiB/hour, signed: negative is falling)
+# escalates even when the absolute level is still ok. See report.
+FALL_RATE_MB_PER_HOUR="${DISK_GUARD_FALL_RATE_MB_PER_HOUR:--1024}"
+# A trend needs two measurements far enough apart to be more than rounding. Two
+# checks a second apart divide a MiB-sized delta by a near-zero interval and
+# manufacture an enormous rate out of noise, which would escalate on every pair of
+# back-to-back invocations. Measured in whole minutes, and floored at 1 so the
+# division below can never divide by zero.
+TREND_MIN_INTERVAL_MINUTES="${DISK_GUARD_TREND_MIN_INTERVAL_MINUTES:-5}"
 # The one repository a workspace checkout may belong to and still be reclaimable
 # for. Gate 2 binds repository identity from `origin`, because terminality is
 # read from this company's issue API and a checkout of another repo must never be
@@ -162,13 +235,18 @@ remove_path() {
 }
 
 api_get() {
-  local path="$1"
+  local path="$1" max_time="${2:-}"
   if [ -n "${DISK_GUARD_API_STUB:-}" ]; then
     "$DISK_GUARD_API_STUB" "$path"
     return $?
   fi
   [ -n "${PAPERCLIP_API_KEY:-}" ] || return 1
+  # Every request is bounded: one hung endpoint must not be able to consume a
+  # whole heartbeat. Callers that legitimately expect a larger body pass their
+  # own ceiling.
   curl -fsS \
+    --max-time "${max_time:-${DISK_GUARD_API_MAX_TIME:-15}}" \
+    --connect-timeout "${DISK_GUARD_API_CONNECT_TIMEOUT:-5}" \
     -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     -H "X-Paperclip-Run-Id: ${PAPERCLIP_RUN_ID:-disk-guard}" \
     "${API_URL%/}/api$path"
@@ -185,70 +263,30 @@ json_issue_status() {
 unlinked_bytes() {
   # Bytes held by inodes with nlink==1 under $1. This is the only figure that
   # predicts space actually returned to the filesystem.
-  #
-  # The walk cannot be shortened: a sum over every unlinked inode is what the
-  # figure means, and the nlink==1 test is the gate itself. What changed in
-  # DEF-306 is only how many times it runs -- see candidate_age_and_unlinked_bytes,
-  # which answers the mtime question in the same walk.
   find "$1" -xdev -type f -links 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
 }
 
-# Whether anything under $1 is newer than the cutoff epoch.
+# Whether anything under $2 is newer than the cutoff epoch.
 #
-# This replaces taking the newest mtime with a full sort. The only question any
-# caller asks is "is anything here newer than the cutoff", so `find` can stop at
-# the first entry that answers it: `-print -quit` short-circuits, and nothing is
-# sorted, so the cost becomes the position of the first fresh entry rather than
-# the size of the tree.
+# Replaces taking the newest mtime with a full sort. The only question any
+# caller asks is "is anything here newer than the cutoff", so find can stop at
+# the first entry that answers it: -print -quit short-circuits and nothing is
+# sorted, so cost becomes the position of the first fresh entry rather than the
+# size of the tree.
 #
-# The comparison is `-newermt "@$((cutoff - 1))"`, not `"@$cutoff"`, and the
-# difference is load-bearing. Callers skip when `newest >= cutoff`, while
-# -newermt is *strictly* newer. Testing only the cutoff would let an entry whose
-# mtime is exactly the cutoff through as a candidate where the old gate skipped
-# it -- a candidate that must be skipped no longer is. Stepping the cutoff back
-# one second makes "mtime > cutoff-1" identical to "mtime >= cutoff" on whole
-# seconds, which is the resolution %T@ is compared at here.
-#
-# Prints nothing when nothing is newer. A caller that skips on a non-empty
-# result is unchanged: an empty tree is still empty, and the "cannot tell" case
-# that used to be an empty `newest` becomes an empty result too.
+# The comparison is -newermt "@$((cutoff - 1))", not "@$cutoff", and that
+# difference is load-bearing: callers skip when newest >= cutoff while -newermt
+# is strictly newer, so testing the raw cutoff would let a candidate whose
+# newest mtime is exactly the cutoff through as reclaimable where the old gate
+# skipped it. Stepping back one second makes "mtime > cutoff-1" identical to
+# "mtime >= cutoff" on whole seconds, which is the resolution compared here.
 tree_has_entry_newer_than() {
   local cutoff="$1" dir="$2"
   [ -d "$dir" ] || return 1
   find "$dir" -xdev -newermt "@$(( cutoff - 1 ))" -print -quit 2>/dev/null
 }
 
-# Age and size in ONE walk of the candidate, for the enumeration path that needs
-# both answers per candidate.
-#
-# Enumeration used to walk every candidate twice: newest_mtime_epoch sorted the
-# whole tree, then unlinked_bytes walked it again to sum it. On the 78 build
-# output trees this volume actually holds that was 265s for a single --prune
-# enumeration (DEF-306), and one of them was so slow the run had to be killed at
-# a 280s ceiling without reaching the last candidate.
-#
-# Both facts come from the same directory entries, so one `find` answers both:
-#   -type f -links 1 -printf '%s\n'  the unlinked-byte total, unchanged
-#   -newermt "@cutoff-1" -printf F   a freshness sentinel, and -quit ends the
-#                                     walk the moment one is found
-#
-# The nlink==1 accounting and the cutoff are both preserved exactly; only the
-# number of walks changes. Echoes "<bytes> <fresh|stale>".
-candidate_age_and_unlinked_bytes() {
-  local dir="$1" cutoff="$2"
-  [ -d "$dir" ] || { printf '0 stale\n'; return 0; }
-  find "$dir" -xdev \
-    \( -type f -links 1 -printf '%s\n' \) \
-    -o \( -newermt "@$(( cutoff - 1 ))" -printf 'F\n' -quit \) \
-    2>/dev/null |
-    awk '/^F$/ { fresh = 1; next } { sum += $1 } END { printf "%d %s\n", sum + 0, (fresh ? "fresh" : "stale") }'
-}
-
 newest_mtime_epoch() {
-  # Retained for the call sites that report a specific newest mtime. The
-  # enumeration gate uses candidate_age_and_unlinked_bytes instead; this stays a
-  # full sort because answering "what is the exact newest epoch" is not a
-  # question that short-circuits.
   find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
 }
 
@@ -346,11 +384,395 @@ corroborated_checkout_issue() {
   printf '%s\n' "$from_dir"
 }
 
+# Read `key=value` out of the previous status file. Prints nothing when the file
+# is absent or the key is missing or blank, so a caller can never mistake an empty
+# field for a number.
+status_field() {
+  local key="$1" file="${2:-$STATUS_FILE}" value
+  [ -f "$file" ] || return 1
+  value="$(grep -m1 "^${key}=" "$file" 2>/dev/null)" || return 1
+  value="${value#*=}"
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+# Whether any process holds an open file descriptor pointing at $1.
+#
+# This is the gate that separates "stale temp pack nobody is reading" from "temp
+# pack a fetch is still writing", and it is checked directly against /proc rather
+# than inferred from a process name: git does not keep the name `git fetch` for the
+# whole fetch, and a name-based check would miss an in-flight fetch running under a
+# different argv. Readlink on each fd resolves the target, and an unresolvable fd
+# (a socket, an anon inode) is simply not a match.
+#
+# PROC_ROOT is overridable so this branch is testable; production never sets it.
+path_has_open_fd() {
+  local target="$1" target_real proc fd link seen=0
+  target_real="$(realpath -e -- "$target" 2>/dev/null)" || return 1
+  for proc in "$PROC_ROOT"/[0-9]*; do
+    [ -d "$proc/fd" ] || continue
+    seen=1
+    for fd in "$proc"/fd/*; do
+      [ -e "$fd" ] || continue
+      link="$(readlink -- "$fd" 2>/dev/null)" || continue
+      [ "$link" = "$target_real" ] && return 0
+      # A deleted-but-open file reads as "<path> (deleted)"; comparing only the
+      # exact realpath above would miss it, and an unlinked-but-open temp pack is
+      # exactly the state worth catching. Strip the suffix before comparing.
+      case "$link" in
+        *" (deleted)")
+          [ "${link% (deleted)}" = "$target_real" ] && return 0
+          ;;
+      esac
+    done
+  done
+  # No /proc at all, or not a single readable process: we cannot tell, and the
+  # caller must skip rather than assume the file is idle. A /proc that exists and
+  # held processes but matched nothing is a real "no", which is return 1 above.
+  [ "$seen" -eq 1 ]
+}
+
+# Whether a git fetch cache repo never completed a fetch: no ref points into its
+# packs and it recorded no origin.
+#
+# Both halves matter and either alone is enough. The CON-458 orphans had neither a
+# ref nor an origin, because the fetch died before it wrote either. A repo that has
+# an origin has been fetched at least once, so its temp packs may be adjacent to a
+# legitimate second fetch; requiring both to be absent means only a repo that has
+# demonstrably never completed a fetch is eligible.
+nix_repo_never_fetched() {
+  local repo="$1" heads tags origin
+  # `show-ref` reads the packed-refs file as well as refs/, so a ref that has been
+  # packed away is still seen. An unreadable or absent repo is not "never fetched".
+  if git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    heads="$(git -C "$repo" for-each-ref --format='%(refname)' refs/heads 2>/dev/null || true)"
+    tags="$(git -C "$repo" for-each-ref --format='%(refname)' refs/tags 2>/dev/null || true)"
+    if [ -n "$heads" ] || [ -n "$tags" ]; then
+      return 1
+    fi
+    origin="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+    [ -z "$origin" ]
+    return
+  fi
+  # Not a readable git repo. Inspect the on-disk shape directly rather than
+  # skipping: an aborted nix fetch can leave scaffolding too damaged for git to
+  # open, and those are the cases most likely to be holding a multi-GiB pack.
+  # Empty refs directories plus a config with no origin is the same evidence.
+  heads="$(find "$repo/refs/heads" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  tags="$(find "$repo/refs/tags" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  [ -z "$heads" ] && [ -z "$tags" ] || return 1
+  [ -z "$(grep -m1 -E '^\s*\[remote "origin"\]|^\s*url\s*=' "$repo/config" 2>/dev/null || true)" ]
+}
+
+# Orphaned nix git-fetch temp packs and indexes: reclaim candidates, one path per
+# line.
+#
+# Why this exists and why it is not `.cache/nix` in safe_caches[]: nix writes a
+# fetch into `objects/pack/tmp_pack_*` and renames it into place only when the fetch
+# succeeds, so an interrupted fetch leaves the file there permanently. On
+# 2026-10-04 three of them, abandoned on 2026-09-28, held 9.3GiB that nothing in
+# this guard's authorized set could ever reclaim -- which is why two consecutive
+# runs (CON-453, CON-458) escalated "prune insufficient" and blamed the PVC, when
+# the PVC was fine and the reclaim sat outside the blast radius. Adding the whole
+# cache would fix the symptom and break the guard: gitv3 and tarball-cache also
+# hold entries a *running* build may still need, so blanket deletion trades a rare
+# orphan for a routine cache miss on a live build. Only evidence of abandonment is
+# eligible here.
+#
+# Four gates, all required, each independent of the others:
+#
+#   1. age       mtime older than NIX_ORPHAN_MIN_AGE_HOURS. A pack minutes old may
+#                be a fetch in flight; the CON-458 orphans were six days old.
+#   2. nlink     nlink==1, so the bytes are held here and nowhere else and are not
+#                hardlinked into a live nix store path. Same measure every other
+#                reclaim path in this guard uses.
+#   3. open fd   no /proc/*/fd points at it. This is what makes the age gate a
+#                backstop rather than the only defence: a fetch that has been
+#                running for days still holds its pack open.
+#   4. repo      the containing repo has no refs/heads, no refs/tags, and no
+#                remote.origin.url -- it never completed a fetch, so no ref can
+#                point into the pack being deleted.
+#
+# Each gate fails closed: an unreadable stat, an unreadable /proc, or a repo whose
+# state cannot be established skips the candidate rather than guessing.
+nix_orphan_temp_pack_candidates() {
+  local cutoff repo pack size mtime nlinks
+  [ -d "$NIX_GIT_CACHE_DIR" ] || return 0
+  cutoff=$(( $(date +%s) - NIX_ORPHAN_MIN_AGE_HOURS * 3600 ))
+  for repo in "$NIX_GIT_CACHE_DIR"/*; do
+    [ -d "$repo" ] || continue
+    [ ! -L "$repo" ] || { log "skip  $repo (repo is a symlink)"; continue; }
+    [ -d "$repo/objects/pack" ] || continue
+    if ! nix_repo_never_fetched "$repo"; then
+      log "skip  $repo (repo is not a never-fetched cache repo: it has refs or a recorded origin)"
+      continue
+    fi
+    # -maxdepth 1 so the walk cannot descend into a pack that happens to be a
+    # directory, and -links 1 with -type f so gate 2 is decided by find itself
+    # rather than by a second stat per file.
+    while IFS= read -r pack; do
+      [ -n "$pack" ] || continue
+      if [ ! -f "$pack" ]; then
+        log "skip  $pack (not a regular file)"
+        continue
+      fi
+      if [ -L "$pack" ]; then
+        log "skip  $pack (candidate is a symlink)"
+        continue
+      fi
+      # contained_realpath, not realpath, so a path that is a symlink chain out of
+      # the cache cannot authorize a delete somewhere else on the volume.
+      local pack_real
+      pack_real="$(contained_realpath "$NIX_GIT_CACHE_DIR" "$pack")" || {
+        log "skip  $pack (outside the nix git cache)"
+        continue
+      }
+      # stat as one call so nlink and mtime come from the same observation. A file
+      # that disappears between enumeration and here is a fetch that completed or
+      # was cleaned; either way there is nothing left to decide.
+      read -r nlinks mtime <<<"$(stat -c '%h %Y' -- "$pack_real" 2>/dev/null)" || {
+        log "skip  $pack (cannot stat)"
+        continue
+      }
+      if [ -z "${nlinks:-}" ] || [ -z "${mtime:-}" ]; then
+        log "skip  $pack (cannot stat)"
+        continue
+      fi
+      if [ "$mtime" -ge "$cutoff" ]; then
+        log "skip  $pack (mtime is within ${NIX_ORPHAN_MIN_AGE_HOURS}h; may be an in-flight fetch)"
+        continue
+      fi
+      if [ "$nlinks" -ne 1 ]; then
+        log "skip  $pack (nlink=$nlinks; held by another link, not reclaimable here)"
+        continue
+      fi
+      if path_has_open_fd "$pack_real"; then
+        log "skip  $pack (a process holds it open)"
+        continue
+      fi
+      size="$(stat -c '%s' -- "$pack_real" 2>/dev/null || echo 0)"
+      printf '%s\t%s\n' "$pack_real" "${size:-0}"
+    done < <(find "$repo/objects/pack" -xdev -maxdepth 1 \
+                \( -name 'tmp_pack_*' -o -name 'tmp_idx_*' \) \
+                -type f -links 1 -print 2>/dev/null)
+  done
+}
+
+# Delete orphaned nix git-fetch temp packs and indexes.
+# This runs as part of --prune when the volume is warn/critical (or forced) and
+# targets only the temp packs/idxs under .cache/nix/gitv3.
+reclaim_nix_orphans() {
+  local before after candidate size total=0
+
+  before="$(df --block-size=1 -P "$MOUNT" | awk 'NR>1 && NF>=5 {print $4; exit}')"
+
+  while IFS=$'\t' read -r candidate size; do
+    [ -n "$candidate" ] || continue
+    if [ "${size:-0}" -lt 1048576 ]; then
+      log "skip  $candidate (only $(( ${size:-0} / 1024 ))KiB unlinked-reclaimable)"
+      continue
+    fi
+    remove_path "$candidate"
+    log "reclaim $candidate (~$(( size / 1024 / 1024 ))MiB orphaned nix temp pack/idx)"
+    total=$(( total + size ))
+  done <<<"$(nix_orphan_temp_pack_candidates)"
+
+  # Nothing matched is a normal no-op, not an error: on a healthy volume there are
+  # no orphans and the sweep has nothing to say. Reporting only when it reclaimed
+  # keeps the routine's comments readable and keeps "swept, found nothing" from
+  # reading like a failure.
+  [ "$total" -gt 0 ] || return 0
+  after="$(df --block-size=1 -P "$MOUNT" | awk 'NR>1 && NF>=5 {print $4; exit}')"
+  printf 'reclaimed_nix_mib=%s\n' "$(( (after - before) / 1024 / 1024 ))"
+}
+
 issue_is_terminal() {
   local identifier="$1" status
   [ -n "$identifier" ] || return 1
-  status="$(api_get "/companies/$COMPANY_ID/issues?q=$identifier&limit=10" 2>/dev/null | json_issue_status "$identifier" 2>/dev/null || true)"
+  [ -n "$RUN_CACHE_DIR" ] || return 1
+
+  # A terminal decision for one identifier is a property of the issue, not of the
+  # checkout that mentions it, so it is memoised for the rest of the run. The memo
+  # records only a status we actually recognised: a transport failure leaves no
+  # memo, so the lookup below retries and the caller still fails closed.
+  local memo="$RUN_CACHE_DIR/issue-${identifier}"
+  if [ -f "$memo" ]; then
+    read -r status <"$memo"
+    log "issue_cache hit $identifier -> $status"
+    [ "$status" = "done" ] || [ "$status" = "cancelled" ]
+    return
+  fi
+
+  status="$(_lookup_issue_status "$identifier")"
+  case "$status" in
+    done|cancelled|active|blocked|in_progress|todo|backlog|in_review)
+      printf '%s\n' "$status" >"$memo" 2>/dev/null
+      ;;
+    *)
+      # Unknown or empty: not ours to reclaim. Deliberately uncached so the next
+      # checkout that names it is judged on its own evidence, never on a guess.
+      ;;
+  esac
   [ "$status" = "done" ] || [ "$status" = "cancelled" ]
+}
+
+# Resolve one identifier to a status, spending at most one network request.
+#
+# The question "is <identifier> terminal?" is asked once per checkout, and the
+# answer must come from *this* company's issues -- that tenant scoping is what
+# stops a foreign repository that happens to name our ticket from spending it.
+# It was previously answered with one unbounded `?q=<identifier>` fuzzy search per
+# checkout, which is a full server-side scan: ~7s and ~38KB to return ten issues.
+# Across a `--prune` over 116 checkouts that was 76 sequential round trips, ~193s
+# of a ~197s run, against a heartbeat with a finite ceiling (DEF-304, DEF-307).
+#
+# Two facts make one page fetch sufficient instead:
+#
+#   1. The snapshot is this company's whole issue list, so any identifier we own is
+#      in it. `?q=` could only ever find an issue the snapshot also contains.
+#   2. An identifier outside this company's namespace cannot match anything here,
+#      so its answer is "not ours" without a request. Fuzzy `?q=` on a foreign
+#      identifier returns unrelated issues that merely contain the string, which
+#      is exactly what the fail-closed branch below treats as not-ours anyway.
+#
+# Fail-closed is preserved throughout: no snapshot, or an unreadable one, falls
+# back to the original per-identifier search.
+_lookup_issue_status() {
+  local identifier="$1" snapshot=""
+  case "$identifier" in
+    "" ) return 0 ;;
+    *-* ) ;;
+    * ) return 0 ;;
+  esac
+
+  if [ ! -f "$RUN_CACHE_DIR/snapshot.done" ]; then
+    # The bulk page is much larger than a ten-issue search (1MB/296 issues here),
+    # so it gets its own, longer ceiling -- but still a bounded one.
+    #
+    # A failed attempt is remembered for the rest of the run. Without that, every
+    # checkout retries a request we have already seen fail or exceed its ceiling,
+    # which is how one expensive probe becomes the entire heartbeat: the failure
+    # costs as much as the success, times the number of checkouts.
+    if [ ! -f "$RUN_CACHE_DIR/snapshot.failed" ]; then
+      if snapshot="$(api_get "/companies/$COMPANY_ID/issues?limit=500" 2>/dev/null \
+                       "${DISK_GUARD_API_BULK_MAX_TIME:-45}")" \
+         && [ -n "$snapshot" ] \
+         && snapshot="$(_slim_issue_list "$snapshot")" \
+         && _snapshot_is_issue_list "$snapshot"; then
+        printf '%s' "$snapshot" >"$RUN_CACHE_DIR/snapshot.json" 2>/dev/null
+        : >"$RUN_CACHE_DIR/snapshot.done" 2>/dev/null
+        _company_prefixes >"$RUN_CACHE_DIR/prefixes.txt" 2>/dev/null
+        : >"$RUN_CACHE_DIR/prefixes.ready" 2>/dev/null
+      else
+        # Not a list of issues we can read, or too slow to fetch. Do not trust it.
+        # Fall back to the per-identifier search for the rest of this run.
+        log "issue_snapshot unusable; falling back to per-issue search"
+        : >"$RUN_CACHE_DIR/snapshot.failed" 2>/dev/null
+      fi
+    fi
+  fi
+
+  if [ -s "$RUN_CACHE_DIR/snapshot.json" ]; then
+    local status
+    status="$(json_issue_status "$identifier" <"$RUN_CACHE_DIR/snapshot.json" 2>/dev/null || true)"
+    if [ -n "$status" ]; then
+      log "issue_snapshot hit $identifier -> $status"
+      printf '%s\n' "$status"
+      return 0
+    fi
+    # Absent from our own issue list: not ours, definitively. No request needed.
+    log "issue_snapshot miss $identifier (not in this company's issues)"
+    return 0
+  fi
+
+  # No usable snapshot. An identifier in a namespace this company does not use
+  # still cannot resolve, and a fuzzy search for it only returns unrelated
+  # issues -- which the caller already reads as not-ours. Decline it locally
+  # rather than spend a request to learn nothing.
+  if _identifier_outside_company_namespace "$identifier"; then
+    log "issue_namespace_miss $identifier (not a prefix this company uses; not searched)"
+    return 0
+  fi
+
+  api_get "/companies/$COMPANY_ID/issues?q=$identifier&limit=10" 2>/dev/null \
+    | json_issue_status "$identifier" 2>/dev/null || true
+}
+
+# The set of identifier prefixes this company actually uses, learned from the
+# snapshot rather than assumed. `?q=` is a fuzzy server-side scan, so searching
+# for another company's ticket cannot return that ticket -- it returns whatever
+# unrelated issue happens to contain the string, which the caller already treats
+# as "not ours". Knowing the prefixes lets us decline those searches outright.
+#
+# Only ever *adds* to the skip set, and only from data this company served, so a
+# wrong or empty answer costs requests but can never authorise a delete.
+_company_prefixes() {
+  [ -s "$RUN_CACHE_DIR/snapshot.json" ] || return 0
+  node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(0); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
+    const prefixes = new Set();
+    for (const i of items) {
+      const m = /^([A-Za-z]+)-[0-9]+$/.exec(String(i && i.identifier || ""));
+      if (m) prefixes.add(m[1].toUpperCase());
+    }
+    console.log([...prefixes].sort().join(" "));
+  ' <"$RUN_CACHE_DIR/snapshot.json"
+}
+
+# True when this identifier is in a namespace this company demonstrably does not
+# use, so no request can resolve it and its answer is already known.
+_identifier_outside_company_namespace() {
+  local identifier="$1" prefixes prefix
+  [ -n "${DISK_GUARD_ASSUME_NAMESPACE:-}" ] && return 1
+  [ -f "$RUN_CACHE_DIR/prefixes.ready" ] || return 1
+  read -r prefixes <"$RUN_CACHE_DIR/prefixes.txt" 2>/dev/null || return 1
+  [ -n "$prefixes" ] || return 1
+  case "${identifier%%-*}" in
+    [A-Za-z]*) prefix="$(printf '%s' "${identifier%%-*}" | tr '[:lower:]' '[:upper:]')" ;;
+    *) return 1 ;;
+  esac
+  case " $prefixes " in
+    *" $prefix "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Keep only the two fields the terminality decision reads. A 296-issue page
+# carries descriptions, conversation state and counters that cost bytes on the
+# wire and time to parse, none of which any reclaim gate consults.
+_slim_issue_list() {
+  printf '%s' "$1" | node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : null);
+    if (!items) process.exit(1);
+    console.log(JSON.stringify(items
+      .filter((i) => i && i.identifier && i.status)
+      .map((i) => ({ identifier: i.identifier, status: i.status }))));
+  '
+}
+
+# True only when the payload really is a list of issues carrying a usable
+# identifier and status. This is the guard on the guard: a 200 response that is
+# not an issue list (an error envelope, an empty object, a filtered page with no
+# identifying fields) must not be able to read as "this company has no such
+# issue", because that reading is what licenses a delete.
+_snapshot_is_issue_list() {
+  printf '%s' "$1" | node -e '
+    const fs = require("fs");
+    let data;
+    try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+    const items = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : null);
+    if (!items) process.exit(1);
+    // An empty list is a legitimate answer only if the route really returned an
+    // issue list; require the envelope to look like one.
+    if (items.length === 0) process.exit(1);
+    process.exit(items.some((i) => i && i.identifier && i.status) ? 0 : 1);
+  '
 }
 
 contained_realpath() {
@@ -361,6 +783,35 @@ contained_realpath() {
     "$base_real"/*) printf '%s\n' "$target_real" ;;
     *) return 1 ;;
   esac
+}
+
+# Whole minutes between two `YYYY-MM-DDTHH:MM:SSZ` stamps, or nothing.
+#
+# The conversion goes through `date -d` rather than a hand-rolled substring parse
+# because the failure modes differ in a way that matters here: an unparseable
+# stamp must produce *no answer*, and `date -d` failing is exactly that signal,
+# whereas a field extraction on a malformed string would happily return the
+# numbers it found and produce a plausible-looking interval from nonsense. The
+# caller treats empty as "no trend", which is the correct reading of "I cannot
+# tell how long ago that was".
+_iso8601_elapsed_minutes() {
+  local from="$1" to="$2" from_s to_s
+  # Only the exact shape this guard writes is accepted. A stamp carrying anything
+  # else -- a local offset, fractional seconds, an empty field -- is not one of
+  # ours to interpret.
+  case "$from" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+    *) return 1 ;;
+  esac
+  case "$to" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+    *) return 1 ;;
+  esac
+  from_s="$(date -u -d "$from" +%s 2>/dev/null)" || return 1
+  to_s="$(date -u -d "$to" +%s 2>/dev/null)" || return 1
+  case "$from_s" in ''|*[!0-9]*) return 1 ;; esac
+  case "$to_s" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%d\n' "$(( (to_s - from_s) / 60 ))"
 }
 
 workspace_reclaim_candidates() {
@@ -640,6 +1091,8 @@ measure() {
 
 report() {
   local size used avail pct avail_mb level rc floor_mb
+  local prev_avail_mb prev_checked_at elapsed_min delta_mb rate_mb_hour
+  local trend="" level_prev
   read -r size used avail pct <<<"$(measure)"
 
   # An unreadable or unparseable df is a measurement failure, not a pressure
@@ -671,20 +1124,105 @@ report() {
   elif [ "$pct" -ge "$WARN_PCT" ] || [ "$avail_mb" -lt "$floor_mb" ]; then level="warn"; rc=2
   fi
 
+  # Trend against the previous recorded measurement, read from the status file
+  # this function is about to overwrite. Read here, not after the write: the file
+  # is the only place the previous check's numbers survive, so anything that ran
+  # after the write would be comparing this run against itself and reporting a
+  # rate of exactly zero.
+  #
+  # This is the signal CON-461 added because a level alone cannot see a leak: on
+  # 2026-10-04 free space fell 13,022 -> 8,052 MiB in about an hour, ~240 MiB/min,
+  # while the routine was a periodic ok-check. Two consecutive runs both read
+  # "critical but unexplainable" and concluded the PVC needed an operator resize
+  # (CON-453, CON-458) when the guard simply had nothing authorized to reclaim and
+  # no way to express "and it is getting worse at 14GB/hour". A steady warn with
+  # reclaimable headroom is not an incident; an ok that is actively collapsing is.
+  prev_avail_mb="$(status_field avail_mb || true)"
+  prev_checked_at="$(status_field checked_at || true)"
+  level_prev="$(status_field level || true)"
+  delta_mb=""; rate_mb_hour=""
+  elapsed_min=""
+  # A value that is not a bare non-negative integer is not a measurement, and
+  # treating it as one would let a hand-edited or truncated status file drive an
+  # escalation. Empty fields are written instead, which reads as "no trend".
+  case "$prev_avail_mb" in
+    ''|*[!0-9]*) prev_avail_mb="" ;;
+  esac
+  if [ -n "$prev_avail_mb" ] && [ -n "$prev_checked_at" ]; then
+    elapsed_min="$(_iso8601_elapsed_minutes "$prev_checked_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true)"
+    case "$elapsed_min" in
+      ''|*[!0-9]*) elapsed_min="" ;;
+    esac
+    # A zero or negative interval means the clock moved backwards, or two
+    # invocations landed in the same second. Either way there is no rate to
+    # report, and dividing by it would manufacture one.
+    if [ -n "$elapsed_min" ] && [ "$elapsed_min" -ge "$TREND_MIN_INTERVAL_MINUTES" ]; then
+      delta_mb=$(( avail_mb - prev_avail_mb ))
+      # Integer division, signed, rounded toward zero so a small fall never
+      # reports as a large positive rate. Sign is preserved because the
+      # escalation compares against a negative threshold.
+      if [ "$delta_mb" -lt 0 ]; then
+        rate_mb_hour=$(( (delta_mb * 60) / elapsed_min ))
+      else
+        rate_mb_hour=$(( (delta_mb * 60) / elapsed_min ))
+      fi
+      trend="falling"
+    fi
+  fi
+
+  # Escalate on the *trend* even when the snapshot level is ok. A level regression
+  # across consecutive runs is the same fact stated in fewer samples: ok -> warn
+  # means the volume crossed a threshold between two checks nobody was watching,
+  # which is the specific blind spot that let CON-458 read as a mystery.
+  #
+  # The threshold is a signed MiB/hour, so falling faster than it (more negative)
+  # escalates and steady or rising does not. FALL_RATE_MB_PER_HOUR<=0 disables
+  # the rate test, leaving the level-regression test alone.
+  if [ -n "$rate_mb_hour" ] && [ "$FALL_RATE_MB_PER_HOUR" -le 0 ] ||
+     { [ -n "$rate_mb_hour" ] && [ "$FALL_RATE_MB_PER_HOUR" -gt 0 ] && [ "$rate_mb_hour" -lt "$FALL_RATE_MB_PER_HOUR" ]; }; then
+    if [ "$rc" -lt 2 ]; then
+      level="warn"; rc=2
+    fi
+    log "falling free space: ${rate_mb_hour}MiB/hour (${prev_avail_mb} -> ${avail_mb}MiB in ${elapsed_min}m); threshold ${FALL_RATE_MB_PER_HOUR}MiB/hour"
+  fi
+  if [ -n "$level_prev" ] && [ "$level_prev" != "$level" ]; then
+    case "$level_prev:$level" in
+      ok:warn|ok:critical|warn:critical)
+        log "level regressed $level_prev -> $level since the previous check"
+        ;;
+    esac
+  fi
+
   printf 'mount=%s size=%sGiB used=%sGiB(>%s%%) free=%sMiB floor=%sMiB level=%s\n' \
     "$MOUNT" "$(( size / 1024 / 1024 / 1024 ))" \
     "$(( used / 1024 / 1024 / 1024 ))" "$pct" "$avail_mb" "$floor_mb" "$level"
+  # The trend on the same line as the level, so a routine comment carries the
+  # whole story and a human diffing two runs does not have to open the status file.
+  if [ -n "$rate_mb_hour" ]; then
+    printf 'trend=%s rate=%sMiB/hour delta=%sMiB over %sm (prev %sMiB)\n' \
+      "$trend" "$rate_mb_hour" "$delta_mb" "$elapsed_min" "$prev_avail_mb"
+  fi
 
   # Durable, parseable state so a monitor/routine can read it without df.
+  #
+  # The trend fields are written on every check, including when there is no trend
+  # (empty), so a consumer can rely on the key always being present rather than
+  # treating a missing key as a different condition from a measured zero. Written
+  # as one flat key=value block, which is what makes the trend machine-readable
+  # instead of something a human has to reconstruct by diffing routine comments --
+  # the reason the CON-461 escalation had to be argued from prose in the first
+  # place.
   mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null
   {
     printf 'checked_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'mount=%s\n' "$MOUNT"
     printf 'size_bytes=%s\nused_bytes=%s\navail_bytes=%s\nuse_pct=%s\navail_mb=%s\nfloor_mb=%s\n' \
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
-    printf 'level=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\n' \
-      "$level" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB"
-    printf 'guard_version=4\n'
+    printf 'avail_mb_prev=%s\navail_mb_delta=%s\navail_mb_elapsed_minutes=%s\nfall_rate_mb_per_hour=%s\n' \
+      "${prev_avail_mb:-}" "${delta_mb:-}" "${elapsed_min:-}" "${rate_mb_hour:-}"
+    printf 'level=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
+      "$level" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$FALL_RATE_MB_PER_HOUR"
+    printf 'guard_version=6\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -699,6 +1237,7 @@ prune() {
   # Everything below this point consults the issue API, so the company id must
   # resolve before any reclaim work starts.
   require_company_id
+  init_run_cache
   # Pruning is a pressure response, not a scheduled chore. At 35% usage there
   # is nothing to fix, and deleting a 917MiB regenerable browser cache
   # "because the routine ran" costs a slow re-download for no gain. Only prune
@@ -742,6 +1281,13 @@ prune() {
     log "prune $p (~$((freed/1024/1024))MiB reclaimable)"
     total=$(( total + freed ))
   done
+
+  # Orphaned nix git-fetch temp packs, before the build-output roots. It runs
+  # first because it is the only reclaim on this volume that has ever recovered
+  # gigabytes (9.3GiB on 2026-10-04, CON-458) without touching live workspace
+  # state, so the cheapest and safest space is taken before anything that needs a
+  # git-identity or issue-terminality argument.
+  reclaim_nix_orphans
 
   while IFS= read -r p; do
     [ -n "$p" ] && workspace_candidates+=("$p")
