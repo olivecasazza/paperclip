@@ -1017,6 +1017,56 @@ test("shared cargo target scope: a stale non-per-issue dir is a candidate and a 
   }
 });
 
+test("age gate: the bounded -newermt predicate keeps the >= cutoff boundary the sort-based gate had", () => {
+  const sandbox = makeSandbox();
+  try {
+    // DEF-306 replaced `find -printf %T@ | sort -nr | head` with
+    // `find -newermt @cutoff -print -quit`. Those are NOT interchangeable at the
+    // boundary: -newermt is *strictly* newer, while the gate it replaced skipped
+    // when newest >= cutoff. A candidate whose newest mtime is exactly the
+    // cutoff was skipped before and would become reclaimable without the
+    // one-second step back that tree_has_entry_newer_than applies.
+    //
+    // Pinned directly against the function so a future "simplify" back to
+    // `-newermt "@$cutoff"` fails here rather than silently widening what the
+    // guard is willing to delete.
+    const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+
+    // A candidate is a directory, and the gate is asked about a directory, so
+    // each case gets its own tree rather than a single shared one.
+    const treeAt = (name, epoch) => {
+      const d = path.join(sandbox.root, name);
+      mkdirSync(d, { recursive: true });
+      const f = path.join(d, "blob");
+      writeFileSync(f, "x");
+      utimesSync(f, new Date(epoch * 1000), new Date(epoch * 1000));
+      // The directory itself carries an mtime too and find reports it, so it
+      // must not be the thing answering the question.
+      utimesSync(d, new Date((epoch - 60) * 1000), new Date((epoch - 60) * 1000));
+      return d;
+    };
+
+    const probe = (d, c) =>
+      spawnSync(
+        "bash",
+        ["-c", `source <(sed -n '/^tree_has_entry_newer_than()/,/^}/p' "${SCRIPT}"); tree_has_entry_newer_than ${c} "${d}"`],
+        { encoding: "utf8" },
+      ).stdout.trim();
+
+    // mtime exactly at the cutoff: the old gate skipped it, so the new one must
+    // too. This is the case a raw -newermt "@$cutoff" gets wrong.
+    assert.notEqual(probe(treeAt("at", cutoff), cutoff), "", "mtime == cutoff must still read as fresh");
+    // One second under the cutoff is stale and reclaimable, as it always was.
+    assert.equal(probe(treeAt("under", cutoff - 1), cutoff), "", "mtime == cutoff-1 must still read as stale");
+    // Well inside the window is unambiguously fresh.
+    assert.notEqual(probe(treeAt("over", cutoff + 3600), cutoff), "", "mtime above the cutoff must read as fresh");
+    // Nothing in the tree at all is stale, not "cannot tell".
+    assert.equal(probe(path.join(sandbox.root, "absent"), cutoff), "", "an absent tree must read as stale");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 test("shared cargo target scope: a name attributed to a company or issue is never a shared candidate", () => {
   const sandbox = makeSandbox();
   try {
