@@ -824,7 +824,7 @@ Key material is derived, never shared. The control plane keeps a root secret (`P
 | `PAPERCLIP_EXECUTION_WORKSPACE_ID` | Execution workspace the guest was provisioned for, used for identity checks. |
 | `PAPERCLIP_EXECUTION_WORKSPACE_COMPANY_ID` | Company whose board the guest represents. Scopes both the membership check and the readiness probes, so "some company in the clone is fine" cannot pass for the one being opened. |
 
-Protected `/api/health` on a cloned workspace additionally carries a `workspace` block — `state`, `databaseReady`, `cloneDataReady`, `authHandoffReady`, `seedState`, `seedPhase`, `instanceId`, `executionWorkspaceId`, `failurePhase`. Public health stays redacted. Managed runtime start will not publish `running / healthy` unless that block agrees and names this exact instance and workspace, and runtime-service work products are refreshed from the live runtime row so a port change cannot leave a stale user-facing URL.
+Protected `/api/health?database=required` on a cloned workspace additionally carries a `workspace` block — `state`, `databaseReady`, `cloneDataReady`, `authHandoffReady`, `seedState`, `seedPhase`, `instanceId`, `executionWorkspaceId`, `failurePhase`. Public health stays redacted. Managed runtime start will not publish `running / healthy` unless that block agrees and names this exact instance and workspace, and runtime-service work products are refreshed from the live runtime row so a port change cannot leave a stale user-facing URL.
 
 The workspace UI surfaces `Provisioning database`, `Validating clone`, `Ready`, `Degraded`, `Repairing`, and `Repair failed`, each with one safe action (open, start, repair, or read the log).
 
@@ -1278,6 +1278,22 @@ Expected:
 
 - `/api/health` returns `{"status":"ok"}`
 - `/api/companies` returns a JSON array
+
+`/api/health` is a liveness probe by default: it reports that this process is
+up and issues no database query, so a saturated connection pool can never make a
+healthy server look dead to an orchestrator. Add `?database=required` when you
+want the readiness contract instead, which does query the database and returns
+503 when it cannot be reached:
+
+```sh
+curl "http://localhost:3100/api/health?database=required"
+```
+
+Every response carries `database: { probed, reachable }` naming which contract
+answered, so the distinction is visible in the payload rather than inferred from
+the status code. The database-derived fields — `bootstrapStatus`,
+`bootstrapInviteActive`, `devServer`, `workspace` — are only populated on the
+readiness path.
 
 ## Reset Local Dev Database
 

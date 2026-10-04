@@ -83,6 +83,7 @@ import {
   statusCardService,
   toolAccessService,
   workspaceOperationService,
+  startHeartbeatRunPayloadRetention,
 } from "./services/index.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
@@ -1865,6 +1866,15 @@ async function startServerWithDatabaseTeardown(
     });
   }
   
+
+  // Run-payload retention runs on its own slow interval rather than inside the
+  // heartbeat scheduler tick. The tick is latency-sensitive work on the same
+  // pool, and a bulk UPDATE over aged runs does not belong in that path: it
+  // would compete with timer ticks for connections and delay them. It is
+  // started outside the scheduler branch so it also applies when the scheduler
+  // is disabled.
+  const stopRunPayloadRetention = startHeartbeatRunPayloadRetention(db as any);
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -1959,6 +1969,7 @@ async function startServerWithDatabaseTeardown(
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
+    stopRunPayloadRetention();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, linkSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, linkSync, lutimesSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -89,6 +89,7 @@ function run(sandbox, args, env = {}) {
       DISK_GUARD_COMPANY_ID: "company-1",
       DISK_GUARD_WORKSPACES_DIR: path.join(sandbox.mount, "instances/default/workspaces"),
       DISK_GUARD_PROJECT_REPO: COMPANY_PROJECT_REPO,
+      DISK_GUARD_WT_DIR: path.join(sandbox.mount, "wt"),
       ...env,
     },
   });
@@ -106,7 +107,154 @@ function exists(sandbox, relPath) {
   return existsSync(path.join(sandbox.mount, relPath));
 }
 
-function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" }, ignoreQuery = false } = {}) {
+/**
+ * Seed a nix git-fetch cache repo at `$MOUNT/.cache/nix/gitv3/<hash>/` holding
+ * temp packs in `objects/pack/`, the way an aborted `nix build` leaves them.
+ *
+ * The shape matters more than the size here, because the guard's argument for
+ * touching this tree at all is that the shape is evidence. Each option removes
+ * one piece of evidence, so each one is a case the sweep must refuse:
+ *
+ *   `hash`        the repo directory name. Nix derives it from the fetch URL, so
+ *                 a real one is a base32-looking string.
+ *   `files`       names to create in `objects/pack/`. Defaults to a single
+ *                 `tmp_pack_*`; pass `tmp_idx_*` to cover the index case.
+ *   `sizeBytes`   per file. Defaults to 2MiB, above the 1MiB floor below which a
+ *                 candidate is reported but not reclaimed, so the reclaim and the
+ *                 "too small to bother" path are distinguishable.
+ *   `fresh`       minutes-old mtimes instead of six-day-old. A pack this young may
+ *                 be an in-flight fetch, which is the single most important thing
+ *                 this sweep must not delete.
+ *   `refs`        `heads`/`tags` to create refs for, or `false` for none. A repo
+ *                 that has a ref may have completed a fetch, so its packs are not
+ *                 proven abandoned.
+ *   `origin`      the remote URL to record, or `false` for none. Same reasoning as
+ *                 refs: a recorded origin means a fetch got far enough to save
+ *                 where it was fetching from.
+ *   `nlink`       extra hardlinks to make, so the file's link count is above 1 and
+ *                 the nlink==1 gate must refuse it.
+ *   `openFd`      hold an actual open descriptor on the file from this process, so
+ *                 the /proc gate is exercised against a real open fd rather than a
+ *                 stubbed one.
+ *   `gitInit`     initialise a real git repo rather than leaving bare on-disk
+ *                 scaffolding. Both shapes occur: nix leaves a directory git can
+ *                 open, and leaves one it cannot.
+ */
+function seedNixGitCache(
+  sandbox,
+  {
+    hash = "034j5c5gi6rhff4xf4g5x4lgfljp7xy9bgpshj4vf5bwshg1659x",
+    files = ["tmp_pack_aaaaaa"],
+    sizeBytes = 2 * MIB,
+    fresh = false,
+    refs = { heads: [], tags: [] },
+    origin = false,
+    nlink = 0,
+    openFd = false,
+    gitInit = true,
+  } = {},
+) {
+  const repo = path.join(sandbox.mount, ".cache/nix/gitv3", hash);
+  const packDir = path.join(repo, "objects", "pack");
+  mkdirSync(path.join(repo, "refs", "heads"), { recursive: true });
+  mkdirSync(path.join(repo, "refs", "tags"), { recursive: true });
+  mkdirSync(packDir, { recursive: true });
+
+  const age = fresh
+    ? new Date(Date.now() - 5 * 60 * 1000)
+    : new Date(Date.now() - 6 * 24 * 60 * 60 * 1000);
+
+  const created = [];
+  for (const name of files) {
+    const full = path.join(packDir, name);
+    writeFileSync(full, Buffer.alloc(sizeBytes));
+    utimesSync(full, age, age);
+    for (let i = 0; i < nlink; i += 1) {
+      linkSync(full, `${full}.link${i}`);
+    }
+    created.push(full);
+  }
+
+  if (refs?.heads?.length || refs?.tags?.length) {
+    if (gitInit) {
+      // A real repo, because `for-each-ref` is how the guard reads refs and a
+      // string written into refs/heads/ by hand is not what it reads.
+      spawnSync("git", ["init", "-q"], { cwd: repo });
+      spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+      spawnSync("git", ["config", "user.name", "Test"], { cwd: repo });
+      if (origin !== false) {
+        spawnSync("git", ["remote", "add", "origin", origin], { cwd: repo });
+      }
+      writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+      spawnSync("git", ["add", "seed.txt"], { cwd: repo });
+      spawnSync("git", ["commit", "-q", "-m", "seed"], { cwd: repo });
+      for (const branch of refs.heads ?? []) {
+        spawnSync("git", ["branch", branch], { cwd: repo });
+      }
+      for (const tag of refs.tags ?? []) {
+        spawnSync("git", ["tag", tag], { cwd: repo });
+      }
+    } else {
+      for (const branch of refs.heads ?? []) {
+        writeFileSync(path.join(repo, "refs", "heads", branch), "0".repeat(40) + "\n");
+      }
+      for (const tag of refs.tags ?? []) {
+        writeFileSync(path.join(repo, "refs", "tags", tag), "0".repeat(40) + "\n");
+      }
+      writeFileSync(
+        path.join(repo, "config"),
+        `[core]\n\trepositoryformatversion = 0\n${origin !== false ? `[remote "origin"]\n\turl = ${origin}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n` : ""}`,
+      );
+    }
+  } else if (origin !== false) {
+    // No refs, but a recorded origin: still a repo that got somewhere.
+    if (gitInit) {
+      spawnSync("git", ["init", "-q"], { cwd: repo });
+      spawnSync("git", ["remote", "add", "origin", origin], { cwd: repo });
+    } else {
+      writeFileSync(
+        path.join(repo, "config"),
+        `[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = ${origin}\n`,
+      );
+    }
+  } else if (gitInit) {
+    // No refs and no origin: a real repo that has never fetched. This is the
+    // exact shape of the CON-458 orphans.
+    spawnSync("git", ["init", "-q"], { cwd: repo });
+    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: repo });
+    writeFileSync(path.join(repo, "README"), "unfetched\n");
+    spawnSync("git", ["add", "README"], { cwd: repo });
+    spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: repo });
+    // A commit leaves refs/heads/master behind, which is a ref the guard refuses
+    // on. Strip it back to the never-fetched state an aborted nix fetch leaves.
+    spawnSync("git", ["update-ref", "-d", "refs/heads/master"], { cwd: repo });
+    rmSync(path.join(repo, "refs", "heads", "master"), { force: true });
+    rmSync(path.join(repo, "packed-refs"), { force: true });
+  }
+
+  // Age the repo itself, so the directory mtimes do not read as "in flight" to
+  // anything that walks the tree rather than the file.
+  utimesSync(packDir, age, age);
+  utimesSync(path.join(repo, "objects"), age, age);
+
+  return { repo, packDir, files: created };
+}
+
+/**
+ * Hold an open read descriptor on `file` for the lifetime of the returned handle,
+ * so a gate that consults /proc for open file descriptors has a real one to find.
+ *
+ * Returned rather than opened inside seedNixGitCache because the open fd has to
+ * outlive the child process that reads it: the guard runs in a spawned bash, so
+ * an fd closed when the seeding function returned would prove nothing.
+ */
+function holdOpen(file) {
+  const fd = openSync(file, "r");
+  return { fd, release: () => closeSync(fd) };
+}
+
+function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DEF-1": "done" }, ignoreQuery = false, strictScope = false } = {}) {
   const stub = path.join(sandbox.binDir, "paperclip-api-stub.mjs");
   const body = [
     "#!/usr/bin/env node",
@@ -115,9 +263,14 @@ function installPaperclipApiStub(sandbox, { roster = ["agent-1"], issues = { "DE
     "const requestPath = process.argv[2] || '';",
     "if (requestPath.includes('/agents')) { console.log(JSON.stringify(roster.map((id) => ({ id })))); process.exit(0); }",
     `const ignoreQuery = ${JSON.stringify(ignoreQuery)};`,
+    `const strictScope = ${JSON.stringify(strictScope)};`,
     "const match = requestPath.match(/[?&]q=([^&]+)/);",
     "const identifier = match ? decodeURIComponent(match[1]) : '';",
     "if (ignoreQuery) { console.log(JSON.stringify({ items: [{ identifier: 'DEF-999', status: 'done' }] })); process.exit(0); }",
+    // strictScope models the real company-scoped route: an identifier from
+    // another company's namespace simply is not in the result set, so the guard
+    // must treat it as non-terminal rather than as a status it can read.
+    "if (strictScope && !Object.prototype.hasOwnProperty.call(issues, identifier)) { console.log(JSON.stringify({ items: [] })); process.exit(0); }",
     "const status = issues[identifier] || 'todo';",
     "console.log(JSON.stringify({ items: [{ identifier, status }] }));",
     "",
@@ -276,6 +429,57 @@ function seedSharedCargoTarget(sandbox, { name, fresh = false, symlink = false }
     symlinkSync(path.join(outside, "real"), path.join(root, name));
   }
   return full;
+}
+
+/**
+ * Seed `$MOUNT/wt/<dirName>` as a git checkout with `rel` build output in it.
+ *
+ * `branch` is set explicitly rather than derived from `dirName` because the two
+ * disagree in the wild, and the guard's safety argument for this root rests on
+ * requiring agreement. Real measured case: `wt/con-220` sits on
+ * `fix/con-220-clippy-194-stacked`, where the branch alone reads as CLIPPY-194.
+ *
+ * `origin` is settable because the wt/ gate demands repository provenance *before*
+ * corroboration: a tree whose origin is not the company project repo must be
+ * refused even when its name and branch agree perfectly. That is the shape of 83
+ * of the 112 trees measured on the live volume.
+ */
+function seedWorktree(sandbox, { dirName, branch, origin = COMPANY_PROJECT_REPO, rel = "target", ignored = true, tracked = false, fresh = false, symlinkCheckout = false } = {}) {
+  const checkout = path.join(sandbox.mount, "wt", dirName);
+  mkdirSync(checkout, { recursive: true });
+  spawnSync("git", ["init", "-q"], { cwd: checkout });
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: checkout });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: checkout });
+  if (origin) spawnSync("git", ["remote", "add", "origin", origin], { cwd: checkout });
+  if (branch) spawnSync("git", ["checkout", "-q", "-b", branch], { cwd: checkout });
+  if (ignored) {
+    writeFileSync(path.join(checkout, ".gitignore"), rel + "\n");
+    // Commit the .gitignore. `git check-ignore` reads ignore rules from the
+    // working tree *and* the index, but only for tracked rules does it match a
+    // directory as a whole; an untracked .gitignore makes check-ignore answer
+    // "no" for the dir, so a fixture that leaves it untracked silently stops at
+    // the gitignore gate and never exercises the gate behind it.
+    spawnSync("git", ["add", "-f", ".gitignore"], { cwd: checkout });
+    spawnSync("git", ["commit", "-q", "-m", "ignore"], { cwd: checkout });
+  }
+  const full = path.join(checkout, rel, "blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  if (tracked) spawnSync("git", ["add", "-f", path.join(rel, "blob")], { cwd: checkout });
+  if (!fresh) {
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(checkout, rel), old, old);
+  }
+  if (symlinkCheckout) {
+    const elsewhere = path.join(sandbox.mount, "outside-wt", dirName);
+    mkdirSync(path.dirname(elsewhere), { recursive: true });
+    renameSync(checkout, elsewhere);
+    rmSync(checkout, { recursive: true, force: true });
+    symlinkSync(elsewhere, checkout);
+  }
+  return { checkout, full };
 }
 
 /** Total bytes of file content under `dir`, used to assert prune freed nothing. */
@@ -745,6 +949,216 @@ test("gate 2: a checkout whose issue cannot be established is skipped, not guess
   }
 });
 
+/**
+ * Seed a checkout whose `origin/main` already contains its HEAD, then detach.
+ *
+ * This is the `def-299-verify` shape: a checkout left detached at a commit that
+ * is already merged, holding stale gitignored build output behind a done issue.
+ * A detached HEAD is the one case where gate 2 has no branch name to corroborate
+ * a directory name against, so it needs `origin/main` to exist as real ancestry
+ * evidence -- which a single-clone `seedWorkspaceCheckout` cannot provide, since
+ * nothing has ever pushed anything anywhere.
+ *
+ * `merged` selects which side of the new rule is under test: true detaches at a
+ * commit that IS an ancestor of origin/main, false at a commit that is not.
+ */
+function seedDetachedCheckoutWithMainline(sandbox, { agentId = "agent-1", checkoutName, issue = "DEF-1", merged = true } = {}) {
+  const checkout = path.join(sandbox.mount, "instances/default/workspaces", agentId, checkoutName);
+
+  // A bare stand-in for the project's real remote. `src` pushes to it so
+  // origin/main is a ref that genuinely exists, rather than one invented by
+  // update-ref -- otherwise the ancestry test would prove nothing.
+  const bare = path.join(sandbox.root, `${checkoutName}-origin.git`);
+  mkdirSync(bare, { recursive: true });
+  spawnSync("git", ["init", "-q", "--bare", "-b", "main", bare]);
+  const src = path.join(sandbox.root, `${checkoutName}-src`);
+  seedGitClone(src, { origin: false });
+  writeFileSync(path.join(src, "README.md"), "merged\n");
+  spawnSync("git", ["add", "."], { cwd: src });
+  spawnSync("git", ["commit", "-q", "-m", "docs(ci): correct a stale comment (#232)"], { cwd: src });
+  spawnSync("git", ["push", "-q", bare, "HEAD:main"], { cwd: src });
+
+  // When the commit must NOT be a mainline ancestor, main gets a commit the
+  // checkout never saw *and* the checkout is left at a commit that diverged from
+  // main instead of one behind it. The distinction matters: ancestry is
+  // transitive, so simply leaving HEAD one commit behind main still makes it an
+  // ancestor of main, which is the `merged` case and not the negative one. Only
+  // a commit that is not on main's history at all fails `--is-ancestor`.
+  if (!merged) {
+    spawnSync("git", ["checkout", "-q", "-b", "side", "HEAD~1"], { cwd: src });
+    writeFileSync(path.join(src, "SIDE.md"), "work that was never merged\n");
+    spawnSync("git", ["add", "."], { cwd: src });
+    spawnSync("git", ["commit", "-q", "-m", "wip: unmerged work off to the side"], { cwd: src });
+    spawnSync("git", ["push", "-q", bare, "HEAD:side"], { cwd: src });
+  }
+
+  spawnSync("git", ["clone", "-q", bare, checkout]);
+  // The checkout's `origin` must be the company project repo for the
+  // repository-identity gate to pass, and origin/main must be the ref this seed
+  // built. A later `git fetch` against the real remote would overwrite the latter,
+  // so the fetch is rewritten to read the local bare repo; without the rewrite a
+  // real network fetch would silently replace the ancestry under test.
+  spawnSync("git", ["config", "remote.origin.url", bare], { cwd: checkout });
+  spawnSync(
+    "git",
+    ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+    { cwd: checkout },
+  );
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: checkout });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: checkout });
+  // Fetch the branch this case hangs on, then point origin at the company repo so
+  // identity passes while refs/remotes/origin/main stays exactly what was seeded.
+  spawnSync("git", ["fetch", "-q", "origin"], { cwd: checkout });
+  spawnSync("git", ["remote", "set-url", "origin", COMPANY_PROJECT_REPO], { cwd: checkout });
+  spawnSync(
+    "git",
+    ["config", `remote.${COMPANY_PROJECT_REPO}.url`, bare],
+    { cwd: checkout },
+  );
+  spawnSync(
+    "git",
+    ["config", `remote.${COMPANY_PROJECT_REPO}.fetch`, "+refs/heads/*:refs/remotes/origin/*"],
+    { cwd: checkout },
+  );
+
+  writeFileSync(path.join(checkout, ".gitignore"), "client/target\n");
+  const full = path.join(checkout, "client/target/blob");
+  mkdirSync(path.dirname(full), { recursive: true });
+  writeFileSync(full, Buffer.alloc(2 * MIB));
+  const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+  utimesSync(full, old, old);
+  utimesSync(path.dirname(full), old, old);
+  utimesSync(path.join(checkout, "client/target"), old, old);
+
+  spawnSync("git", ["checkout", "-q", "--detach", merged ? "origin/main" : "origin/side"], { cwd: checkout });
+  // Assert the seed is the shape the test claims, so a broken seed fails as a
+  // seed rather than silently passing for the wrong reason.
+  assert.notEqual(
+    spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd: checkout }).status,
+    0,
+    "seed must leave HEAD detached or this case is not the detached-HEAD rule",
+  );
+  const isAncestor =
+    spawnSync("git", ["merge-base", "--is-ancestor", "HEAD", "origin/main"], { cwd: checkout }).status === 0;
+  assert.equal(isAncestor, merged, "seed must produce the mainline ancestry the case under test needs");
+
+  return { checkout, full };
+}
+
+test("workspace scope: a checkout with no .git is named in the log, not dropped in silence", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-275": "done" } });
+
+    // The `def-275-outbox-replay` shape on /paperclip: an abandoned build scratch
+    // copy with `client/` and `env.sh` and no `.git` anywhere. 7.62 GiB of
+    // nlink==1, the largest such block on the volume.
+    const checkout = path.join(sandbox.mount, "instances/default/workspaces/agent-1/def-275-outbox-replay");
+    const full = path.join(checkout, "client/target/debug/blob");
+    mkdirSync(path.dirname(full), { recursive: true });
+    writeFileSync(full, Buffer.alloc(2 * MIB));
+    writeFileSync(path.join(checkout, "env.sh"), "# run environment for the trimmed client/ build copy\n");
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    utimesSync(full, old, old);
+    utimesSync(path.dirname(full), old, old);
+    utimesSync(path.join(checkout, "client/target"), old, old);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    // The refusal itself is correct and unchanged: no repository, no commit, no
+    // corroboration, so nothing under it may be deleted.
+    assert.ok(existsSync(full), "build output under an unauditable checkout must survive");
+
+    // What was broken is that it produced no line at all. A skip the owner cannot
+    // see is indistinguishable from a tree that does not exist, so the whole tree
+    // left the books silently.
+    assert.match(
+      result.stderr,
+      /def-275-outbox-replay \(no \.git; cannot corroborate ownership\)/,
+      "a checkout with no .git must be named with an explicit reason",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a detached HEAD that is a merged ancestor of origin/main is corroborated by its directory name", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-299": "done" } });
+    const detached = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "def-299-verify", issue: "DEF-299" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    // HEAD is merged, so the tree is a snapshot of mainline: the branch check has
+    // nothing to say, but the commit itself is evidence that the content belongs.
+    assert.ok(!existsSync(detached.full), "a detached HEAD already on origin/main must be reclaimable");
+    assert.match(
+      result.stderr,
+      /prune .*def-299-verify\/client\/target/,
+      "the reclaim must be reported, so the freed bytes are auditable too",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("gate 2: a detached HEAD that is NOT on origin/main, or whose name names no issue, still fails closed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 90 * 1024 * MIB, avail: 10 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      roster: ["agent-1"],
+      issues: { "DEF-299": "done", "DEF-300": "done" },
+    });
+    // Half the new rule removed at a time: unmerged commit, and a merged commit
+    // in a directory that names no ticket. Either alone must still refuse.
+    const unmerged = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "def-299-unmerged", issue: "DEF-299", merged: false });
+    const unnamed = seedDetachedCheckoutWithMainline(sandbox, { checkoutName: "scratch-tree", issue: "DEF-300", merged: true });
+    // Ancestry is orthogonal to every other gate, so a merged detached HEAD must
+    // still lose to them. This is the live shape from DEF-322: `def-300-rustfmt`
+    // was refused for age alone, and the age gate is the one thing the new rule
+    // must not have disturbed.
+    const fresh = seedWorkspaceCheckout(sandbox, { checkoutName: "def-300-rustfmt", issue: "DEF-300", fresh: true });
+    // And to the repo-identity gate: `pc-guard` is a clone of *this* control
+    // plane's own repo, so no ancestry claim about its mainline authorises a
+    // deletion read from our issue API.
+    const foreign = seedWorkspaceCheckout(sandbox, { checkoutName: "pc-guard", issue: "DEF-300", origin: FOREIGN_REPO });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.ok(existsSync(unmerged.full), "a detached HEAD with work not on main must survive");
+    assert.ok(existsSync(unnamed.full), "a merged detached HEAD in a directory naming no issue must survive");
+    assert.ok(existsSync(fresh.full), "build output under the min-age threshold must still survive");
+    assert.ok(existsSync(foreign.full), "a checkout of a foreign repo must survive");
+    assert.match(
+      result.stderr,
+      /def-300-rustfmt\/client\/target \(newest mtime under 24h\)/,
+      "the min-age gate must still report why it refused",
+    );
+    assert.match(
+      result.stderr,
+      /pc-guard \(origin .* is not the company project repo/,
+      "the repo-identity gate must still report why it refused",
+    );
+    assert.match(
+      result.stderr,
+      /def-299-unmerged \(branch does not name an issue; a detached HEAD is not an ancestor of origin\/main\)/,
+      "an unmerged detached HEAD must be refused with a reason that names the missing ancestry",
+    );
+    assert.match(
+      result.stderr,
+      /scratch-tree \(directory name does not attribute it to an issue\)/,
+      "ancestry is not a substitute for a directory name that names a ticket",
+    );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 test("gate 2: the 3.3G live case is refused with a reason naming identity, not skipped silently", () => {
   const sandbox = makeSandbox();
   try {
@@ -823,6 +1237,216 @@ test("workspace scope: directory names and symlinks do not authorize deletion", 
     assert.equal(result.status, RC_CRITICAL);
     assert.ok(existsSync(branchOnly.full), "checkout directory names must not determine issue ownership");
     assert.ok(existsSync(path.dirname(symlinkCheckout.full)), "symlinked candidates must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: a terminal issue's worktree build output is pruned, and every failing gate survives", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-1": "done", "CON-2": "todo", "CON-3": "done", "CON-4": "done", "CON-5": "done" },
+    });
+    // The suffix in `con-1-gate` must not change the issue it resolves to.
+    const closed = seedWorktree(sandbox, { dirName: "con-1-gate", branch: "fix/con-1-retire-lanes" });
+    const open = seedWorktree(sandbox, { dirName: "con-2", branch: "fix/con-2-still-open" });
+    const tracked = seedWorktree(sandbox, { dirName: "con-3", branch: "fix/con-3-tracked", tracked: true });
+    const notIgnored = seedWorktree(sandbox, { dirName: "con-4", branch: "fix/con-4-not-ignored", ignored: false });
+    const fresh = seedWorktree(sandbox, { dirName: "con-5", branch: "fix/con-5-fresh", fresh: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(closed.full), "a terminal issue's worktree build output must be pruned");
+    assert.ok(existsSync(open.full), "an open issue's worktree build output must survive");
+    assert.ok(existsSync(tracked.full), "tracked build output must survive");
+    assert.ok(existsSync(notIgnored.full), "non-gitignored build output must survive");
+    assert.ok(existsSync(fresh.full), "fresh build output must survive");
+    // A force-added build file is reported *not ignored* by check-ignore (git
+    // never ignores a tracked path), so this fixture is what keeps the gitignore
+    // gate and the ls-files gate from being conflated: if check-ignore ever
+    // started passing tracked paths, `tracked.full` would be deleted here.
+    assert.match(result.stderr, /not gitignored/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: name and branch must agree on the issue, so a branch cannot reassign a tree", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // CON-220 and CLIPPY-194 are both terminal, so only corroboration can tell
+    // them apart. This is the measured live shape of wt/con-220.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      issues: { "CON-220": "done", "CLIPPY-194": "done", "CON-9": "done" },
+    });
+    const mismatched = seedWorktree(sandbox, { dirName: "con-220", branch: "fix/con-220-clippy-194-stacked" });
+    const noBranch = seedWorktree(sandbox, { dirName: "con-9", branch: "" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(
+      existsSync(mismatched.full),
+      "a tree whose branch names a different issue must survive, even when both issues are terminal",
+    );
+    assert.ok(existsSync(noBranch.full), "a detached tree with no branch identifier must survive");
+    // The wt/ root now shares the workspace gate, so the refusal is reported with
+    // the two disagreeing values rather than a generic "no agreement" message.
+    // What matters is that it is refused *before* terminality is consulted, and
+    // that CLIPPY-194 being terminal changes nothing.
+    assert.match(result.stderr, /branch says 'CLIPPY-194', directory says 'CON-220'/);
+    assert.match(result.stderr, /branch does not name an issue/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: another company's worktree is never reclaimed, however its branch is named", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // strictScope: only CON-* exists in this company. Every foreign identifier
+    // comes back as no result at all, exactly as the real company-scoped route
+    // behaves, so these trees are protected by ownership rather than by luck.
+    const apiStub = installPaperclipApiStub(sandbox, {
+      strictScope: true,
+      issues: { "CON-1": "done" },
+    });
+    const nixlab = seedWorktree(sandbox, { dirName: "nixlab-1771-timer-context", branch: "fix/nixlab-1771-timer-context" });
+    const sti = seedWorktree(sandbox, { dirName: "sti-415-v2", branch: "fix/sti-415-v2" });
+    // A foreign tree that also carries one of our identifiers in its branch.
+    const impersonating = seedWorktree(sandbox, { dirName: "sti-500", branch: "fix/con-1-impersonator" });
+    // Our own tree, to prove the ownership check is what separates them.
+    const ours = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-ours" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(ours.full), "our own terminal worktree is still reclaimed");
+    assert.ok(existsSync(nixlab.full), "another company's worktree must survive");
+    assert.ok(existsSync(sti.full), "another company's worktree must survive");
+    assert.ok(existsSync(impersonating.full), "a foreign tree must not inherit our issue's status from its branch");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: provenance outranks corroboration -- a foreign-origin clone of OUR issue is still skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    // CON-1 is terminal, so terminality cannot be what saves the foreign tree.
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done" } });
+
+    // The dangerous shape, and the reason the wt/ gate checks origin first. Every
+    // name-based signal agrees: the directory is named for our issue, the branch
+    // names the same issue, and that issue is terminal. The only thing that
+    // distinguishes this from ours is that its origin is a different repository.
+    //
+    // This is not hypothetical. Of the 112 trees measured under wt/ on the live
+    // volume, 83 are not clones of the project repo and 74 of those clear a
+    // name+branch check -- so a gate that stops at corroboration reclaims on the
+    // strength of two labels that any process can create.
+    const foreignOrigin = seedWorktree(sandbox, {
+      dirName: "con-1",
+      branch: "fix/con-1-looks-totally-legitimate",
+      origin: "https://github.com/casazza-info/nixlab.git",
+    });
+    // No origin at all: a tree with no repository identity cannot be vouched for.
+    const noOrigin = seedWorktree(sandbox, {
+      dirName: "con-2",
+      branch: "fix/con-2-also-perfectly-named",
+      origin: "",
+    });
+    // The control: identical name and branch, company origin. If this one is not
+    // reclaimed, the test is passing for the wrong reason.
+    const ours = seedWorktree(sandbox, {
+      dirName: "con-3",
+      branch: "fix/con-3-ours",
+      origin: COMPANY_PROJECT_REPO,
+    });
+    const apiStubWithCon3 = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done", "CON-3": "done" } });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStubWithCon3 });
+    assert.equal(result.status, RC_CRITICAL);
+
+    assert.ok(
+      existsSync(foreignOrigin.full),
+      "a tree whose origin is another repository must survive even when name and branch both name a terminal issue of ours",
+    );
+    assert.ok(existsSync(noOrigin.full), "a tree with no origin must survive, not be guessed at");
+    assert.ok(!existsSync(ours.full), "the company-origin control must still be reclaimed, or this test proves nothing");
+
+    // Assert the gate's own words, so a deletion cannot pass by accident.
+    assert.match(result.stderr, /is not the company project repo/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: symlinked worktrees and symlinked build output are skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done", "CON-2": "done" } });
+    const symlinkedCheckout = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-link", symlinkCheckout: true });
+    const symlinkedTarget = seedWorktree(sandbox, { dirName: "con-2", branch: "fix/con-2-target-link" });
+    const outside = path.join(sandbox.mount, "outside-build");
+    mkdirSync(outside);
+    rmSync(path.dirname(symlinkedTarget.full), { recursive: true, force: true });
+    symlinkSync(outside, path.dirname(symlinkedTarget.full));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(symlinkedCheckout.full), "a symlinked worktree must survive");
+    assert.ok(existsSync(path.dirname(symlinkedTarget.full)), "a symlinked build dir must survive");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: build output that resolves outside wt/ is skipped", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done" } });
+    const tree = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-escape" });
+    // Move the build dir outside wt/ and symlink to it. The tree passes every
+    // other gate -- real git repo, corroborated identifier, terminal issue,
+    // gitignored, untracked, old -- so only containment can stop this, and
+    // `rm -rf` would otherwise follow the link out of the root.
+    const real = path.join(sandbox.mount, "outside-build-target");
+    mkdirSync(real, { recursive: true });
+    writeFileSync(path.join(real, "blob"), Buffer.alloc(2 * MIB));
+    rmSync(path.join(tree.checkout, "target"), { recursive: true, force: true });
+    symlinkSync(real, path.join(tree.checkout, "target"));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(path.join(real, "blob")), "build output resolving outside wt/ must survive");
+    assert.match(result.stderr, /candidate is a symlink/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("wt scope: the worktree itself and its sources are never deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox, { issues: { "CON-1": "done" } });
+    const tree = seedWorktree(sandbox, { dirName: "con-1", branch: "fix/con-1-keep-source" });
+    const sourceFile = path.join(tree.checkout, "src.rs");
+    writeFileSync(sourceFile, "fn main() {}\n");
+    spawnSync("git", ["add", "-f", "src.rs"], { cwd: tree.checkout });
+    spawnSync("git", ["commit", "-q", "-m", "source"], { cwd: tree.checkout });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(tree.full), "the build output is reclaimed");
+    assert.ok(existsSync(tree.checkout), "the worktree itself must survive");
+    assert.ok(existsSync(sourceFile), "committed source in the worktree must survive");
   } finally {
     sandbox.cleanup();
   }
@@ -1012,6 +1636,56 @@ test("shared cargo target scope: a stale non-per-issue dir is a candidate and a 
       treeBytes(sandbox.mount) < bytesBefore,
       "reclaiming a shared dir must actually free the space it reported",
     );
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("age gate: the bounded -newermt predicate keeps the >= cutoff boundary the sort-based gate had", () => {
+  const sandbox = makeSandbox();
+  try {
+    // DEF-306 replaced `find -printf %T@ | sort -nr | head` with
+    // `find -newermt @cutoff -print -quit`. Those are NOT interchangeable at the
+    // boundary: -newermt is *strictly* newer, while the gate it replaced skipped
+    // when newest >= cutoff. A candidate whose newest mtime is exactly the
+    // cutoff was skipped before and would become reclaimable without the
+    // one-second step back that tree_has_entry_newer_than applies.
+    //
+    // Pinned directly against the function so a future "simplify" back to
+    // `-newermt "@$cutoff"` fails here rather than silently widening what the
+    // guard is willing to delete.
+    const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+
+    // A candidate is a directory, and the gate is asked about a directory, so
+    // each case gets its own tree rather than a single shared one.
+    const treeAt = (name, epoch) => {
+      const d = path.join(sandbox.root, name);
+      mkdirSync(d, { recursive: true });
+      const f = path.join(d, "blob");
+      writeFileSync(f, "x");
+      utimesSync(f, new Date(epoch * 1000), new Date(epoch * 1000));
+      // The directory itself carries an mtime too and find reports it, so it
+      // must not be the thing answering the question.
+      utimesSync(d, new Date((epoch - 60) * 1000), new Date((epoch - 60) * 1000));
+      return d;
+    };
+
+    const probe = (d, c) =>
+      spawnSync(
+        "bash",
+        ["-c", `source <(sed -n '/^tree_has_entry_newer_than()/,/^}/p' "${SCRIPT}"); tree_has_entry_newer_than ${c} "${d}"`],
+        { encoding: "utf8" },
+      ).stdout.trim();
+
+    // mtime exactly at the cutoff: the old gate skipped it, so the new one must
+    // too. This is the case a raw -newermt "@$cutoff" gets wrong.
+    assert.notEqual(probe(treeAt("at", cutoff), cutoff), "", "mtime == cutoff must still read as fresh");
+    // One second under the cutoff is stale and reclaimable, as it always was.
+    assert.equal(probe(treeAt("under", cutoff - 1), cutoff), "", "mtime == cutoff-1 must still read as stale");
+    // Well inside the window is unambiguously fresh.
+    assert.notEqual(probe(treeAt("over", cutoff + 3600), cutoff), "", "mtime above the cutoff must read as fresh");
+    // Nothing in the tree at all is stale, not "cannot tell".
+    assert.equal(probe(path.join(sandbox.root, "absent"), cutoff), "", "an absent tree must read as stale");
   } finally {
     sandbox.cleanup();
   }
@@ -1215,6 +1889,674 @@ test("a name that parses as <PREFIX>-<number> still routes down the per-issue pa
   }
 });
 
+/**
+ * Read `key=value` out of the guard's status file, for the trend assertions.
+ * Missing means "the guard did not write it", which is itself the failure.
+ */
+function statusValue(sandbox, key) {
+  const body = readFileSync(sandbox.statusFile, "utf8");
+  const match = new RegExp(`^${key}=(.*)$`, "m").exec(body);
+  return match ? match[1] : undefined;
+}
+
+/**
+ * Write a status file as a *previous* check, so the next `--check` sees a trend.
+ *
+ * The guard reads its own last-written file to compute the rate, so a test cannot
+ * produce a trend any other way. Backdating `checked_at` is what sets the elapsed
+ * time and therefore the rate, which is the whole point: a 5,000MiB fall over 60
+ * minutes is a 5,000MiB/hour leak and the same fall over 600 minutes is 500MiB/hour
+ * and must not escalate.
+ */
+function writePreviousStatus(sandbox, { checkedAt, availMb, level = "ok", usePct = 50 }) {
+  const sizeBytes = 200 * 1024 * MIB;
+  const availBytes = availMb * MIB;
+  const usedBytes = sizeBytes - availBytes;
+  mkdirSync(path.dirname(sandbox.statusFile), { recursive: true });
+  writeFileSync(
+    sandbox.statusFile,
+    [
+      `checked_at=${checkedAt}`,
+      `mount=${sandbox.mount}`,
+      `size_bytes=${sizeBytes}`,
+      `used_bytes=${usedBytes}`,
+      `avail_bytes=${availBytes}`,
+      `use_pct=${usePct}`,
+      `avail_mb=${availMb}`,
+      `floor_mb=6144`,
+      `level=${level}`,
+      `warn_pct=88`,
+      `crit_pct=94`,
+      "min_free_mb=1500",
+      "guard_version=5",
+      "",
+    ].join("\n"),
+  );
+}
+
+function minutesAgo(minutes) {
+  return new Date(Date.now() - minutes * 60 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * A previous check whose free space matches the stub exactly, one hour ago.
+ *
+ * The nix sweep tests care about what got deleted, not about the trend, and a
+ * stale `avail_mb` from an earlier run would escalate the level out from under
+ * them -- `prune()` decides whether to delete anything from the level the guard
+ * measures, so a trend-driven escalation would silently turn "test the sweep"
+ * into "test the sweep at critical", and a future change to the prune gate would
+ * then look like a sweep failure.
+ */
+function writeFlatPreviousStatus(sandbox, availMb) {
+  writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb, level: "ok", usePct: 40 });
+}
+
+// ---------------------------------------------------------------------------
+// CON-461: orphaned nix git-fetch temp packs
+// ---------------------------------------------------------------------------
+
+test("nix git cache: an orphaned tmp_pack_*/tmp_idx_* in a never-fetched repo is reclaimed, and reported with its size", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    // The exact shape of the CON-458 orphans: 9.3GiB across three files in one
+    // repo whose fetch died before it wrote a ref or an origin.
+    const { packDir, files } = seedNixGitCache(sandbox, {
+      files: ["tmp_pack_zSj50C", "tmp_pack_hl1ihe", "tmp_idx_Q8l6uu"],
+      sizeBytes: 3 * MIB,
+    });
+    assert.equal(files.length, 3);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    for (const f of files) {
+      assert.ok(!existsSync(f), `orphaned temp pack ${path.basename(f)} must be reclaimed`);
+    }
+    assert.ok(existsSync(packDir), "the repo scaffolding itself is not this guard's to delete");
+    // Each removal is reported with its size, so an operator can see what came
+    // back without re-running df by hand.
+    assert.match(result.stderr, /reclaim .*tmp_pack_zSj50C \(~3MiB orphaned nix temp pack\/idx\)/);
+    assert.match(result.stderr, /reclaim .*tmp_idx_Q8l6uu \(~3MiB orphaned nix temp pack\/idx\)/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: a fresh tmp_pack_* that may be an in-flight fetch is never deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    // Minutes old, not days. This is the acceptance criterion that matters most:
+    // the failure mode being guarded against is not reclaiming too little, it is
+    // deleting a pack out from under a build that is still writing it.
+    const { files } = seedNixGitCache(sandbox, { files: ["tmp_pack_inflight"], sizeBytes: 4 * MIB, fresh: true });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    for (const f of files) {
+      assert.ok(existsSync(f), "a minutes-old temp pack may be an in-flight fetch and must survive");
+    }
+    assert.match(result.stderr, /may be an in-flight fetch/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: every evidence gate independently refuses the pack, so the sweep fails closed", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+
+    // One repo per gate. Each is otherwise a perfect candidate: old, nlink==1, no
+    // open fd. If any gate were dropped, exactly one of these would be deleted and
+    // the assertion that all six survive would fail.
+    const fresh = seedNixGitCache(sandbox, { hash: "aaa-fresh", files: ["tmp_pack_fresh"], fresh: true });
+    const linked = seedNixGitCache(sandbox, { hash: "bbb-linked", files: ["tmp_pack_linked"] });
+    // Two extra names for the link, because nix's own layout puts a hash beside a
+    // pack and only the pack itself is a tmp_pack_*; a link that also matched the
+    // name would be the same file enumerated twice, which proves nothing about the
+    // nlink gate.
+    linkSync(linked.files[0], path.join(linked.packDir, "pack-0123456789abcdef.idx"));
+    linkSync(linked.files[0], path.join(linked.packDir, "pack-0123456789abcdef.pack"));
+    const heads = seedNixGitCache(sandbox, { hash: "ccc-heads", files: ["tmp_pack_heads"], refs: { heads: ["main"], tags: [] } });
+    const tags = seedNixGitCache(sandbox, { hash: "ddd-tags", files: ["tmp_pack_tags"], refs: { heads: [], tags: ["v1"] } });
+    const origin = seedNixGitCache(sandbox, { hash: "eee-origin", files: ["tmp_pack_origin"], origin: "https://github.com/olivecasazza/definitely-not-crosswords.git" });
+    // Bare on-disk scaffolding rather than a git repo git can open: an aborted
+    // fetch can leave the repo too damaged to `git init` cleanly over, and that
+    // is exactly when a multi-GiB pack is most likely to be stranded. A ref file
+    // written directly must still be read as a ref.
+    const rawRefs = seedNixGitCache(sandbox, {
+      hash: "fff-rawrefs",
+      files: ["tmp_pack_rawrefs"],
+      gitInit: false,
+      refs: { heads: ["main"], tags: [] },
+    });
+
+    const held = holdOpen(linked.files[0]);
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    held.release();
+
+    assert.equal(result.status, RC_CRITICAL);
+    for (const [name, seeded] of Object.entries({ fresh, linked, heads, tags, origin, rawRefs })) {
+      for (const f of seeded.files) {
+        assert.ok(existsSync(f), `${name}: a pack missing one piece of evidence must survive`);
+      }
+    }
+    // The refusals have to be visible in the output. A skip that is silent is
+    // indistinguishable from the sweep not running at all, which is the same
+    // blind spot that let CON-458 read as a mystery.
+    assert.match(result.stderr, /may be an in-flight fetch/);
+    // nlink==2 is the observable consequence of the extra link, and it is what the
+    // gate reports. A silent skip would be indistinguishable from the sweep not
+    // running, which is the same blind spot that let CON-458 read as a mystery.
+    assert.match(result.stderr, /tmp_pack_linked \(nlink=3/);
+    assert.match(result.stderr, /not a never-fetched cache repo/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: a pack a process is actively writing is skipped even when it is old, nlink==1, and in a never-fetched repo", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    const { files } = seedNixGitCache(sandbox, { hash: "held-open", files: ["tmp_pack_held"], sizeBytes: 3 * MIB });
+
+    // A real open fd, held by this process, while the guard runs. The age gate
+    // alone would have called this an orphan; the fd is what makes the sweep safe
+    // against a long fetch that has outlived the age threshold.
+    const held = holdOpen(files[0]);
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+    held.release();
+
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(files[0]), "a pack with an open fd must survive whatever its age says");
+    assert.match(result.stderr, /a process holds it open/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: nothing to sweep is a normal no-op, not an error", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    // A cache dir with nothing but a completed repo in it: no tmp_pack_*, no
+    // tmp_idx_*. This is the steady state of a healthy volume, and it must not
+    // produce an error, a non-zero status, or a claim that it reclaimed anything.
+    seedNixGitCache(sandbox, { hash: "clean-repo", files: [], origin: "https://github.com/olivecasazza/definitely-not-crosswords.git" });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    assert.doesNotMatch(result.stdout, /reclaimed_nix_mib/, "a sweep that found nothing must not report a reclaim");
+    assert.doesNotMatch(result.stderr, /reclaim /, "a sweep that found nothing must not claim a removal");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: the age threshold is the one the sweep documents, and an in-flight fetch has a wide margin above it", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    const sixDaysOld = seedNixGitCache(sandbox, { hash: "old-hash", files: ["tmp_pack_old"] });
+
+    // Just inside the window the guard allows: 25 hours old. Reclaimed. A 24h
+    // threshold admits anything *older* than 24h, so 25h is the youngest age that
+    // passes and 23h the oldest that does not. An earlier version of this test had
+    // the two the wrong way round -- it expected the 23h file deleted and the 25h
+    // file kept -- which reads correctly only if "older than the threshold" is
+    // taken to mean "more recently than the threshold".
+    const justInside = seedNixGitCache(sandbox, { hash: "inside-hash", files: ["tmp_pack_inside"], fresh: false });
+    utimesSync(justInside.files[0], new Date(Date.now() - 25 * 3600 * 1000), new Date(Date.now() - 25 * 3600 * 1000));
+
+    // Just outside it: 23 hours old. Survives, because the threshold is a
+    // conservative margin rather than "old enough to probably be dead".
+    const justOutside = seedNixGitCache(sandbox, { hash: "outside-hash", files: ["tmp_pack_outside"] });
+    utimesSync(justOutside.files[0], new Date(Date.now() - 23 * 3600 * 1000), new Date(Date.now() - 23 * 3600 * 1000));
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(!existsSync(sixDaysOld.files[0]), "the CON-458 case -- six days old -- must be reclaimed");
+    assert.ok(!existsSync(justInside.files[0]), "25h is older than the 24h window and must be reclaimed");
+    assert.ok(existsSync(justOutside.files[0]), "23h is younger than the 24h window and must survive");
+    // The boundary is the whole point of this test, so pin the direction of the
+    // skip message too: a gate that skipped the *older* file would still delete
+    // both files in the other direction and pass a delete-only assertion.
+    assert.match(result.stderr, /tmp_pack_outside \(mtime is within 24h/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix: live nix state stays protected -- .nix-portable, .local/state/nix and the store are never reclaim paths, and no nix gc is introduced", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    // The live paths named in the guard's header, each holding enough to look
+    // worth reclaiming and an mtime old enough to pass any age gate.
+    const old = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    const live = {};
+    for (const rel of [".nix-portable/store/toolchain", ".local/state/nix/profiles/profile-1", "nixstore/aaa-linux-builder", ".local/share/nix/store/x"]) {
+      const full = path.join(sandbox.mount, rel);
+      mkdirSync(full, { recursive: true });
+      writeFileSync(path.join(full, "blob"), Buffer.alloc(8 * MIB));
+      utimesSync(path.join(full, "blob"), old, old);
+      live[rel] = full;
+    }
+    // A temp pack-shaped name inside live state must not tempt anything either.
+    const livePackDir = path.join(sandbox.mount, ".nix-portable/store/toolchain/objects/pack");
+    mkdirSync(livePackDir, { recursive: true });
+    writeFileSync(path.join(livePackDir, "tmp_pack_decoy"), Buffer.alloc(8 * MIB));
+    utimesSync(path.join(livePackDir, "tmp_pack_decoy"), old, old);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    for (const [rel, dir] of Object.entries(live)) {
+      assert.ok(existsSync(path.join(dir, "blob")), `${rel} must survive a prune`);
+    }
+    assert.ok(existsSync(path.join(livePackDir, "tmp_pack_decoy")), "a temp pack outside the git cache must survive");
+
+    // No reclaim path may invoke the nix store. `nix store gc` / `nix-store
+    // --delete` / `nix copy` are unsafe here: this volume's store is effectively
+    // empty while the toolchains that matter live outside it, so GC roots would
+    // not cover them. A regression that reintroduced one would be invisible in
+    // every other assertion in this file, because on this volume it would collect
+    // paths nothing appears to be using and leave the real toolchains untouched.
+    const script = readFileSync(SCRIPT, "utf8");
+    assert.doesNotMatch(script, /\bnix\s+store\s+gc\b/, "nix store gc must never be a reclaim path on this volume");
+    assert.doesNotMatch(script, /\bnix-store\b/, "nix-store must never be a reclaim path on this volume");
+    assert.doesNotMatch(script, /\bnix\s+copy\b/, "nix copy must never be a reclaim path on this volume");
+    assert.doesNotMatch(script, /\bnix-collect-garbage\b/, "nix-collect-garbage must never be a reclaim path on this volume");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("nix git cache: .cache/nix is not a blanket safe_cache, so a live gitv3 or tarball-cache entry is never deleted", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 95 * 1024 * MIB, avail: 5 * 1024 * MIB });
+    writeFlatPreviousStatus(sandbox, 5 * 1024);
+    const apiStub = installPaperclipApiStub(sandbox);
+    const old = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    // A successfully-fetched repo's real pack, plus the tarball cache. These are
+    // the entries a running build may still need, which is the reason the sweep is
+    // targeted rather than `.cache/nix` in safe_caches[].
+    const live = seedNixGitCache(sandbox, {
+      hash: "live-repo",
+      files: ["pack-0123456789abcdef.pack"],
+      origin: "https://github.com/olivecasazza/definitely-not-crosswords.git",
+    });
+    const tarball = path.join(sandbox.mount, ".cache/nix/tarball-cache/abc");
+    mkdirSync(tarball, { recursive: true });
+    writeFileSync(path.join(tarball, "source"), Buffer.alloc(8 * MIB));
+    utimesSync(path.join(tarball, "source"), old, old);
+    // And a sqlite side-car the fetcher keeps, which is live cache bookkeeping.
+    const sidecar = path.join(sandbox.mount, ".cache/nix/fetcher-cache-v1.sqlite");
+    writeFileSync(sidecar, Buffer.alloc(2 * MIB));
+    utimesSync(sidecar, old, old);
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_CRITICAL);
+    assert.ok(existsSync(live.files[0]), "a fetched repo's pack must survive");
+    assert.ok(existsSync(path.join(tarball, "source")), "the tarball cache must survive");
+    assert.ok(existsSync(sidecar), "the fetcher cache sqlite must survive");
+
+    // The whole point is that the eligible set is the temp packs, so the guard
+    // must not list `.cache/nix` as a whole-path prune target either.
+    assert.doesNotMatch(result.stderr, /prune \S*\.cache\/nix( |$)/, ".cache/nix must not be pruned as a whole path");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CON-461: falling free space between routine runs
+// ---------------------------------------------------------------------------
+
+test("trend: a volume that is still ok but losing over 1GiB/hour escalates, and reports the rate", () => {
+  const sandbox = makeSandbox();
+  try {
+    // 40% used, so the snapshot level is unambiguously `ok`: this is the whole
+    // point of the signal. A guard that only escalates at warn/critical cannot see
+    // a collapse that has not arrived yet, and on 2026-10-04 the collapse was at
+    // 240 MiB/min -- it reached critical before any check noticed it moving.
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    // 10,240MiB lost over 60 minutes = 10,240MiB/hour, far past the 1GiB/hour
+    // threshold. rc=2 (warn) even though the volume reads ok.
+    assert.equal(result.status, RC_WARN);
+    assert.match(result.stdout, /level=warn/);
+    assert.match(result.stdout, /trend=falling/);
+    assert.match(result.stdout, /rate=-10240MiB\/hour/);
+    assert.match(result.stderr, /falling free space/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: a steady volume with reclaimable headroom does not escalate, however long it has been flat", () => {
+  const sandbox = makeSandbox();
+  try {
+    // Free space essentially unchanged over a day. A steady warn with headroom is
+    // not an incident, and neither is a steady ok -- escalating on flatness would
+    // make the guard cry wolf on every healthy run and train everyone to ignore it.
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(24 * 60), availMb: 120 * 1024 + 3, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.equal(result.status, RC_OK);
+    assert.match(result.stdout, /level=ok/);
+    assert.match(result.stdout, /rate=0MiB\/hour/);
+    assert.doesNotMatch(result.stderr, /falling free space/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: a slow leak below the threshold is reported but does not escalate, and only the rate keeps the level unchanged", () => {
+  const sandbox = makeSandbox();
+  try {
+    // 500MiB/hour is a real trend and an operator should see it, but it is below
+    // the 1GiB/hour escalation bar and would take two days to matter on a
+    // 197GiB volume. Escalating here would fire on the volume's normal churn.
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 120 * 1024 + 500, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.match(result.stdout, /rate=-500MiB\/hour/, "a slow leak must still be visible");
+    assert.doesNotMatch(result.stderr, /falling free space/, "a sub-threshold leak must not be escalated by the rate test");
+    assert.equal(statusValue(sandbox, "level"), "ok", "the absolute level is unchanged: the volume is still only 40% full");
+    // Nothing else escalates here either. The previous level is also ok and the
+    // current level is ok, so there is no regression to report -- an earlier
+    // version of this test asserted `level regressed ok -> warn` while also
+    // asserting level=ok, which no guard can satisfy: the regression line compares
+    // the recorded previous level against the level just measured, and both are ok
+    // here. Escalation is covered by the cases that actually regress
+    // ("an absolute level regression between consecutive runs") and by the cases
+    // that actually cross the rate threshold.
+    assert.doesNotMatch(result.stderr, /level regressed/, "with ok before and ok now there is no regression");
+    assert.equal(statusValue(sandbox, "level_prev"), "ok");
+    assert.equal(result.status, RC_OK, "a sub-threshold leak on a healthy volume is not an incident");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: a fall that recovers within the interval is reported as a recovery, not as a leak", () => {
+  const sandbox = makeSandbox();
+  try {
+    // Free space is *higher* than the last check: a prune ran, or a build finished
+    // and released its temp. The rate must be non-negative, so it can never be
+    // compared against the negative fall threshold and escalate.
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 130 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 120 * 1024, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.equal(result.status, RC_OK);
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), String(10 * 1024));
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), String(10 * 1024));
+    assert.doesNotMatch(result.stderr, /falling free space/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: the rate is normalised by elapsed time, so the same absolute fall is a fast leak or a slow one", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    // The same 2,000MiB the guard is watching for: over an hour it is 2,000MiB/hour
+    // and escalates; over twelve hours it is ~166MiB/hour and does not. The
+    // absolute fall is identical, so only the interval can be what decided it --
+    // which is the property the escalation is actually about.
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 120 * 1024 + 2000, level: "ok", usePct: 40 });
+    const fast = run(sandbox, ["--check"]);
+    assert.match(fast.stderr, /falling free space/, "2,000MiB/hour is past the 1GiB/hour bar and must escalate");
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), "-2000");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "-2000");
+
+    rmSync(sandbox.statusFile, { force: true });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(12 * 60), availMb: 120 * 1024 + 2000, level: "ok", usePct: 40 });
+    const slow = run(sandbox, ["--check"]);
+    assert.doesNotMatch(slow.stderr, /falling free space/, "the same 2,000MiB over twelve hours is a slow leak");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "-166");
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), "-2000", "the delta is the absolute fall, not a rate");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: two checks in the same minute do not manufacture a leak out of rounding", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(0), availMb: 120 * 1024 + 3, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    // 3MiB inside a single minute is 180MiB/hour if the interval is credited as a
+    // minute and unbounded if it is credited as a second. Either way it is one
+    // measurement, not two, and there is no interval to measure a trend over.
+    assert.equal(statusValue(sandbox, "avail_mb_elapsed_minutes"), "");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "");
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), "", "no interval means no delta either, rather than a delta with no rate");
+    assert.doesNotMatch(result.stderr, /falling free space/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: disk-guard.status carries the previous value, the delta and the rate, so the trend is readable without diffing prose", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+
+    run(sandbox, ["--check"]);
+
+    // The acceptance criterion, stated as fields. `avail_mb_prev` and
+    // `avail_mb_delta` are the two names the issue asks for by example, and the
+    // rate and interval are what make the delta interpretable.
+    assert.equal(statusValue(sandbox, "avail_mb_prev"), String(130 * 1024));
+    assert.equal(statusValue(sandbox, "avail_mb"), String(120 * 1024));
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), String(-10 * 1024));
+    assert.equal(statusValue(sandbox, "avail_mb_elapsed_minutes"), "60");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), String(-10 * 1024));
+    assert.equal(statusValue(sandbox, "level_prev"), "ok");
+    assert.equal(statusValue(sandbox, "fall_rate_threshold_mb_per_hour"), "-1024");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: the first check on a clean volume has no previous value and writes empty trend fields rather than guessing", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.equal(result.status, RC_OK);
+    // A trend needs two measurements. Writing zero here would report "free space
+    // is not falling", which is a claim about a comparison that was never made.
+    assert.equal(statusValue(sandbox, "avail_mb_prev"), "");
+    assert.equal(statusValue(sandbox, "avail_mb_delta"), "");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "");
+    assert.equal(statusValue(sandbox, "avail_mb"), String(120 * 1024));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: an absolute level regression between consecutive runs is escalated even when the level is only warn", () => {
+  const sandbox = makeSandbox();
+  try {
+    // ok -> warn: the volume crossed the warn threshold between two checks. The
+    // issue calls this out specifically, and it is the same fact as a fast fall
+    // stated in fewer samples, so it escalates for the same reason.
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 180 * 1024 * MIB, avail: 20 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(360), availMb: 20 * 1024 + 2, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.match(result.stdout, /level=warn/, "the trend must be reported and must have escalated the level");
+    assert.match(result.stderr, /level regressed ok -> warn since the previous check/, "the regression must be logged with the exact past level that triggered it");
+    // The test only asserts against status file here to confirm the new level is captured; the log is covered above.
+    assert.equal(statusValue(sandbox, "level"), "warn");
+    assert.equal(statusValue(sandbox, "level_prev"), "ok");
+    // The fall here is tiny and well under the rate threshold, so this test is
+    // only meaningful if the regression test is independent of the rate test.
+    assert.match(result.stdout, /rate=-0MiB\/hour|rate=0MiB\/hour/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: a hand-edited or truncated previous value cannot drive an escalation", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    // An `avail_mb` that is not a bare integer. A substring-extraction-based parse
+    // would hand this to the arithmetic and either error out or coerce it, and a
+    // coerced value produces a confident rate out of nothing -- which is the
+    // failure mode a guard that invents a level must never have.
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: "120000 MiB", level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.equal(result.status, RC_OK);
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "");
+    assert.doesNotMatch(result.stderr, /falling free space/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: a previous stamp that is not the shape this guard writes yields no rate, not a guess", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+    const body = readFileSync(sandbox.statusFile, "utf8").replace(/^checked_at=.*$/m, "checked_at=yesterday afternoon");
+    writeFileSync(sandbox.statusFile, body);
+
+    const result = run(sandbox, ["--check"]);
+
+    assert.equal(result.status, RC_OK);
+    assert.equal(statusValue(sandbox, "avail_mb_elapsed_minutes"), "");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), "");
+    // The previous value is still recorded, because it is a fact about the last
+    // run; only the interval we cannot establish is left empty.
+    assert.equal(statusValue(sandbox, "avail_mb_prev"), String(130 * 1024));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: the rate threshold is configurable, and disabling it leaves the level-regression signal working", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+
+    // A threshold below the observed rate: the leak is still measured and still
+    // written to the status file, it just is not an incident by this guard's
+    // judgement. The rate is the output; the escalation is a policy over it, and
+    // the two must be separable or an operator cannot tune one without losing
+    // the other.
+    const lenient = run(sandbox, ["--check"], { DISK_GUARD_FALL_RATE_MB_PER_HOUR: "-100000" });
+    assert.doesNotMatch(lenient.stderr, /falling free space/, "a threshold below the observed rate must not escalate");
+    assert.match(lenient.stdout, /rate=-10240MiB\/hour/, "the rate is still reported even when it does not escalate");
+    assert.equal(statusValue(sandbox, "fall_rate_threshold_mb_per_hour"), "-100000");
+
+    // Threshold disabled entirely, with a genuine ok -> warn regression. The
+    // regression is a separate fact from the rate and must survive on its own.
+    rmSync(sandbox.statusFile, { force: true });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(360), availMb: 20 * 1024 + 2, level: "ok", usePct: 40 });
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 180 * 1024 * MIB, avail: 20 * 1024 * MIB });
+    const disabled = run(sandbox, ["--check"], { DISK_GUARD_FALL_RATE_MB_PER_HOUR: "0" });
+    assert.equal(disabled.status, RC_WARN, "the level regression is still escalated with the rate test off");
+    assert.match(disabled.stderr, /level regressed ok -> warn/);
+    assert.doesNotMatch(disabled.stderr, /falling free space/, "the rate test is off, so it must not have fired");
+    assert.equal(statusValue(sandbox, "fall_rate_threshold_mb_per_hour"), "0");
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: --prune stays a no-op when the volume is ok, even with a falling trend", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    const apiStub = installPaperclipApiStub(sandbox);
+    const { files } = seedNixGitCache(sandbox, { files: ["tmp_pack_sitting"], sizeBytes: 3 * MIB });
+    const cache = seed(sandbox, ".cache/node/blob", 4 * MIB);
+
+    // Pre-existing ok status with plenty of headroom: the guard must not delete a
+    // cache because the *previous* run was trending down. Pruning is a response to
+    // present pressure, and a trend is a reason to look, not a licence to delete.
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--prune"], { DISK_GUARD_API_STUB: apiStub });
+
+    assert.equal(result.status, RC_WARN, "the trend escalates the reported level");
+    assert.match(result.stdout, /prune_skipped=level_ok/, "but the prune itself is skipped at level ok");
+    assert.ok(existsSync(cache), "a safe cache must survive a prune that was skipped");
+    assert.ok(existsSync(files[0]), "an orphaned temp pack must survive a prune that was skipped");
+    // The two answers have to be distinguishable, or "the guard escalated" and
+    // "the guard deleted things" become the same event and neither is readable.
+    assert.match(result.stdout, /prune_skipped=level_ok/);
+    assert.doesNotMatch(result.stdout, /reclaimed_mib|reclaimed_nix_mib/);
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
+test("trend: --check needs no company id, so the signal cannot be lost to a tenant misconfiguration", () => {
+  const sandbox = makeSandbox();
+  try {
+    installDfStub(sandbox, { size: 200 * 1024 * MIB, used: 80 * 1024 * MIB, avail: 120 * 1024 * MIB });
+    writePreviousStatus(sandbox, { checkedAt: minutesAgo(60), availMb: 130 * 1024, level: "ok", usePct: 40 });
+
+    const result = run(sandbox, ["--check"], { PAPERCLIP_COMPANY_ID: "", DISK_GUARD_COMPANY_ID: "" });
+
+    assert.equal(result.status, RC_WARN);
+    assert.match(result.stderr, /falling free space/, "the trend must be reported with no company id at all");
+    assert.equal(statusValue(sandbox, "fall_rate_mb_per_hour"), String(-10 * 1024));
+  } finally {
+    sandbox.cleanup();
+  }
+});
+
 // Expected guard_version of the committed script. This constant is the whole
 // point of DEF-294: the previous version of this test only compared against the
 // runtime copies under /paperclip, and `continue`d past any that were absent --
@@ -1228,7 +2570,7 @@ test("a name that parses as <PREFIX>-<number> still routes down the per-issue pa
 // that is PRESENT but reports a different version, or differs by a byte, is
 // always a bug and is checked. Set the env var only for a deliberate
 // uninstall, never to quiet a real mismatch.
-const EXPECTED_GUARD_VERSION = 4;
+const EXPECTED_GUARD_VERSION = 8;
 const RUNTIME_COPIES = ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"];
 
 test("the committed script declares the guard_version the repo expects", () => {

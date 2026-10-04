@@ -13,6 +13,7 @@ import {
 } from "../services/workspace-readiness.js";
 import {
   buildManagedWorkspaceGuestEnv,
+  buildWorkspaceReadinessHealthUrl,
   listManagedWorkspaceHandoffSubjects,
   probeManagedWorkspaceHandoffSubjects,
   probeManagedWorkspaceReadiness,
@@ -283,6 +284,31 @@ describe("resolveWorkspaceReadiness", () => {
     ).toBe(true);
     const seeded = createMarkerDir({ "seed-manifest.json": verifiedManifest() });
     expect(isManagedWorkspaceInstance({ PAPERCLIP_CONFIG: seeded.configPath })).toBe(true);
+  });
+});
+
+describe("buildWorkspaceReadinessHealthUrl", () => {
+  // Regression guard for the liveness/readiness split. `/api/health` defaults to
+  // liveness and does not query the database, so a bare URL returns no
+  // `workspace` block. That failure is silent rather than loud: the probe
+  // reports `readiness_missing`, which makes `auto` gate mode publish the
+  // workspace with no identity verification and makes `strict` mode refuse to
+  // start it at all. Pin the opt-in here.
+  it("opts into the readiness contract so the workspace block can be returned", () => {
+    expect(buildWorkspaceReadinessHealthUrl("http://127.0.0.1:42013"))
+      .toBe("http://127.0.0.1:42013/api/health?database=required");
+    expect(buildWorkspaceReadinessHealthUrl("https://workspace.example.ts.net:42013/"))
+      .toBe("https://workspace.example.ts.net:42013/api/health?database=required");
+  });
+
+  it("is idempotent and never double-asks", () => {
+    expect(buildWorkspaceReadinessHealthUrl("http://127.0.0.1:42013/api/health?database=required"))
+      .toBe("http://127.0.0.1:42013/api/health?database=required");
+    // The opt-in is resolved against the path, so a query the caller had put on
+    // its own input URL is intentionally not carried over. What matters is that
+    // `database=required` is present exactly once.
+    expect(buildWorkspaceReadinessHealthUrl("http://127.0.0.1:42013/api/health?trace=1"))
+      .toBe("http://127.0.0.1:42013/api/health?database=required");
   });
 });
 
