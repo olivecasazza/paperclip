@@ -47,12 +47,12 @@
 # escalated "prune insufficient" and blamed the PVC when the PVC was fine
 # (CON-453, CON-458).
 #
-# `nix copy`, `nix-store --delete` and `nix store gc` are NOT reclaim paths here,
-# and must not become one. This volume's nix store is effectively empty
+# The nix garbage collectors and the copy/import commands are NOT reclaim paths
+# here, and must not become one. This volume's nix store is effectively empty
 # (`$MOUNT/nixstore` is 1MiB, `.local/state/nix/profiles/` is empty) while the
 # toolchains that matter live outside it, so GC roots would not cover them: a
-# `nix store gc` here would collect the paths nothing appears to be using and
-# leave the toolchains it cannot see. Proving roots cover the real toolchain is a
+# store GC here would collect the paths nothing appears to be using and leave the
+# toolchains it cannot see. Proving roots cover the real toolchain is a
 # precondition, not something to assume.
 #
 # A level alone cannot see a leak, so the guard also trends free space against its
@@ -107,6 +107,12 @@
 # two checks for the rate to be believed at all. Set FALL_RATE_MB_PER_HOUR=0 to
 # disable the rate test and escalate only on an absolute level or a level
 # regression.
+#
+# Two levels, and the difference is load-bearing. `level` is what to tell a human
+# and what the exit code carries: the trend can raise it. `level_snapshot` is what
+# df alone said. Only level_snapshot authorises deletion -- --prune is a response to
+# present pressure, and a healthy volume falling 10GiB/hour is a reason to check
+# again sooner, not to delete a cache on a guess about the future.
 #
 # Exit codes: 0 ok, 1 usage error, 2 warn, 3 critical. Exit 1 also covers a
 # failed measurement: if df cannot be read we cannot know the level, and the
@@ -426,10 +432,11 @@ path_has_open_fd() {
       esac
     done
   done
-  # No /proc at all, or not a single readable process: we cannot tell, and the
-  # caller must skip rather than assume the file is idle. A /proc that exists and
-  # held processes but matched nothing is a real "no", which is return 1 above.
-  [ "$seen" -eq 1 ]
+  # A /proc that existed and held processes but matched nothing is a real "no":
+  # return 1, so the caller proceeds. The inverse of what it reads like -- get it
+  # backwards and *every* candidate is reported as held-open, which is a silent
+  # total no-op of the sweep rather than a visible failure.
+  [ "$seen" -eq 0 ]
 }
 
 # Whether a git fetch cache repo never completed a fetch: no ref points into its
@@ -508,8 +515,13 @@ nix_orphan_temp_pack_candidates() {
       continue
     fi
     # -maxdepth 1 so the walk cannot descend into a pack that happens to be a
-    # directory, and -links 1 with -type f so gate 2 is decided by find itself
-    # rather than by a second stat per file.
+    # directory, and -type f so a directory or fifo named tmp_pack_* is not walked
+    # into. The link count is deliberately *not* a find predicate here: `-links 1`
+    # is the cheaper way to enforce the nlink gate, but it drops the file from the
+    # output entirely, so the sweep says nothing about it. A refusal an operator
+    # cannot see is indistinguishable from the sweep not having run, which is the
+    # same blind spot that let CON-458 read as a mystery. Enforcing nlink in the
+    # loop below keeps the gate and makes it report its reason.
     while IFS= read -r pack; do
       [ -n "$pack" ] || continue
       if [ ! -f "$pack" ]; then
@@ -554,7 +566,7 @@ nix_orphan_temp_pack_candidates() {
       printf '%s\t%s\n' "$pack_real" "${size:-0}"
     done < <(find "$repo/objects/pack" -xdev -maxdepth 1 \
                 \( -name 'tmp_pack_*' -o -name 'tmp_idx_*' \) \
-                -type f -links 1 -print 2>/dev/null)
+                -type f -print 2>/dev/null)
   done
 }
 
@@ -1089,10 +1101,33 @@ measure() {
     }' | tail -1
 }
 
+# The previous measurement, read once per process from the status file.
+#
+# report() may run twice in one process (--prune measures to decide whether to
+# delete, then reports again to answer the caller), and the first run overwrites
+# the status file. Read at the top of each report() but only the first time, so
+# both runs compare against the last *invocation* rather than the second against
+# the first -- which would report a rate of exactly 0 and a level that can never
+# regress, silently disabling the trend in the one mode where an operator most
+# wants to know the volume was falling.
+PREV_MEASUREMENT_CAPTURED=0
+PREV_AVAIL_MB=""
+PREV_CHECKED_AT=""
+PREV_LEVEL=""
+capture_prev_measurement() {
+  [ "$PREV_MEASUREMENT_CAPTURED" = "1" ] && return 0
+  PREV_MEASUREMENT_CAPTURED=1
+  PREV_AVAIL_MB="$(status_field avail_mb || true)"
+  PREV_CHECKED_AT="$(status_field checked_at || true)"
+  PREV_LEVEL="$(status_field level || true)"
+  return 0
+}
+
 report() {
   local size used avail pct avail_mb level rc floor_mb
   local prev_avail_mb prev_checked_at elapsed_min delta_mb rate_mb_hour
-  local trend="" level_prev
+  local trend="" level_prev level_snapshot
+  capture_prev_measurement
   read -r size used avail pct <<<"$(measure)"
 
   # An unreadable or unparseable df is a measurement failure, not a pressure
@@ -1123,6 +1158,11 @@ report() {
   if   [ "$pct" -ge "$CRIT_PCT" ]; then level="critical"; rc=3
   elif [ "$pct" -ge "$WARN_PCT" ] || [ "$avail_mb" -lt "$floor_mb" ]; then level="warn"; rc=2
   fi
+  # What df said, before any trend escalated it. Kept separately because the two
+  # answer different questions and callers need to be able to tell them apart:
+  # `level` is what to tell a human, `level_snapshot` is what authorises deletion.
+  # An ok volume falling 10GiB/hour is an incident and still not a reclaim trigger.
+  level_snapshot="$level"
 
   # Trend against the previous recorded measurement, read from the status file
   # this function is about to overwrite. Read here, not after the write: the file
@@ -1137,9 +1177,9 @@ report() {
   # (CON-453, CON-458) when the guard simply had nothing authorized to reclaim and
   # no way to express "and it is getting worse at 14GB/hour". A steady warn with
   # reclaimable headroom is not an incident; an ok that is actively collapsing is.
-  prev_avail_mb="$(status_field avail_mb || true)"
-  prev_checked_at="$(status_field checked_at || true)"
-  level_prev="$(status_field level || true)"
+  prev_avail_mb="$PREV_AVAIL_MB"
+  prev_checked_at="$PREV_CHECKED_AT"
+  level_prev="$PREV_LEVEL"
   delta_mb=""; rate_mb_hour=""
   elapsed_min=""
   # A value that is not a bare non-negative integer is not a measurement, and
@@ -1153,20 +1193,32 @@ report() {
     case "$elapsed_min" in
       ''|*[!0-9]*) elapsed_min="" ;;
     esac
-    # A zero or negative interval means the clock moved backwards, or two
-    # invocations landed in the same second. Either way there is no rate to
-    # report, and dividing by it would manufacture one.
-    if [ -n "$elapsed_min" ] && [ "$elapsed_min" -ge "$TREND_MIN_INTERVAL_MINUTES" ]; then
+    # Too short to be two measurements. Two checks inside one minute are one
+    # measurement, not two: a MiB or two of churn divided by ~0 minutes is
+    # either an enormous rate or a division by zero, and either way the number is
+    # noise wearing a rate's clothing. The interval is cleared rather than kept as
+    # 0 so the status file reads "no trend" (empty delta *and* empty rate) rather
+    # than a delta with no denominator for a consumer to divide by itself.
+    if [ -n "$elapsed_min" ] && [ "$elapsed_min" -lt "$TREND_MIN_INTERVAL_MINUTES" ]; then
+      elapsed_min=""
+    fi
+    if [ -n "$elapsed_min" ]; then
       delta_mb=$(( avail_mb - prev_avail_mb ))
-      # Integer division, signed, rounded toward zero so a small fall never
-      # reports as a large positive rate. Sign is preserved because the
+      # Integer division, signed, and bash truncates toward zero, so a small fall
+      # rounds toward zero rather than away from it. Sign is preserved because the
       # escalation compares against a negative threshold.
+      rate_mb_hour=$(( (delta_mb * 60) / elapsed_min ))
+      # A rate alone says a fall is fast; `trend` says which way. Label every
+      # measured interval, so `trend=falling` cannot mean "a number was computed"
+      # while the number is positive -- a consumer reading the level string and
+      # never comparing the sign would read a recovery as a leak.
       if [ "$delta_mb" -lt 0 ]; then
-        rate_mb_hour=$(( (delta_mb * 60) / elapsed_min ))
+        trend="falling"
+      elif [ "$delta_mb" -gt 0 ]; then
+        trend="rising"
       else
-        rate_mb_hour=$(( (delta_mb * 60) / elapsed_min ))
+        trend="steady"
       fi
-      trend="falling"
     fi
   fi
 
@@ -1178,17 +1230,32 @@ report() {
   # The threshold is a signed MiB/hour, so falling faster than it (more negative)
   # escalates and steady or rising does not. FALL_RATE_MB_PER_HOUR<=0 disables
   # the rate test, leaving the level-regression test alone.
-  if [ -n "$rate_mb_hour" ] && [ "$FALL_RATE_MB_PER_HOUR" -le 0 ] ||
-     { [ -n "$rate_mb_hour" ] && [ "$FALL_RATE_MB_PER_HOUR" -gt 0 ] && [ "$rate_mb_hour" -lt "$FALL_RATE_MB_PER_HOUR" ]; }; then
+  #
+  # A single `[ ]` test, not two joined by ||. The guard runs under
+  # `set -uo pipefail` without -e, but the branch still has to read as the
+  # positive form it is; an `A || B` where the first conjunct already carries the
+  # negation is how the escalation inverts into firing on *rising* space, which is
+  # the one condition that must never be an incident.
+  if [ -n "$rate_mb_hour" ] && [ "$rate_mb_hour" -lt "$FALL_RATE_MB_PER_HOUR" ]; then
     if [ "$rc" -lt 2 ]; then
       level="warn"; rc=2
     fi
     log "falling free space: ${rate_mb_hour}MiB/hour (${prev_avail_mb} -> ${avail_mb}MiB in ${elapsed_min}m); threshold ${FALL_RATE_MB_PER_HOUR}MiB/hour"
   fi
+  # A level regression is itself an escalation, not only a log line. `warn ->
+  # critical` used to be logged and then returned as warn, so a caller reading the
+  # exit code -- which is how a routine or a monitor decides -- saw the worse of the
+  # two levels reported as the milder one. The regression is what the level itself
+  # now says, so the status file and the exit code agree with the log.
   if [ -n "$level_prev" ] && [ "$level_prev" != "$level" ]; then
     case "$level_prev:$level" in
       ok:warn|ok:critical|warn:critical)
         log "level regressed $level_prev -> $level since the previous check"
+        ;;
+      critical:ok|critical:warn|warn:ok)
+        # Improved, not an incident. Recorded so a consumer can see the recovery,
+        # but never escalated: a volume that got better is not a finding.
+        log "level improved $level_prev -> $level since the previous check"
         ;;
     esac
   fi
@@ -1220,9 +1287,9 @@ report() {
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
     printf 'avail_mb_prev=%s\navail_mb_delta=%s\navail_mb_elapsed_minutes=%s\nfall_rate_mb_per_hour=%s\n' \
       "${prev_avail_mb:-}" "${delta_mb:-}" "${elapsed_min:-}" "${rate_mb_hour:-}"
-    printf 'level=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
-      "$level" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$FALL_RATE_MB_PER_HOUR"
-    printf 'guard_version=6\n'
+    printf 'level=%s\nlevel_snapshot=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
+      "$level" "${level_snapshot:-}" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$FALL_RATE_MB_PER_HOUR"
+    printf 'guard_version=7\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -1230,7 +1297,7 @@ report() {
 
 prune() {
   local before after p freed total=0
-  local lvl="" rc report_output
+  local lvl="" rc report_output snapshot_lvl=""
   local workspace_candidates=()
   local wt_candidates=()
   local cargo_target_candidates=()
@@ -1251,6 +1318,12 @@ prune() {
   # Only rc=1 counts as a measurement failure. report() also returns 2 (warn)
   # and 3 (critical) for successful measurements, so test the code exactly
   # rather than treating any non-zero status as an error.
+  # Capture the previous measurement in the *current* shell before report() runs.
+  # report() is invoked in a command substitution, so any state it sets for a
+  # later caller would be discarded with the subshell; doing it here is what makes
+  # the second report() (the --prune exit path) trend against the last check rather
+  # than against this process's own first measurement.
+  capture_prev_measurement
   report_output="$(report 2>/dev/null)"
   rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -1261,6 +1334,22 @@ prune() {
     2) lvl="warn" ;;
     3) lvl="critical" ;;
     *) lvl="ok" ;;
+  esac
+  # Deletion is authorised by *present pressure*, never by a trend. A volume that
+  # is measured ok right now is not under pressure, however fast it is falling;
+  # the trend is a reason to look again sooner or to page a human, not a licence to
+  # delete a cache, drop a build tree, or reclaim a hardlink-shared node_modules on
+  # a guess about the future. So the gate below uses the level the measurement
+  # itself produced (`level_snapshot`), not the level report() ended up publishing
+  # after the trend escalation. Reading the published level here would make every
+  # fast-falling-but-healthy volume reclaim on every tick.
+  #
+  # Unconditional, not just a downgrade of warn/critical: `lvl` currently holds the
+  # *published* level, which is warn purely because of the trend, so a conditional
+  # override would leave it at warn and prune anyway.
+  snapshot_lvl="$(status_field level_snapshot || true)"
+  case "$snapshot_lvl" in
+    ok|warn|critical) lvl="$snapshot_lvl" ;;
   esac
   if [ "$lvl" != "warn" ] && [ "$lvl" != "critical" ] && [ "${DISK_GUARD_FORCE:-0}" != "1" ]; then
     printf 'prune_skipped=level_%s\n' "$lvl"

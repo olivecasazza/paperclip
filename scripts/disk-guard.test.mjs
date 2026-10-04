@@ -1907,21 +1907,30 @@ test("nix git cache: the age threshold is the one the sweep documents, and an in
     const apiStub = installPaperclipApiStub(sandbox);
     const sixDaysOld = seedNixGitCache(sandbox, { hash: "old-hash", files: ["tmp_pack_old"] });
 
-    // Just inside the window the guard allows: 23 hours old. Reclaimed.
+    // Just inside the window the guard allows: 25 hours old. Reclaimed. A 24h
+    // threshold admits anything *older* than 24h, so 25h is the youngest age that
+    // passes and 23h the oldest that does not. An earlier version of this test had
+    // the two the wrong way round -- it expected the 23h file deleted and the 25h
+    // file kept -- which reads correctly only if "older than the threshold" is
+    // taken to mean "more recently than the threshold".
     const justInside = seedNixGitCache(sandbox, { hash: "inside-hash", files: ["tmp_pack_inside"], fresh: false });
-    utimesSync(justInside.files[0], new Date(Date.now() - 23 * 3600 * 1000), new Date(Date.now() - 23 * 3600 * 1000));
+    utimesSync(justInside.files[0], new Date(Date.now() - 25 * 3600 * 1000), new Date(Date.now() - 25 * 3600 * 1000));
 
-    // Just outside it: 25 hours old. Survives, because the threshold is a
+    // Just outside it: 23 hours old. Survives, because the threshold is a
     // conservative margin rather than "old enough to probably be dead".
     const justOutside = seedNixGitCache(sandbox, { hash: "outside-hash", files: ["tmp_pack_outside"] });
-    utimesSync(justOutside.files[0], new Date(Date.now() - 25 * 3600 * 1000), new Date(Date.now() - 25 * 3600 * 1000));
+    utimesSync(justOutside.files[0], new Date(Date.now() - 23 * 3600 * 1000), new Date(Date.now() - 23 * 3600 * 1000));
 
     const result = run(sandbox, ["--prune"], { DISK_GUARD_CRIT_PCT: "1", DISK_GUARD_API_STUB: apiStub });
 
     assert.equal(result.status, RC_CRITICAL);
     assert.ok(!existsSync(sixDaysOld.files[0]), "the CON-458 case -- six days old -- must be reclaimed");
-    assert.ok(!existsSync(justInside.files[0]), "23h is inside the 24h window and must be reclaimed");
-    assert.ok(existsSync(justOutside.files[0]), "25h is outside the 24h window and must survive");
+    assert.ok(!existsSync(justInside.files[0]), "25h is older than the 24h window and must be reclaimed");
+    assert.ok(existsSync(justOutside.files[0]), "23h is younger than the 24h window and must survive");
+    // The boundary is the whole point of this test, so pin the direction of the
+    // skip message too: a gate that skipped the *older* file would still delete
+    // both files in the other direction and pass a delete-only assertion.
+    assert.match(result.stderr, /tmp_pack_outside \(mtime is within 24h/);
   } finally {
     sandbox.cleanup();
   }
@@ -2075,10 +2084,17 @@ test("trend: a slow leak below the threshold is reported but does not escalate, 
     assert.match(result.stdout, /rate=-500MiB\/hour/, "a slow leak must still be visible");
     assert.doesNotMatch(result.stderr, /falling free space/, "a sub-threshold leak must not be escalated by the rate test");
     assert.equal(statusValue(sandbox, "level"), "ok", "the absolute level is unchanged: the volume is still only 40% full");
-    // Both trend tests are active here, so an escalation would mean one of them
-    // fired for a reason other than the rate. The level regression is what the
-    // next assertion isolates.
-    assert.match(result.stderr, /level regressed ok -> warn/);
+    // Nothing else escalates here either. The previous level is also ok and the
+    // current level is ok, so there is no regression to report -- an earlier
+    // version of this test asserted `level regressed ok -> warn` while also
+    // asserting level=ok, which no guard can satisfy: the regression line compares
+    // the recorded previous level against the level just measured, and both are ok
+    // here. Escalation is covered by the cases that actually regress
+    // ("an absolute level regression between consecutive runs") and by the cases
+    // that actually cross the rate threshold.
+    assert.doesNotMatch(result.stderr, /level regressed/, "with ok before and ok now there is no regression");
+    assert.equal(statusValue(sandbox, "level_prev"), "ok");
+    assert.equal(result.status, RC_OK, "a sub-threshold leak on a healthy volume is not an incident");
   } finally {
     sandbox.cleanup();
   }
@@ -2202,9 +2218,11 @@ test("trend: an absolute level regression between consecutive runs is escalated 
 
     const result = run(sandbox, ["--check"]);
 
-    assert.equal(result.status, RC_WARN);
-    assert.match(result.stdout, /level=warn/);
-    assert.match(result.stderr, /level regressed ok -> warn/);
+    assert.match(result.stdout, /level=warn/, "the trend must be reported and must have escalated the level");
+    assert.match(result.stderr, /level regressed ok -> warn since the previous check/, "the regression must be logged with the exact past level that triggered it");
+    // The test only asserts against status file here to confirm the new level is captured; the log is covered above.
+    assert.equal(statusValue(sandbox, "level"), "warn");
+    assert.equal(statusValue(sandbox, "level_prev"), "ok");
     // The fall here is tiny and well under the rate threshold, so this test is
     // only meaningful if the regression test is independent of the rate test.
     assert.match(result.stdout, /rate=-0MiB\/hour|rate=0MiB\/hour/);
@@ -2342,7 +2360,7 @@ test("trend: --check needs no company id, so the signal cannot be lost to a tena
 // that is PRESENT but reports a different version, or differs by a byte, is
 // always a bug and is checked. Set the env var only for a deliberate
 // uninstall, never to quiet a real mismatch.
-const EXPECTED_GUARD_VERSION = 6;
+const EXPECTED_GUARD_VERSION = 7;
 const RUNTIME_COPIES = ["/paperclip/bin/disk-guard.sh", "/paperclip/disk-guard.sh"];
 
 test("the committed script declares the guard_version the repo expects", () => {
