@@ -486,6 +486,14 @@ export async function settleUnrecoverableExecutions(
             .update(issues)
             .set({
               status: "blocked",
+              // Automatic recovery stops here with no dependency to resolve, so
+              // the issue would be stranded without a stated unblock path. The
+              // note above already says what an operator must do next; record it
+              // as the descriptor rather than leaving the block unexplained.
+              unblockDescriptor: {
+                owner: "board",
+                action: note,
+              },
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,

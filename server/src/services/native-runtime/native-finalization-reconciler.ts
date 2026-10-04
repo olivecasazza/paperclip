@@ -171,6 +171,15 @@ type NativeCleanupSweep = {
 };
 const nativeCleanupSweeps = new WeakMap<Db, NativeCleanupSweep>();
 
+/**
+ * Operator instruction for a native session whose persisted state is ambiguous
+ * and cannot be resumed safely. Shared by the issue's `unblockDescriptor` and
+ * the recovery action's `nextAction`, so the instruction recorded for the board
+ * is also the issue's stated unblock path rather than living only on the action.
+ */
+const AMBIGUOUS_NATIVE_SESSION_ACTION =
+  "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.";
+
 /** Candidate discovery is not cleanup authority. The exact-state operation
  * claims its own durable lease and rechecks every physical owner. Keep this
  * lane joined and bounded, and advance even past ineligible candidates so one
@@ -469,7 +478,15 @@ export async function claimNativeSessionResumptions(input: {
           updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
-          { status: "blocked" },
+          {
+            status: "blocked",
+            // A board-owned hold with no dependency to resolve; without a
+            // descriptor this write strands the issue.
+            unblockDescriptor: {
+              owner: "board",
+              action: AMBIGUOUS_NATIVE_SESSION_ACTION,
+            },
+          },
           tx,
         );
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
@@ -488,7 +505,7 @@ export async function claimNativeSessionResumptions(input: {
             providerEventsExist: providerEvent !== null,
             originalFailureCode,
           },
-          nextAction: "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.",
+          nextAction: AMBIGUOUS_NATIVE_SESSION_ACTION,
           wakePolicy: null,
           maxAttempts: 3,
           supersedeOnIdentityChange: true,
