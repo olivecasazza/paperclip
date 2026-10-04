@@ -8,11 +8,12 @@ import {
   issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
-import { afterAll, afterEach, beforeAll, describe } from "vitest";
+import { afterAll, afterEach, beforeAll } from "vitest";
 import { errorHandler } from "../../middleware/index.js";
 import { ensureHumanRoleDefaultGrants } from "../../services/principal-access-compatibility.js";
 import {
   getEmbeddedPostgresTestSupport,
+  resolveEmbeddedPostgresDescribe,
   startEmbeddedPostgresTestDatabase,
 } from "./embedded-postgres.js";
 
@@ -20,8 +21,16 @@ type Db = ReturnType<typeof createDb>;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 
-/** `describe` on hosts that can run embedded Postgres, `describe.skip` elsewhere. */
-export const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+/**
+ * `describe` on hosts that can run embedded Postgres. An unsupported host
+ * registers a hard failure instead of skipping silently — see
+ * `resolveEmbeddedPostgresDescribe`. Locally it still degrades to
+ * `describe.skip` with a visible warning.
+ */
+export const describeEmbeddedPostgres = resolveEmbeddedPostgresDescribe(
+  embeddedPostgresSupport,
+  { sourceFile: "server/src/__tests__/helpers/route-test-harness.ts" },
+);
 
 export type EmbeddedPostgresContext = { readonly db: Db };
 

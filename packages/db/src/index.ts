@@ -16,9 +16,15 @@ export {
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
+  resolveEmbeddedPostgresGate,
+  resolveEmbeddedPostgresUnavailablePolicy,
+  isEmbeddedPostgresCiHost,
+  EMBEDDED_POSTGRES_CI_ENV_VARS,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   type EmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestSupport,
+  type EmbeddedPostgresGate,
+  type EmbeddedPostgresUnavailablePolicy,
 } from "./test-embedded-postgres.js";
 export {
   runDatabaseBackup,

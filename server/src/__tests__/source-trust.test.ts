@@ -13,11 +13,14 @@ import {
 } from "../services/source-trust.js";
 import {
   getEmbeddedPostgresTestSupport,
+  resolveEmbeddedPostgresDescribe,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const describeEmbeddedPostgres = resolveEmbeddedPostgresDescribe(embeddedPostgresSupport, {
+  sourceFile: "server/src/__tests__/source-trust.test.ts",
+});
 
 const quarantinedSourceTrust = {
   preset: LOW_TRUST_REVIEW_PRESET,
