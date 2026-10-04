@@ -207,6 +207,26 @@ unlinked_bytes() {
   find "$1" -xdev -type f -links 1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
 }
 
+# Whether anything under $2 is newer than the cutoff epoch.
+#
+# Replaces taking the newest mtime with a full sort. The only question any
+# caller asks is "is anything here newer than the cutoff", so find can stop at
+# the first entry that answers it: -print -quit short-circuits and nothing is
+# sorted, so cost becomes the position of the first fresh entry rather than the
+# size of the tree.
+#
+# The comparison is -newermt "@$((cutoff - 1))", not "@$cutoff", and that
+# difference is load-bearing: callers skip when newest >= cutoff while -newermt
+# is strictly newer, so testing the raw cutoff would let a candidate whose
+# newest mtime is exactly the cutoff through as reclaimable where the old gate
+# skipped it. Stepping back one second makes "mtime > cutoff-1" identical to
+# "mtime >= cutoff" on whole seconds, which is the resolution compared here.
+tree_has_entry_newer_than() {
+  local cutoff="$1" dir="$2"
+  [ -d "$dir" ] || return 1
+  find "$dir" -xdev -newermt "@$(( cutoff - 1 ))" -print -quit 2>/dev/null
+}
+
 newest_mtime_epoch() {
   find "$1" -xdev -printf '%T@\n' 2>/dev/null | sort -nr | awk 'NR==1{printf "%d\n", $1; exit}'
 }
@@ -545,8 +565,7 @@ workspace_reclaim_candidates() {
           log "skip  $p (contains tracked files)"
           continue
         fi
-        newest="$(newest_mtime_epoch "$p")"
-        if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+        if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
           log "skip  $p (newest mtime under ${WORKSPACE_RECLAIM_MIN_AGE_HOURS}h)"
           continue
         fi
@@ -612,8 +631,7 @@ wt_reclaim_candidates() {
         log "skip  $p (contains tracked files)"
         continue
       fi
-      newest="$(newest_mtime_epoch "$p")"
-      if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+      if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
         log "skip  $p (newest mtime under ${WT_RECLAIM_MIN_AGE_HOURS}h)"
         continue
       fi
@@ -686,8 +704,7 @@ shared_cargo_target_candidate() {
     log "skip  $p (outside cargo-target-shared)"
     return 1
   }
-  newest="$(newest_mtime_epoch "$p")"
-  if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+  if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
     log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
     return 1
   fi
@@ -747,8 +764,7 @@ cargo_target_reclaim_candidates() {
       log "skip  $p (outside cargo-target-shared)"
       continue
     }
-    newest="$(newest_mtime_epoch "$p")"
-    if [ -z "$newest" ] || [ "$newest" -ge "$cutoff" ]; then
+    if [ "$(tree_has_entry_newer_than "$cutoff" "$p")" ]; then
       log "skip  $p (newest mtime under ${CARGO_TARGET_RECLAIM_MIN_AGE_HOURS}h)"
       continue
     fi
