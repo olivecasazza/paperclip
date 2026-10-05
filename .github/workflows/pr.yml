@@ -40,6 +40,7 @@ jobs:
         run: pnpm run test:disk-guard
 
   ci:
+    needs: [disk-guard]
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
