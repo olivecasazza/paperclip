@@ -28,6 +28,20 @@ export const MAX_ITERATIONS = 20;
 const DEFAULT_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 /**
+ * Escape hatch: `HEARTBEAT_RUN_PAYLOAD_RETENTION=0` disables the sweep entirely.
+ *
+ * The sweep is opt-out rather than opt-in because the default is the historical
+ * behaviour, but it runs an unbounded-write `UPDATE` against `heartbeat_runs` on
+ * startup. On a deployment whose pool is already saturated that is the worst
+ * possible first query, and until the reclaim semantics are settled (see the
+ * docstring on `pruneHeartbeatRunPayloads`) there is a real argument for running
+ * it nowhere at all. Operators need a way to say that without a redeploy.
+ */
+function isRetentionSweepEnabled(): boolean {
+  return process.env.HEARTBEAT_RUN_PAYLOAD_RETENTION !== "0";
+}
+
+/**
  * Statuses that can never transition again. A run in any of these has settled,
  * so nothing will read its payload back on behalf of a live execution.
  */
@@ -134,9 +148,31 @@ function trimCandidates(cutoff: Date) {
  * roughly 90% of the bytes on an aged run.
  *
  * Row removal itself is deliberately out of scope: see CON-436 item 1. This
- * recovers the space without foreclosing that decision, and because the heavy
- * columns live in TOAST, nulling them lets the space be returned to the OS
- * instead of only shrinking future inserts.
+ * clears the heavy values without foreclosing that decision, and because the
+ * heavy columns live in TOAST, nulling them keeps future inserts and index
+ * scans from carrying those chunks.
+ *
+ * **This does not return the space to the OS.** An earlier version of this
+ * comment claimed it did; that was wrong, and measured on the production
+ * relation it is wrong by a wide margin. `UPDATE` writes new tuple versions, so
+ * the superseded TOAST chunks stay on disk as dead space. `VACUUM` records them
+ * as reusable but does not release them; releasing them needs `VACUUM FULL`
+ * (an `ACCESS EXCLUSIVE` rewrite, not viable on a live pool) or `pg_repack`.
+ *
+ * Measured on production before and after sweeping the whole candidate set:
+ * the relation stayed at 1041 MB total / 930 MB TOAST, unchanged, including
+ * across a real `VACUUM`. What this sweep genuinely buys is smaller rows for
+ * every future read of them — not reclaimed disk. Treat it as write-amplification
+ * for a modest read win, and weigh that against the sweep's own I/O before
+ * enabling it on a saturated pool.
+ *
+ * It also does not address pool starvation directly. The list query that
+ * saturates the pool is `created_at DESC` — newest first — so it reads the
+ * cohort *inside* the window. On production the two cohorts are roughly
+ * inverted with respect to this sweep's target: ~369 MB of `result_json` sits
+ * inside the 30-day window that the hot query reads on every call, while the
+ * ~191 MB beyond it is what this predicate would rewrite. The starvation fix
+ * belongs in the list query and the pool sizing, not here.
  *
  * Batching matters here and is not an optimisation. These columns live in
  * TOAST, so one statement over an unbounded candidate set rewrites hundreds of
@@ -214,6 +250,14 @@ export function startHeartbeatRunPayloadRetention(
   intervalMs: number = DEFAULT_SWEEP_INTERVAL_MS,
   retentionDays: number = DEFAULT_RETENTION_DAYS,
 ): () => void {
+  if (!isRetentionSweepEnabled()) {
+    logger.warn(
+      { retentionDays },
+      "Heartbeat run payload retention sweep disabled by HEARTBEAT_RUN_PAYLOAD_RETENTION=0",
+    );
+    return () => {};
+  }
+
   const timer = setInterval(() => {
     pruneHeartbeatRunPayloads(db, retentionDays).catch((err) => {
       logger.warn({ err }, "Heartbeat run payload retention sweep failed");

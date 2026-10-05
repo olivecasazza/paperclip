@@ -25,6 +25,7 @@ vi.mock("../middleware/logger.js", () => ({
 import {
   MAX_ITERATIONS,
   pruneHeartbeatRunPayloads,
+  startHeartbeatRunPayloadRetention,
   TRIM_BATCH_SIZE,
 } from "../services/heartbeat-run-payload-retention.ts";
 
@@ -286,5 +287,53 @@ describeEmbeddedPostgres("pruneHeartbeatRunPayloads", () => {
     const second = await pruneHeartbeatRunPayloads(db, 30);
     expect(second).toBe(25);
     expect(await pruneHeartbeatRunPayloads(db, 30)).toBe(0);
+  }, 120_000);
+  it("does not touch aged rows when the sweep is disabled", async () => {
+    // The sweep fires on startup and is fire-and-forget, so this has to wait for
+    // the async work rather than assert synchronously -- otherwise the assertion
+    // runs before the sweep has claimed a batch and passes vacuously.
+    const id = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id,
+      companyId,
+      agentId,
+      status: "succeeded",
+      createdAt: daysAgo(200),
+      finishedAt: daysAgo(200),
+      contextSnapshot: { issueId: randomUUID() },
+      resultJson: { output: "x".repeat(64) },
+      usageJson: { totalTokens: 1 },
+    });
+
+    const previous = process.env.HEARTBEAT_RUN_PAYLOAD_RETENTION;
+    process.env.HEARTBEAT_RUN_PAYLOAD_RETENTION = "0";
+    let stop = () => {};
+    try {
+      stop = startHeartbeatRunPayloadRetention(db as never, 5);
+    } finally {
+      if (previous === undefined) delete process.env.HEARTBEAT_RUN_PAYLOAD_RETENTION;
+      else process.env.HEARTBEAT_RUN_PAYLOAD_RETENTION = previous;
+    }
+    stop();
+
+    // Generous wait: with the guard removed this row is trimmed, with the guard
+    // in place it is never touched.
+    await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select({ resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, id));
+        expect(rows[0]?.resultJson).not.toBeNull();
+      },
+      { timeout: 2000, interval: 50 },
+    );
+
+    const rows = await db
+      .select({ resultJson: heartbeatRuns.resultJson, usageJson: heartbeatRuns.usageJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, id));
+    expect(rows[0]?.resultJson).not.toBeNull();
+    expect(rows[0]?.usageJson).not.toBeNull();
   }, 120_000);
 });
