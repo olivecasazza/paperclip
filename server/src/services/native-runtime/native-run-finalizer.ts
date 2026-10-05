@@ -438,13 +438,27 @@ async function recordRetryableFailure(input: {
         tx,
       );
     } else if (exhausted) {
+      const blocksForUnrecoverableWorkspace = Boolean(
+        input.permanent && input.failureScope === "workspace",
+      );
       await issueService(tx as unknown as Db).update(
         input.coordinator.issueId,
         {
-          status:
-            input.permanent && input.failureScope === "workspace"
-              ? "blocked"
-              : "in_review",
+          status: blocksForUnrecoverableWorkspace ? "blocked" : "in_review",
+          // An unrecoverable workspace sync-out leaves nothing to resolve, so
+          // the hold needs its own unblock path. `input.nextAction` is the same
+          // operator instruction already recorded on the failure detail above;
+          // reusing it keeps the issue and the recovery record in agreement.
+          ...(blocksForUnrecoverableWorkspace
+            ? {
+                unblockDescriptor: {
+                  owner: "board" as const,
+                  action:
+                    input.nextAction ??
+                    "Reconcile the execution workspace and resolve the preserved work, then move this issue out of `blocked`.",
+                },
+              }
+            : {}),
         },
         tx,
       );

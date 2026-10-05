@@ -27648,6 +27648,15 @@ export function heartbeatService(
                 .update(issues)
                 .set({
                   status: "blocked",
+                  // This block is an unrunnable-workspace configuration hold with
+                  // no dependency to resolve, so without a descriptor the issue
+                  // is stranded: nothing can fire `issue_blockers_resolved` and
+                  // no heartbeat will pick it up. The remediation is already
+                  // computed above; carry it onto the issue itself.
+                  unblockDescriptor: {
+                    owner: "board",
+                    action: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                  },
                   checkoutRunId: null,
                   executionRunId: null,
                   executionAgentNameKey: null,

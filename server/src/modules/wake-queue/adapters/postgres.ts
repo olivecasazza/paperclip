@@ -712,6 +712,15 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
   };
 }
 
+/**
+ * Operator instruction for a native continuation that died and cannot be
+ * auto-reconciled. Shared by the issue's `unblockDescriptor` and the recovery
+ * action's `nextAction` so the two cannot drift apart: the action text is only
+ * useful to a human if it is also the issue's stated unblock path.
+ */
+const NATIVE_CONTINUATION_RECONCILE_ACTION =
+  "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
+
 async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow, issue: IssueRow, now: Date): Promise<boolean> {
   const applies =
     run.runtimeMode === "native" &&
@@ -736,7 +745,20 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     .limit(1);
   let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
   if (issue.status !== "blocked") {
-    const projected = await issueService(tx).update(issue.id, { status: "blocked" }, tx);
+    // This is a board-owned reconciliation hold with no dependency to resolve.
+    // Persisting bare `blocked` here strands the issue, so carry the same
+    // operator instruction the recovery action below records onto the issue.
+    const projected = await issueService(tx).update(
+      issue.id,
+      {
+        status: "blocked",
+        unblockDescriptor: {
+          owner: "board",
+          action: NATIVE_CONTINUATION_RECONCILE_ACTION,
+        },
+      },
+      tx,
+    );
     if (projected) {
       nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
       await tx.insert(activityLog).values({
@@ -783,8 +805,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       cause: "native_continuation_requires_reconciliation",
       fingerprint: `native-continuation:${run.id}`,
       evidence: { runId: run.id, originalFailureCode: run.errorCode, ...(nativeFailureBlock ? { nativeFailureBlock } : {}) },
-      nextAction:
-        "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
+      nextAction: NATIVE_CONTINUATION_RECONCILE_ACTION,
       maxAttempts: 3,
       wakePolicy: null,
       supersedeOnIdentityChange: true,

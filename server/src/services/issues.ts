@@ -10690,17 +10690,17 @@ export function issueService(db: Db) {
       ) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const dependencyReadinessForTransition =
+        patch.status === "in_progress" || patch.status === "blocked"
+          ? (
+              await listIssueDependencyReadinessMap(
+                dbOrTx,
+                existing.companyId,
+                [id],
+              )
+            ).get(id)
+          : null;
       if (patch.status === "in_progress") {
-        const dependencyReadiness =
-          blockedByIssueIds === undefined
-            ? (
-                await listIssueDependencyReadinessMap(
-                  dbOrTx,
-                  existing.companyId,
-                  [id],
-                )
-              ).get(id)
-            : null;
         const unresolvedBlockerIssueIds =
           blockedByIssueIds !== undefined
             ? await listUnresolvedBlockerIssueIds(
@@ -10708,18 +10708,85 @@ export function issueService(db: Db) {
                 existing.companyId,
                 blockedByIssueIds,
               )
-            : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
+            : (dependencyReadinessForTransition?.unresolvedBlockerIssueIds ?? []);
         if (unresolvedBlockerIssueIds.length > 0) {
           const unresolvedBlockers = await listUnresolvedBlockerDetails(
             dbOrTx,
             existing.companyId,
             unresolvedBlockerIssueIds,
-            dependencyReadiness?.pendingFinalizeBlockerIssueIds,
+            dependencyReadinessForTransition
+              ?.pendingFinalizeBlockerIssueIds,
           );
           throw unprocessable("Issue is blocked by unresolved blockers", {
             unresolvedBlockerIssueIds,
             unresolvedBlockers,
           });
+        }
+      }
+      // A blocked issue with no unresolved blocker, no pending interaction or
+      // approval, and no unblockDescriptor is unresolvable by construction:
+      // `issue_blockers_resolved` can never fire and no heartbeat will pick it
+      // up. The route guard cannot catch this because writers such as the
+      // terminal-run-recovery classifier call this service directly, so the
+      // zero-signal check lives here and covers every writer. Actor type is
+      // deliberately not consulted.
+      //
+      // Only a real transition *into* blocked is checked, matching the route
+      // guard. Writers that re-persist an existing `blocked` status while
+      // changing something else (reassignment, version bumps) must not be
+      // rejected: they do not create the stranded state, and the issue was
+      // already blocked before they ran.
+      const enteringBlocked =
+        patch.status === "blocked" && existing.status !== "blocked";
+      if (enteringBlocked) {
+        const nextUnblockDescriptor =
+          issueData.unblockDescriptor !== undefined
+            ? issueData.unblockDescriptor
+            : existing.unblockDescriptor;
+        const unresolvedBlockerIssueIds =
+          blockedByIssueIds !== undefined
+            ? await listUnresolvedBlockerIssueIds(
+                dbOrTx,
+                existing.companyId,
+                blockedByIssueIds,
+              )
+            : (dependencyReadinessForTransition?.unresolvedBlockerIssueIds ?? []);
+        const [pendingInteraction, pendingApproval] = await Promise.all([
+          dbOrTx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, existing.companyId),
+                eq(issueThreadInteractions.issueId, id),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+          dbOrTx
+            .select({ id: approvals.id })
+            .from(issueApprovals)
+            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+            .where(
+              and(
+                eq(issueApprovals.companyId, existing.companyId),
+                eq(issueApprovals.issueId, id),
+                eq(approvals.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+        ]);
+        if (
+          unresolvedBlockerIssueIds.length === 0 &&
+          !pendingInteraction &&
+          !pendingApproval &&
+          !nextUnblockDescriptor
+        ) {
+          throw unprocessable(
+            "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+          );
         }
       }
       const shouldValidateNextAssignee =

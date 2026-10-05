@@ -2734,8 +2734,24 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
+    const blockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    // A recovery issue parked in place has no blocker to resolve, so the
+    // operator instruction is the only signal that can make it resolvable.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(blockerIds.length ? { blockedByIssueIds: blockerIds } : {}),
+      ...(blockerIds.length
+        ? {}
+        : {
+            unblockDescriptor: {
+              owner: "board" as const,
+              action:
+                "Inspect the stranded recovery evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+            },
+          }),
     });
     if (!updated) return null;
 
@@ -3586,8 +3602,23 @@ export function recoveryService(
         ),
       );
 
+    const dispositionRepairBlockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    // Disposition repair escalates to the board with no blocker to resolve, so
+    // it must carry the operator instruction it just recorded on the action.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(dispositionRepairBlockerIds.length
+        ? { blockedByIssueIds: dispositionRepairBlockerIds }
+        : {
+            unblockDescriptor: {
+              owner: "board" as const,
+              action:
+                "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+            },
+          }),
     });
     if (!updated) return null;
     const sourceAssigneePreserved =
@@ -3942,9 +3973,26 @@ export function recoveryService(
       input.issue.companyId,
       input.issue.id,
     );
+    // With no unresolved blocker, `blocked` alone leaves the issue
+    // unresolvable by construction: nothing can fire `issue_blockers_resolved`
+    // and no heartbeat will pick it up. The recovery action just created is the
+    // real signal, so carry its operator instruction onto the issue instead of
+    // persisting an empty blocker set and no descriptor. The service-layer
+    // zero-signal guard rejects this write otherwise.
+    const unblockDescriptor = blockerIds.length
+      ? null
+      : {
+          owner: (
+            recoveryAction.ownerAgentId
+              ? { agentId: recoveryAction.ownerAgentId }
+              : "board"
+          ) as { agentId: string } | "board",
+          action: recoveryAction.nextAction,
+        };
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;

@@ -707,7 +707,7 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(generationIssueId).toBeTruthy();
 
     // The setup run gets stuck and blocks the task instead of writing a summary.
-    await issueService(db).update(generationIssueId, { status: "blocked" });
+    await issueService(db).update(generationIssueId, { status: "blocked", unblockDescriptor: { owner: "board", action: "Setup run got stuck; resolve the stuck setup before rerunning." } });
 
     // The card releases its generation claim, so the tile stops spinning and the
     // board offers "Run now" again (generatingIssueId null → not "setup running").
