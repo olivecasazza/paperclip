@@ -246,6 +246,7 @@ import {
   noticeMetadataReferencesRecoveryAction,
 } from "../services/recovery/index.ts";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -6952,6 +6953,222 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(snapshot).toEqual({ kind: "disposition_repair_escalated", actionId: action!.id, assigneeAgentId: agentId, attemptCount: 5, maxAttempts: 5, reason: "unchanged_source_state_exhausted" });
     expect(substituteWakes).toHaveLength(0);
     expect(sourceAttemptSix).toHaveLength(0);
+  });
+
+  it("terminates an exhausted disposition repair whose final attempt failed", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "adapter_failed",
+        retryReason: "issue_disposition_repair",
+        runSource: "issue.deliberate_wait_disposition_repair",
+      });
+    // The bounded legacy budget is 2: attempt 1 is persisted on the action and
+    // the run that spends attempt 2 fails. This is the stranded shape recorded
+    // on CON-115/116/123/153/154/155 (action active, agent-owned, 2/2 spent,
+    // last attempt `failed`, no monitor, no scheduled retry).
+    const fingerprint = legacyDispositionFingerprint(companyId, issueId, agentId, runId);
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target",
+      fingerprint,
+      evidence: { sourceIssueId: issueId, latestRunId: runId },
+      nextAction: "The original owner must replace the parked summary with a durable disposition.",
+      wakePolicy: {
+        type: "bounded_owner_disposition_repair",
+        retryAgentId: agentId,
+        attempt: 1,
+        maxAttempts: 2,
+      },
+      maxAttempts: 2,
+      attemptCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_disposition_repair",
+          retryReason: "issue_disposition_repair",
+          source: "issue.deliberate_wait_disposition_repair",
+          dispositionRepairFingerprint: fingerprint,
+          dispositionRepairAttempt: 2,
+          dispositionRepairMaxAttempts: 2,
+          legacyDispositionEpisode: { id: runId, attempt: 2, maxAttempts: 2 },
+          dispositionRepairSourceRunId: runId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const action = (
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        .then((rows) => rows[0]!)
+    );
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    const [settled, sourceAfter] = await Promise.all([
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id))
+        .then((rows) => rows[0]!),
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!),
+    ]);
+    // The action must leave the active set without a human PATCH, and hand the
+    // source issue to the board on the only shape the retry gate accepts.
+    expect(settled.status).toBe("active");
+    expect(settled.ownerType).toBe("board");
+    expect(settled.wakePolicy).toMatchObject({
+      type: "board_escalation",
+      reason: "unchanged_source_state_exhausted",
+      preservesSourceAssignee: true,
+    });
+    expect(settled.returnOwnerAgentId).toBe(agentId);
+    expect(sourceAfter).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: null,
+    });
+    // The hand-back is now reachable instead of dead-ending on a stale gate.
+    const retried = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(retried.status).toBe("blocked");
+    expect(await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId)).toMatchObject({
+      id: action.id,
+      ownerType: "board",
+    });
+  });
+
+  it("leaves a non-exhausted failed disposition repair to its bounded retry", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "adapter_failed",
+        retryReason: "issue_disposition_repair",
+        runSource: "issue.deliberate_wait_disposition_repair",
+      });
+    const fingerprint = legacyDispositionFingerprint(companyId, issueId, agentId, runId);
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target",
+      fingerprint,
+      evidence: { sourceIssueId: issueId, latestRunId: runId },
+      nextAction: "The original owner must replace the parked summary with a durable disposition.",
+      wakePolicy: {
+        type: "bounded_owner_disposition_repair",
+        retryAgentId: agentId,
+        attempt: 1,
+        maxAttempts: 2,
+      },
+      maxAttempts: 2,
+      attemptCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    // Attempt 1 of 2 ran and produced no disposition, so the budget is still
+    // live. The action must stay agent-owned with its bounded retry intact
+    // instead of being escalated to the board.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        errorCode: null,
+        error: null,
+        finishedAt: new Date(),
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_disposition_repair",
+          retryReason: "issue_disposition_repair",
+          source: "issue.deliberate_wait_disposition_repair",
+          dispositionRepairFingerprint: fingerprint,
+          dispositionRepairAttempt: 1,
+          dispositionRepairMaxAttempts: 2,
+          legacyDispositionEpisode: { id: runId, attempt: 1, maxAttempts: 2 },
+          dispositionRepairSourceRunId: runId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const action = (
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        .then((rows) => rows[0]!)
+    );
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+
+    const [untouched, sourceAfter] = await Promise.all([
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id))
+        .then((rows) => rows[0]!),
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!),
+    ]);
+    expect(untouched).toMatchObject({
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+    });
+    // The bounded retry still fires: attempt 2 of 2 is reserved for the owner
+    // rather than terminating the action.
+    expect(untouched.attemptCount).toBe(2);
+    expect(untouched.wakePolicy).toMatchObject({
+      type: "bounded_owner_disposition_repair",
+      attempt: 2,
+      maxAttempts: 2,
+    });
+    expect(sourceAfter.status).toBe("in_progress");
+    expect(
+      await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'dispositionRepairAttempt' = '2'`,
+          ),
+        ),
+    ).toHaveLength(1);
   });
 
   it("routes a non-invokable source owner to recovery without reassigning the source", async () => {
