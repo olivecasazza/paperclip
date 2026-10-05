@@ -37,7 +37,13 @@ jobs:
           run_install: false
 
       - name: Test disk-pressure guard thresholds and reclaim gate
-        run: pnpm run test:disk-guard
+        run: |
+          stub_bin="$RUNNER_TEMP/disk-guard-process-stubs"
+          mkdir -p "$stub_bin"
+          printf '#!/bin/sh\nexit 1\n' > "$stub_bin/pgrep"
+          printf '#!/bin/sh\nexit 1\n' > "$stub_bin/pidof"
+          chmod +x "$stub_bin/pgrep" "$stub_bin/pidof"
+          PATH="$stub_bin:$PATH" pnpm run test:disk-guard
 
   ci:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
