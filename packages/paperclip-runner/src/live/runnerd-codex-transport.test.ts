@@ -4489,10 +4489,8 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         ).toBe(true);
         if (mode === "lost-ack") {
           expect(retired.connectionCount).toBeGreaterThanOrEqual(2);
-          expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(2);
-        } else {
-          expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
         }
+        expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
         await vi.waitFor(async () =>
           expect((await readRunner()).runId).toBe("run-warm-ack-next"),
         );
