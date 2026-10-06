@@ -3131,20 +3131,53 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
+    const recordCommittedEvent = (): boolean => {
+      if (existing !== undefined) {
+        existing.deliveryCount += 1;
+        this.#store.state.replayDeliveries += 1;
+      } else {
+        if (this.#store.state.committedEvents.length >= maxCommittedEventWindow) {
+          const currentEviction = this.#store.state.committedEvents.findIndex(
+            (candidate) => !unsettledSemanticInput(candidate, this.#store.state),
+          );
+          if (currentEviction < 0) return false;
+          this.#store.state.committedEvents.splice(currentEviction, 1);
+        }
+        this.#store.state.committedEvents.push({
+          sourceSeq,
+          sourceEventId,
+          eventType,
+          priority,
+          envelope: structuredClone(envelope),
+          deliveryCount: 1,
+          logicalEffectCount: 1,
+        });
+        this.#store.state.ackedSourceSeq = sourceSeq;
+      }
+      this.#store.save();
+      return true;
+    };
+
     // The caller's durable commit is the acknowledgement authority. A crash
     // after that idempotent commit but before the local cursor save is safe:
     // the runner replays the event, the caller observes a duplicate, and only
     // then do we advance the cumulative cursor. Reversing this order can make
     // an uncommitted event disappear from the runner outbox permanently.
-    try {
-      await this.#onCommittedEvent?.(event);
-    } catch (error) {
-      if (error instanceof NativeSessionProtocolIntegrityError) {
-        this.#failProtocolIntegrity(connection, error);
-      } else {
+    if (existing === undefined) {
+      try {
+        await this.#onCommittedEvent?.(event);
+      } catch (error) {
+        if (error instanceof NativeSessionProtocolIntegrityError) {
+          this.#failProtocolIntegrity(connection, error);
+          return;
+        }
+        if (this.#protocolIntegrityError === null && !recordCommittedEvent()) {
+          connection.close();
+          return;
+        }
         connection.close();
+        return;
       }
-      return;
     }
     // Another authenticated connection can replace this one while its commit
     // is in flight. Once that exact owner has faulted, even a prior successful
@@ -3154,35 +3187,10 @@ export class DurablePrpControlPlane {
       return;
     }
 
-    if (existing !== undefined) {
-      existing.deliveryCount += 1;
-      this.#store.state.replayDeliveries += 1;
-    } else {
-      if (this.#store.state.committedEvents.length >= maxCommittedEventWindow) {
-        // The awaited business commit may allow another authenticated owner
-        // or a tool completion to advance the window. Re-evaluate, never use
-        // an index sampled before that await to delete a different input.
-        const currentEviction = this.#store.state.committedEvents.findIndex(
-          (candidate) => !unsettledSemanticInput(candidate, this.#store.state),
-        );
-        if (currentEviction < 0) {
-          connection.close();
-          return;
-        }
-        this.#store.state.committedEvents.splice(currentEviction, 1);
-      }
-      this.#store.state.committedEvents.push({
-        sourceSeq,
-        sourceEventId,
-        eventType,
-        priority,
-        envelope: structuredClone(envelope),
-        deliveryCount: 1,
-        logicalEffectCount: 1,
-      });
-      this.#store.state.ackedSourceSeq = sourceSeq;
+    if (!recordCommittedEvent()) {
+      connection.close();
+      return;
     }
-    this.#store.save();
 
     if (
       isSemanticInput &&
