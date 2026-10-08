@@ -1515,6 +1515,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )) &&
         !sourceAcceptedResponseWake;
       const sourceIsPaperclipRunner = isNativePaperclipRunnerRun(source);
+      const sourceFinalTextForPresentation = sourceIsPaperclipRunner
+        ? (acceptedSummary ??
+          paperclipRunnerFinalResponse(parsedSource, {
+            runId: source.id,
+            agentName: meta?.agentName,
+            fallbackSummary: acceptedSummary,
+          })?.text ??
+          null)
+        : null;
+      const sourceStartedAtMs = toMs(meta?.startedAt ?? meta?.createdAt);
       const decidedCommentId = presentationDecisionCommentId(meta?.resultJson);
       const progressCommentIds = semanticProgressCommentIds(meta?.resultJson);
       const sourcePresentationCommentId =
@@ -1524,14 +1534,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               .find(
                 (comment) =>
                   !comment.deletedAt &&
-                  comment.runId === source.id &&
-                  !progressCommentIds.has(comment.id),
+                  !progressCommentIds.has(comment.id) &&
+                  (comment.runId === source.id ||
+                    (sourceIsPaperclipRunner &&
+                      isRunnerResponseComment({
+                        comment,
+                        runId: source.id,
+                        runStartedAtMs: sourceStartedAtMs,
+                        finalText: sourceFinalTextForPresentation,
+                      }))),
               )?.id ?? null)
           : decidedCommentId !== null &&
               comments.some(
                 (comment) =>
                   !comment.deletedAt &&
-                  comment.runId === source.id &&
+                  (comment.runId === source.id ||
+                    (sourceIsPaperclipRunner &&
+                      isRunnerResponseComment({
+                        comment,
+                        runId: source.id,
+                        runStartedAtMs: sourceStartedAtMs,
+                        finalText: sourceFinalTextForPresentation,
+                      }))) &&
                   comment.id === decidedCommentId,
               )
             ? decidedCommentId

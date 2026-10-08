@@ -88,11 +88,15 @@ test("chat first open is read-only; concurrent first sends and retries share one
         .then(json),
     ]);
     expect(replies[0].id).toBe(replies[1].id);
-    await idle(request, f.chatPath, 3);
+    await idle(request, f.chatPath, 2);
     await page.reload();
-    await expect(
-      page.getByText("Reply generation 0: Retry once", { exact: true }),
-    ).toBeVisible();
+    const retryReply = page.getByText("Reply generation 0: Retry once", {
+      exact: true,
+    });
+    await expect(retryReply).toHaveCount(1);
+    await expect(page.getByRole("main")).toContainText(
+      "Reply generation 0: Retry once",
+    );
     expect(
       await json(await request.get(`/api/companies/${f.company.id}/issues`)),
     ).toHaveLength(0);
