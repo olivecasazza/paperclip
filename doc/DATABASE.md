@@ -357,6 +357,52 @@ Database backups do not include non-database instance files such as local-disk
 uploads, workspace files, or the local encrypted secrets master key. Back those paths
 up separately when you need full instance disaster recovery.
 
+## Reclaiming space from run-payload retention
+
+`server/src/services/heartbeat-run-payload-retention.ts` nulls `result_json`,
+`usage_json`, the stdout/stderr excerpts, and the non-routing half of
+`context_snapshot` on terminal runs older than the retention window. That is a
+**logical** reclaim: it shrinks what a future read of an aged row has to detoast,
+and it leaves the row itself intact.
+
+It is **not** a disk reclaim. An `UPDATE` writes a new tuple version, and the
+superseded tuple's TOAST chunks are not reusable until `VACUUM` marks them dead,
+and not returned to the operating system at all until the table is rewritten.
+Measured on the live control-plane database while fixing CON-468: trimming 500
+aged rows left `heartbeat_runs` at 1040 MB total / 929 MB TOAST, and a real
+`VACUUM` afterwards left it at 1040 MB / 929 MB — byte-for-byte unchanged.
+
+So if you are chasing on-disk size after a retention sweep, do one of these
+deliberately, in a maintenance window, and measure before and after:
+
+```sql
+-- Baseline. This is the number that must come down.
+SELECT pg_size_pretty(pg_total_relation_size('heartbeat_runs')) AS total,
+       pg_size_pretty(pg_total_relation_size(
+         (SELECT reltoastrelid FROM pg_class WHERE oid = 'heartbeat_runs'::regclass)
+       )) AS toast;
+
+-- Option 1 — pg_repack. Preferred: the ACCESS EXCLUSIVE lock is only held for
+-- the final table swap, not for the whole rewrite. Needs the extension
+-- (`CREATE EXTENSION pg_repack;`) and enough free disk for a second copy of
+-- the table (930 MB TOAST today, so budget ~1 GB).
+--   pg_repack -t heartbeat_runs
+
+-- Option 2 — VACUUM FULL. No extension required, but it holds ACCESS EXCLUSIVE
+-- for the entire rewrite. Do not run it against a live pool; every read and
+-- write on heartbeat_runs blocks until it finishes.
+--   VACUUM FULL heartbeat_runs;
+```
+
+Neither is automated, and neither should be: the pool starvation this table
+contributes to (see CON-431) is exactly why an `ACCESS EXCLUSIVE` rewrite on
+live traffic is not something a scheduled job should attempt on its own.
+
+Rows themselves are never deleted by retention. That is a separate, gated
+decision — see CON-436 item 1 and CON-446, where the FK graph (not the
+retention window) turned out to be the binding constraint on how much could
+even be deleted.
+
 ## Secret storage
 
 Paperclip stores secret metadata and versions in:
