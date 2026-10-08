@@ -14,7 +14,7 @@ export function listAttentionExhaustedRuns(db: Db, companyId: string) {
     .where(and(
       eq(heartbeatRunEvents.companyId, companyId),
       eq(heartbeatRunEvents.eventType, "lifecycle"),
-      sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+      eq(heartbeatRunEvents.retryExhausted, true),
     ))
     .orderBy(asc(heartbeatRunEvents.runId), desc(heartbeatRunEvents.id))
     .as("latest_exhaustion");

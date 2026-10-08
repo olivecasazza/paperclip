@@ -84,6 +84,14 @@ export async function appendHeartbeatRunEvent(
       // The run lock also serializes concurrent recovery checks across server
       // instances. Reusing the receipt must not allocate a sequence or publish
       // another live event on each scheduler tick.
+      //
+      // Match the column OR the legacy message prefix. During a rolling deploy a
+      // pre-migration build still writes exhaustion receipts with the default
+      // retry_exhausted=false, and this query must still recognise them as the
+      // same receipt — otherwise a still-running old pod and a new pod would
+      // each publish a duplicate exhaustion event for one run. This is scoped to
+      // a single run via company_id/run_id, so the fallback LIKE is evaluated
+      // over that run's events, not the table.
       const existing = await tx
         .select()
         .from(heartbeatRunEvents)
@@ -92,7 +100,10 @@ export async function appendHeartbeatRunEvent(
           eq(heartbeatRunEvents.runId, input.runId),
           eq(heartbeatRunEvents.agentId, input.agentId),
           eq(heartbeatRunEvents.eventType, "lifecycle"),
-          sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+          or(
+            eq(heartbeatRunEvents.retryExhausted, true),
+            sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+          ),
           sql`${heartbeatRunEvents.payload} @> ${JSON.stringify(input.retryExhaustion)}::jsonb`,
         ))
         .limit(1)
@@ -161,6 +172,9 @@ export async function appendHeartbeatRunEvent(
       sourceSeq: input.nativeSource?.sourceSeq ?? null,
       sourcePayloadSha256: sourceHash,
       protocolSchemaVersion: input.nativeSource?.protocolSchemaVersion ?? null,
+      // Set from the structured receipt rather than the rendered message, so the
+      // flag cannot be lost to redaction or copy changes.
+      retryExhausted: input.retryExhaustion ? true : false,
     }).returning();
     if (!row) throw new Error("heartbeat_run_event_not_persisted");
     return {

@@ -29522,7 +29522,7 @@ export function heartbeatService(
           and(
             eq(heartbeatRunEvents.runId, runId),
             eq(heartbeatRunEvents.eventType, "lifecycle"),
-            sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+            eq(heartbeatRunEvents.retryExhausted, true),
           ),
         )
         .orderBy(desc(heartbeatRunEvents.id))
