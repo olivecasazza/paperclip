@@ -16,6 +16,7 @@ const PAPERCLIP_DECISION_SIGNING_SECRET =
 const PAPERCLIP_TOOL_ACTION_SIGNING_SECRET =
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "playwright-e2e-tool-action-signing-secret";
 const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
+const PLAYWRIGHT_EXECUTABLE_PATH = process.env.PAPERCLIP_PLAYWRIGHT_EXECUTABLE_PATH;
 
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
@@ -55,6 +56,9 @@ export default defineConfig({
       use: {
         browserName: "chromium",
         ...(PLAYWRIGHT_CHANNEL ? { channel: PLAYWRIGHT_CHANNEL } : {}),
+        ...(PLAYWRIGHT_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: PLAYWRIGHT_EXECUTABLE_PATH } }
+          : {}),
       },
     },
   ],
