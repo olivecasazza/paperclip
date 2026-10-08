@@ -2132,6 +2132,67 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("announces a shallow-clone checkout so the CON-224 false signal cannot be re-derived", () => {
+    // The workspace an agent is handed is transported as a depth-1 clone, where
+    // merge-base finds nothing, `rev-list --count` returns 1, and
+    // `rev-list --max-parents=0` reports a root commit. Those are exactly what a
+    // force-pushed trunk reports, and the remedy for that misreading is a
+    // force-push — so the condition must be visible in the agent's own prompt.
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_assigned",
+      issue: { id: "issue-1", identifier: "CON-231", title: "Guard the shallow boundary", status: "in_progress" },
+      executionWorkspace: { shallowHistory: true },
+    });
+
+    expect(prompt).toContain("- shallow clone history:");
+    expect(prompt).toContain("git fetch --unshallow origin");
+    expect(prompt).toContain("do not propose a force-push");
+  });
+
+  it("keeps the shallow-clone diagnostic on resumed sessions, where the branch guard is dropped", () => {
+    // The truncated history is a property of the checkout, not of this wake: the
+    // wrong reading it invites outlives the prompt, so it must survive a resume.
+    const payload = {
+      executionWorkspace: { branchName: "PAP-1582-ship-the-fix", shallowHistory: true },
+    };
+
+    expect(renderPaperclipWakePrompt(payload)).toContain("- shallow clone history:");
+    expect(renderPaperclipWakePrompt(payload, { resumedSession: true })).toContain("- shallow clone history:");
+  });
+
+  it("stays silent about a shallow clone for a full-history checkout", () => {
+    expect(
+      renderPaperclipWakePrompt({
+        reason: "issue_assigned",
+        issue: { id: "issue-1", identifier: "CON-231", title: "Guard the shallow boundary", status: "in_progress" },
+        executionWorkspace: { branchName: "PAP-1582-ship-the-fix" },
+      }),
+    ).not.toContain("shallow clone history");
+    expect(
+      renderPaperclipWakePrompt({
+        reason: "issue_assigned",
+        issue: { id: "issue-1", identifier: "CON-231", title: "Guard the shallow boundary", status: "in_progress" },
+        executionWorkspace: { branchName: "PAP-1582-ship-the-fix", shallowHistory: false },
+      }),
+    ).not.toContain("shallow clone history");
+  });
+
+  it("round-trips the shallow flag through wake payload serialization", () => {
+    expect(
+      JSON.parse(
+        stringifyPaperclipWakePayload({ executionWorkspace: { shallowHistory: true } }) ?? "{}",
+      ),
+    ).toMatchObject({ executionWorkspace: { shallowHistory: true } });
+
+    // A shallow checkout with no branch pin must survive normalization too; a
+    // transported depth-1 clone is detached.
+    expect(
+      JSON.parse(
+        stringifyPaperclipWakePayload({ executionWorkspace: { branchName: "PAP-1-x", shallowHistory: true } }) ?? "{}",
+      ),
+    ).toMatchObject({ executionWorkspace: { branchName: "PAP-1-x", shallowHistory: true } });
+  });
+
   it("renders a plugin session message as the user turn without granting it system authority", () => {
     const payload = {
       reason: "gateway_chat_message",
@@ -3434,6 +3495,30 @@ describe("applyPaperclipWorkspaceEnv", () => {
     );
 
     expect(env).toEqual({});
+  });
+
+  it("announces a shallow checkout in the agent env with the recovery command", () => {
+    const env = applyPaperclipWorkspaceEnv(
+      {},
+      {
+        workspaceCwd: "/sandbox/workspace",
+        shallowHistory: true,
+      },
+    );
+
+    const notice = env.PAPERCLIP_WORKSPACE_SHALLOW_HISTORY;
+    expect(notice).toContain("git fetch --unshallow origin");
+    expect(notice).toContain("do not propose a force-push");
+  });
+
+  it("adds no shallow-history key for a full-history checkout", () => {
+    const env = applyPaperclipWorkspaceEnv(
+      {},
+      { workspaceCwd: "/tmp/workspace", shallowHistory: false },
+    );
+
+    expect(env.PAPERCLIP_WORKSPACE_SHALLOW_HISTORY).toBeUndefined();
+    expect(env).toEqual({ PAPERCLIP_WORKSPACE_CWD: "/tmp/workspace" });
   });
 });
 
