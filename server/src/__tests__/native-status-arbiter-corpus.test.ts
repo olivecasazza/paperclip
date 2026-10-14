@@ -2150,7 +2150,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       if (guard === "answered") await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
       if (guard === "attention") await db.update(workAssessments).set({ assessmentJson: { attentionRequests: [{ kind: "approval", summary: "Approve release", ownerClass: "human" }] } }).where(eq(workAssessments.id, seeded.assessmentId));
       if (guard === "authority") await db.update(completionContracts).set({ risk: "high", completionAuthority: "server_arbiter" }).where(eq(completionContracts.id, seeded.contractId!));
-      if (guard === "later_status") await issueService(db).update(seeded.issueId, { status: "blocked" });
+      if (guard === "later_status") await issueService(db).update(seeded.issueId, { status: "blocked", unblockDescriptor: { owner: "board", action: "Corpus guard fixture: later blocked status." } });
       if (guard === "workspace_failed") await db.update(workspaceOperations).set({ status: "failed", exitCode: 1 }).where(eq(workspaceOperations.heartbeatRunId, seeded.runId));
       if (guard === "newer_contract") {
         const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, seeded.contractId!));

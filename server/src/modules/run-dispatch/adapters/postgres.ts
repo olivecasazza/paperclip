@@ -340,6 +340,7 @@ export function createPostgresRunDispatchAdapter(
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));

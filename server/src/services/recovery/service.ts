@@ -478,6 +478,10 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+function isTerminalIssueStatus(status: string) {
+  return status === "done" || status === "cancelled";
+}
+
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
@@ -2734,8 +2738,24 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
+    const blockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    // A recovery issue parked in place has no blocker to resolve, so the
+    // operator instruction is the only signal that can make it resolvable.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(blockerIds.length ? { blockedByIssueIds: blockerIds } : {}),
+      ...(blockerIds.length
+        ? {}
+        : {
+            unblockDescriptor: {
+              owner: "board" as const,
+              action:
+                "Inspect the stranded recovery evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+            },
+          }),
     });
     if (!updated) return null;
 
@@ -3586,8 +3606,23 @@ export function recoveryService(
         ),
       );
 
+    const dispositionRepairBlockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    // Disposition repair escalates to the board with no blocker to resolve, so
+    // it must carry the operator instruction it just recorded on the action.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(dispositionRepairBlockerIds.length
+        ? { blockedByIssueIds: dispositionRepairBlockerIds }
+        : {
+            unblockDescriptor: {
+              owner: "board" as const,
+              action:
+                "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+            },
+          }),
     });
     if (!updated) return null;
     const sourceAssigneePreserved =
@@ -3762,6 +3797,7 @@ export function recoveryService(
     latestRun: LatestIssueRun,
     options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
   ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
+    let settledAttemptCount: number | undefined;
     const current = await db
       .select()
       .from(issues)
@@ -3792,9 +3828,31 @@ export function recoveryService(
     });
     if (episode) {
       if (!latestRun) return "skipped";
+      const runAgentId = latestRun.agentId;
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
       if (decision.kind === "skip") return "skipped";
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
+      // `exhausted` on a run that did not succeed means the last permitted
+      // attempt failed. Re-arm the budget below to the exhausted value so the
+      // existing escalation branch terminates the action instead of scheduling
+      // an attempt that can never be granted. Scope this to a real persisted
+      // action owned by the same source episode: a bare exhaustion decision
+      // must never invent an action for an unrelated or already-settled issue.
+      if (decision.kind === "exhausted" && latestRun.status !== "succeeded") {
+        const persisted = await recoveryActionsSvc.getActiveForIssue(
+          current.companyId,
+          current.id,
+        );
+        if (
+          persisted?.kind !== "deliberate_wait_without_target" ||
+          persisted.fingerprint !== state.fingerprint ||
+          persisted.ownerType !== "agent" ||
+          persisted.returnOwnerAgentId !== runAgentId
+        ) {
+          return "skipped";
+        }
+        settledAttemptCount = decision.attempt;
+      }
     }
     if (state.hasActiveExecutionPath) return "skipped";
     if (state.hasDurableWaitingPath) {
@@ -3835,7 +3893,11 @@ export function recoveryService(
     // attempts merely because the recovery-action row did not exist yet.
     const historicalAttempt = Math.min(
       maxAttempts,
-      Math.max(episode?.attempt ?? 0, Math.floor(options.historicalAttemptCount ?? 0)),
+      Math.max(
+        episode?.attempt ?? 0,
+        Math.floor(options.historicalAttemptCount ?? 0),
+        settledAttemptCount ?? 0,
+      ),
     );
     // A source run owns one successor slot. Concurrent checks must not advance
     // the counter again after another checker reserved that same successor.
@@ -3898,6 +3960,53 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  // A source issue that already reached a terminal status cannot be stranded:
+  // the work is finished or intentionally abandoned, so a board escalation
+  // armed about it is a false positive. Settle it here instead of waiting for
+  // `reconcileActiveRecoveryActions` on a later tick, otherwise the active
+  // action keeps the issue red on the board and holds `blockedByIssueIds`
+  // edges that block downstream work on something demonstrably done.
+  async function settleTerminalStrandedRecoveryAction(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryCause: StrandedRecoveryCause;
+  }) {
+    // Scope the settle to the stranded action this call is about. An unfiltered
+    // `resolveActiveForIssue` resolves *every* active action on the issue, so a
+    // concurrent `missing_disposition` hold about a different cause would be
+    // resolved as collateral and its real work silently dropped from the board.
+    const settled = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      kind: strandedRecoveryActionKind(input.recoveryCause),
+      cause: input.recoveryCause,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: `source_terminal:${input.issue.status}`,
+    });
+    if (!settled) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: null,
+      runId: null,
+      action: "issue.recovery_action_false_positive",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: input.issue.status,
+        recoveryCause: input.recoveryCause,
+        recoveryActionId: settled.id,
+        resolutionNote: `source_terminal:${input.issue.status}`,
+        latestRunId: input.latestRun?.id ?? null,
+      },
+    });
+    return settled;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3919,9 +4028,41 @@ export function recoveryService(
       input.latestRun,
       input.recoveryCause,
     );
+
+    // The candidate list was snapshotted before this call, so the owner may
+    // have committed a real disposition in the meantime. Re-read the source
+    // before arming anything: a terminal source means this escalation is a
+    // false positive about work that is demonstrably finished, and re-arming a
+    // board escalation for it is what made the disposition unrepresentable —
+    // the new action re-blocked the issue on the very next sweep, forever.
+    const current = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.issue.companyId),
+          eq(issues.id, input.issue.id),
+        ),
+      )
+      .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+    if (!current || isTerminalIssueStatus(current.status)) {
+      if (current) {
+        await settleTerminalStrandedRecoveryAction({
+          issue: current,
+          latestRun: input.latestRun,
+          recoveryCause,
+        });
+      }
+      return null;
+    }
+
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
-      issue: input.issue,
-      previousStatus: input.previousStatus,
+      issue: current,
+      // Record the status actually re-read, not the caller's stale snapshot.
+      // The caller passed `previousStatus` from a candidate list taken before
+      // the owner could commit anything, which is how the action evidence kept
+      // claiming `in_progress` for an issue that was already `done`.
+      previousStatus: current.status as StrandedPreviousStatus,
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
@@ -3932,7 +4073,7 @@ export function recoveryService(
       Boolean(recoveryAction.returnOwnerAgentId);
     if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: input.issue,
+        issue: current,
         latestRun: input.latestRun,
         actionId: recoveryAction.id,
         agentId: recoveryAction.returnOwnerAgentId,
@@ -3942,9 +4083,33 @@ export function recoveryService(
       input.issue.companyId,
       input.issue.id,
     );
+    // With no unresolved blocker, `blocked` alone leaves the issue
+    // unresolvable by construction: nothing can fire `issue_blockers_resolved`
+    // and no heartbeat will pick it up. The recovery action just created is the
+    // real signal, so carry its operator instruction onto the issue instead of
+    // persisting an empty blocker set and no descriptor. The service-layer
+    // zero-signal guard rejects this write otherwise.
+    const unblockDescriptor = blockerIds.length
+      ? null
+      : {
+          owner: (
+            recoveryAction.ownerAgentId
+              ? { agentId: recoveryAction.ownerAgentId }
+              : "board"
+          ) as { agentId: string } | "board",
+          action: recoveryAction.nextAction,
+        };
+    // Compare-and-set on the status column. Re-reading is not enough on its
+    // own: the owner's `done` can still land between this write's pre-check and
+    // its UPDATE. `blocked` stays in the allowed set because re-asserting
+    // `blocked` for a *new distinct* failure on an already-blocked issue is a
+    // fresh operator notice, not a stale disposition.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
+      companyGuard: input.issue.companyId,
+      expectedStatus: ["todo", "in_progress", "in_review", "blocked"],
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -3996,7 +4161,7 @@ export function recoveryService(
         recoveryIssue: null,
         recoveryActionId: recoveryAction.id,
         recoveryOwner,
-        latestIssueStatus: input.issue.status,
+        latestIssueStatus: current.status,
         latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
         missingDisposition:
           input.successfulRunHandoffEvidence.missingDisposition,

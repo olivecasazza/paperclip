@@ -18,7 +18,7 @@ Success means all of these are true:
   detached workaround
 - the worktree database is a full bootstrapped isolated clone of the primary
   instance database
-- `/api/health` returns `status: ok` and `bootstrapStatus: ready`
+- `/api/health?database=required` returns `status: ok` and `bootstrapStatus: ready`
 - the root page returns `200` and does not show the first-admin setup gate
 - the board user can log in with their normal dev credentials
 - the app shows populated cloned data, not only a manually copied auth user
@@ -223,8 +223,13 @@ clue, not the final state.
 
 Set `SERVICE_URL` to the service URL returned by the runtime API.
 
+Use `?database=required` for these checks. `/api/health` defaults to liveness,
+which reports only that the process is up and deliberately never queries the
+database, so `bootstrapStatus` is absent unless you ask for readiness. A plain
+`curl` would read `null` and wrongly report an unbootstrapped clone.
+
 ```sh
-curl -sS "$SERVICE_URL/api/health" | jq
+curl -sS "$SERVICE_URL/api/health?database=required" | jq
 curl -sS -I "$SERVICE_URL/" | head
 ```
 
@@ -297,7 +302,7 @@ queries.
 Minimum API checks:
 
 ```sh
-curl -sS "$SERVICE_URL/api/health" | jq '.status, .bootstrapStatus'
+curl -sS "$SERVICE_URL/api/health?database=required" | jq '.status, .bootstrapStatus'
 curl -sS "$SERVICE_URL/api/companies" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq
 curl -sS "$SERVICE_URL/api/agents/me" \
@@ -362,7 +367,7 @@ managed service. Claiming a first admin can clear the gate, but if the user
 asked for the normal isolated workspace database, full reseed is the correct
 fix.
 
-Verify: `/api/health` has `bootstrapStatus: ready`, login works, and populated
+Verify: `/api/health?database=required` has `bootstrapStatus: ready`, login works, and populated
 data exists.
 
 ### Login fails
@@ -503,7 +508,7 @@ Verified:
 - main control plane shows <service> running/healthy at <url>
 - served workspace app shows the same service running/healthy
 - port owner identity: /proc/<pid>/cwd resolves inside the target worktree
-- <url>/api/health is ok with bootstrapStatus ready
+- <url>/api/health?database=required is ok with bootstrapStatus ready
 - root page returns 200 and no setup gate
 - dev login verified by <agent browser / QA / user> without posting credentials
 - cloned data verified via <specific API records>

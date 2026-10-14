@@ -8603,6 +8603,31 @@ async function executePaperclipNativeSessionWithinScope(
           ? error.message.slice(0, 2_000)
           : String(error).slice(0, 2_000);
       const sanitizedStderrTail = redactSensitiveText(message).slice(-4_096);
+      // The operator instruction for this failure. Recorded on the failure detail
+      // AND reused as the issue's unblockDescriptor when this failure parks the
+      // issue in `blocked`, so the instruction a board member reads on the issue
+      // is the same one the recovery record carries. A `blocked` issue with no
+      // descriptor cannot be resolved by any automatic signal.
+      const failureNextAction =
+        sourceFailureCode === "native_provider_approval_required"
+          ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
+          : sourceFailureCode === "native_session_cleanup_quarantined"
+            ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
+            : sourceFailureCode === "native_provider_terminal_failed"
+              ? "The provider session is permanently unusable. Verify stopped execution, completed actions, and task context before starting a linked continuation."
+              : recoveryEvidence.recoveryMode === "ambiguous_state"
+                ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
+                : integrityFailure
+                  ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
+                  : sourceFailureCode === "native_provider_usage_limit"
+                    ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
+                    : ownershipUnverified
+                      ? "Inspect the retained runner's executable and authenticated connection. Do not replace its provider until ownership is safely resolved."
+                      : exhausted
+                        ? "Inspect the persisted native session after its bounded resume budget was exhausted."
+                        : recoveryEvidence.recoveryMode === "bootstrap_retry"
+                          ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
+                          : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.";
       // Set inside the transaction only when the write below genuinely
       // transitions the run into "failed". Read after the transaction
       // commits, so a rolled-back write never reports a false failure.
@@ -8649,27 +8674,7 @@ async function executePaperclipNativeSessionWithinScope(
               providerEventsExist: recoveryEvidence.providerEventsExist,
               checkpointExists: recoveryEvidence.checkpointExists,
               recoveryOwner: recoveryProjection.recoveryOwner,
-              nextAction:
-                sourceFailureCode === "native_provider_approval_required"
-                  ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
-                  : sourceFailureCode === "native_session_cleanup_quarantined"
-                  ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
-                  : sourceFailureCode === "native_provider_terminal_failed"
-                    ? "The provider session is permanently unusable. Verify stopped execution, completed actions, and task context before starting a linked continuation."
-                    : recoveryEvidence.recoveryMode === "ambiguous_state"
-                      ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
-                      : integrityFailure
-                        ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
-                        : sourceFailureCode === "native_provider_usage_limit"
-                          ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
-                          : ownershipUnverified
-                            ? "Inspect the retained runner's executable and authenticated connection. Do not replace its provider until ownership is safely resolved."
-                            : exhausted
-                              ? "Inspect the persisted native session after its bounded resume budget was exhausted."
-                              : recoveryEvidence.recoveryMode ===
-                                  "bootstrap_retry"
-                                ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
-                                : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
+              nextAction: failureNextAction,
             },
             nextAttemptAt,
             recoveryHistory: sql`(
@@ -8780,9 +8785,24 @@ async function executePaperclipNativeSessionWithinScope(
             failureTask.checkoutRunId === input.execution.binding.runId);
         let failureBlockStatusVersion: number | undefined;
         if (stillOwnsTask && recoveryProjection.issueStatus) {
+          const parksInBlocked = recoveryProjection.issueStatus === "blocked";
           const projected = await issueService(tx as unknown as Db).update(
             input.execution.binding.issueId,
-            { status: recoveryProjection.issueStatus },
+            {
+              status: recoveryProjection.issueStatus,
+              // A terminal native failure has no dependency to resolve, so the
+              // block needs its own unblock path. Reuse the instruction already
+              // recorded on the failure detail rather than inventing a second
+              // wording for the same cause.
+              ...(parksInBlocked
+                ? {
+                    unblockDescriptor: {
+                      owner: "board" as const,
+                      action: failureNextAction,
+                    },
+                  }
+                : {}),
+            },
             tx,
           );
           if (projected?.status === "blocked") failureBlockStatusVersion = projected.statusVersion;

@@ -9,6 +9,42 @@ permissions:
   pull-requests: read
 
 jobs:
+  disk-guard:
+    name: Test disk-pressure guard thresholds and reclaim gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Test disk-pressure guard thresholds and reclaim gate
+        run: |
+          stub_bin="$RUNNER_TEMP/disk-guard-process-stubs"
+          mkdir -p "$stub_bin"
+          printf '#!/bin/sh\nexit 1\n' > "$stub_bin/pgrep"
+          printf '#!/bin/sh\nexit 1\n' > "$stub_bin/pidof"
+          chmod +x "$stub_bin/pgrep" "$stub_bin/pidof"
+          PATH="$stub_bin:$PATH" pnpm run test:disk-guard
+
   ci:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.

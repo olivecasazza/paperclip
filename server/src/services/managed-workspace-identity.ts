@@ -28,6 +28,7 @@ import {
   WORKSPACE_READINESS_USER_ID_HEADER,
 } from "../auth/workspace-login-handoff.js";
 import { logger } from "../middleware/logger.js";
+import { withHealthReadinessQuery } from "../routes/health.js";
 import {
   deriveWorktreeInstanceId,
   readWorktreeInstanceId,
@@ -39,6 +40,23 @@ import {
  * managed start or a reuse decision slower than it was.
  */
 export const WORKSPACE_READINESS_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Build the `/api/health` URL a readiness probe must use.
+ *
+ * This is not an optimisation — it is what keeps the probe a readiness probe.
+ * `/api/health` defaults to liveness, which answers without touching the
+ * database and therefore without the `workspace` block this module exists to
+ * read. A URL built without the opt-in does not fail loudly: `probeManagedWorkspaceReadiness`
+ * sees no `workspace` object and returns `readiness_missing`, which in
+ * `auto` gate mode silently publishes the workspace with no identity
+ * verification at all, and in `strict` mode refuses to start it.
+ *
+ * Every URL that feeds a readiness probe must go through here.
+ */
+export function buildWorkspaceReadinessHealthUrl(origin: string): string {
+  return withHealthReadinessQuery(new URL("/api/health", origin).toString());
+}
 
 export type ManagedWorkspaceIdentity = {
   instanceId: string;

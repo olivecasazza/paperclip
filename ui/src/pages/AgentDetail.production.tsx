@@ -141,6 +141,11 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 };
 
 const RUN_LOG_PAGE_BYTES = 256_000;
+// Keep in step with AgentDetail.tsx: the overview/dashboard run list is a
+// display list capped at 200 rows, the same bound every other run list in the
+// UI uses. Unbounded, it fetched every run for the agent with the full
+// transcript projection (~15s on the pool as of 2026-10-03).
+const AGENT_RUN_LIST_LIMIT = 200;
 
 const REDACTED_ENV_VALUE = "***REDACTED***";
 const SECRET_ENV_KEY_RE =
@@ -891,7 +896,7 @@ export function AgentDetail() {
 
   const { data: heartbeats } = useQuery({
     queryKey: queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined),
-    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined),
+    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined, AGENT_RUN_LIST_LIMIT),
     enabled: !!resolvedCompanyId && !!agent?.id && shouldLoadHeartbeats,
   });
 

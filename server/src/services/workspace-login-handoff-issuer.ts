@@ -27,6 +27,7 @@ import {
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import {
   probeManagedWorkspaceReadiness,
+  buildWorkspaceReadinessHealthUrl,
   resolveManagedWorkspaceIdentity,
 } from "./managed-workspace-identity.js";
 
@@ -158,7 +159,7 @@ export async function issueWorkspaceLoginHandoff(input: {
   const readinessResult = await probe({
     // Probe the origin the user will actually be sent to, so a stale row or a
     // reassigned port is caught before a ticket exists rather than after.
-    healthUrl: new URL("/api/health", origin).toString(),
+    healthUrl: buildWorkspaceReadinessHealthUrl(origin),
     identity,
     handoffSubject: boardIdentity,
   });

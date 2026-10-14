@@ -17,6 +17,28 @@ describe("legacy continuation authority", () => {
   it.each(["failed", "cancelled", "interrupted", "timed_out", "running"])("does not convert a %s process into repair", status => {
     expect(decideLegacyContinuation({ ...input, run: { ...input.run, status } }).kind).toBe("skip");
   });
+  it.each(["failed", "cancelled", "interrupted", "timed_out"])("still skips a %s process that still has repair budget", status => {
+    expect(decideLegacyContinuation({
+      ...input,
+      run: { ...input.run, status },
+      episode: { ...input.episode, attempt: 1 },
+    }).kind).toBe("skip");
+  });
+  it.each(["failed", "cancelled", "interrupted", "timed_out", "running"])("reports exhaustion once a %s process spends the last attempt", status => {
+    expect(decideLegacyContinuation({
+      ...input,
+      run: { ...input.run, status },
+      episode: { ...input.episode, attempt: 2 },
+    })).toEqual({ kind: "exhausted", attempt: 2, maxAttempts: 2 });
+  });
+  it.each(["stopped", "paused", "budgetBlocked", "pendingWait", "activeExecution", "ownedLifecycle", "conversation"] as const)("keeps the %s gate authoritative for an exhausted %s repair", (gate, status) => {
+    expect(decideLegacyContinuation({
+      ...input,
+      run: { ...input.run, status },
+      episode: { ...input.episode, attempt: 2 },
+      gates: { ...input.gates, [gate]: true },
+    }).kind).toBe("skip");
+  });
   it.each(["stopped", "paused", "budgetBlocked", "pendingWait", "activeExecution", "ownedLifecycle", "conversation"] as const)("preserves %s", gate => {
     expect(decideLegacyContinuation({ ...input, gates: { ...input.gates, [gate]: true } }).kind).toBe("skip");
   });

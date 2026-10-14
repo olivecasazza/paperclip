@@ -132,7 +132,7 @@ describe("issueWorkspaceLoginHandoff", () => {
     // Readiness is probed against the origin the user will be sent to, not a
     // separately configured address.
     expect(probe).toHaveBeenCalledTimes(1);
-    expect(probe.mock.calls[0]![0]!.healthUrl).toBe("https://workspace.example.ts.net:42013/api/health");
+    expect(probe.mock.calls[0]![0]!.healthUrl).toBe("https://workspace.example.ts.net:42013/api/health?database=required");
     expect(probe.mock.calls[0]![0]!.handoffSubject).toEqual({
       userId: "user-1",
       email: "operator@example.com",

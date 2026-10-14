@@ -73,7 +73,10 @@ export default defineConfig({
     // keys before spawning the real Paperclip process.
     command: runnerE2EWebServerCommand(repositoryRoot),
     gracefulShutdown: runnerE2EWebServerGracefulShutdown,
-    url: `${baseURL}/api/health`,
+    // Readiness gate, not the default liveness path: this has to mean "the server
+    // is actually serving". The liveness default returns 200 before migrations
+    // finish, which would hand Playwright a not-yet-ready server.
+    url: `${baseURL}/api/health?database=required`,
     reuseExistingServer: false,
     timeout: 180_000,
     stdout: "pipe",

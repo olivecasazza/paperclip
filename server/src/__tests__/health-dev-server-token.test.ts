@@ -97,8 +97,10 @@ describe("GET /health dev-server supervisor access", () => {
         }),
       );
 
+      // The dev runner now asks for the readiness contract (see
+      // `getDevHealthPayload`), because `devServer.activeRunCount` is a query.
       const res = await request(app)
-        .get("/health")
+        .get("/health?database=required")
         .set("X-Paperclip-Dev-Server-Status-Token", "dev-runner-token");
 
       expect(res.status).toBe(200);
@@ -108,6 +110,7 @@ describe("GET /health dev-server supervisor access", () => {
         deploymentExposure: "private",
         localAiLoginSupported: true,
         commit: null,
+        database: { probed: true, reachable: true },
         bootstrapStatus: "ready",
         bootstrapInviteActive: false,
         devServer: {

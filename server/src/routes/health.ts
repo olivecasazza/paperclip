@@ -50,6 +50,67 @@ function shouldExposeFullHealthDetails(
   return actorType === "board" || actorType === "agent";
 }
 
+/**
+ * The query-string opt-in that turns this route's liveness contract into its
+ * database-backed readiness contract.
+ *
+ * Exported because callers outside this route — the UI client, both dev
+ * runners, the managed-workspace publish gate, the onboard smoke script — have
+ * to build the same URL. Sharing one constant is what keeps a readiness caller
+ * from silently dropping back onto the liveness path and reading a field that
+ * is no longer there.
+ *
+ * See `wantsDatabaseReadiness` for what the values mean.
+ */
+export const HEALTH_READINESS_QUERY = "database=required";
+
+/**
+ * Append the readiness opt-in to a `/api/health` URL that already points at
+ * this API. Any existing query string is preserved, and asking twice is a no-op
+ * so a caller that already opted in is not rewritten.
+ */
+export function withHealthReadinessQuery(healthUrl: string): string {
+  if (healthUrl.includes(HEALTH_READINESS_QUERY)) return healthUrl;
+  return `${healthUrl}${healthUrl.includes("?") ? "&" : "?"}${HEALTH_READINESS_QUERY}`;
+}
+
+/**
+ * Whether this caller asked for the database-backed readiness contract.
+ *
+ * `?database=required` (also `1`, `true`, `yes`, `on`) opts in; anything else —
+ * including `database=0`, `database=false` and no parameter at all — is the
+ * default liveness contract, which must never reach for the database. So must
+ * every field the liveness response omits: `bootstrapStatus` and `devServer`
+ * are both queries, which is why the UI and the dev runner opt in.
+ *
+ * The distinction is load-bearing, not cosmetic. A liveness probe that issues a
+ * query can only report on the database: when the pool is saturated, `SELECT 1`
+ * cannot get a connection inside the probe's timeout, the process is declared
+ * dead while it is serving perfectly, and the orchestrator restarts it. That
+ * turns a performance problem into an outage for every agent at once. Readiness
+ * callers, who genuinely want dependency state, opt in and keep the old
+ * semantics.
+ */
+function wantsDatabaseReadiness(raw: unknown): boolean {
+  // A repeated parameter (`?database=required&database=1`) arrives as an array
+  // under some query parsers. Opt in if any value asks for it.
+  const values = Array.isArray(raw) ? raw : [raw];
+  return values.some((value) => {
+    if (typeof value !== "string") return false;
+    const normalized = value.trim().toLowerCase();
+    // A bare `?database` arrives as "" and reads as the flag it is.
+    if (!normalized) return true;
+    return ["required", "1", "true", "yes", "on"].includes(normalized);
+  });
+}
+
+type HealthDatabaseState = {
+  /** Whether this request performed a database probe at all. */
+  probed: boolean;
+  /** Whether the database answered. Null when no probe ran. */
+  reachable: boolean | null;
+};
+
 function matchesSharedToken(expectedToken: string | undefined | null, providedToken: string | undefined) {
   const expectedValue = expectedToken?.trim();
   const token = providedToken?.trim();
@@ -270,8 +331,17 @@ export function healthRoutes(
       ? { userId: requestedHandoffUserId, email: requestedHandoffUserEmail }
       : null;
 
+    // Default is liveness: report this process's own health and stop. Only a
+    // readiness caller pays for a database round-trip, and only its answer can
+    // make the status code 503. The `database` block is on every response so a
+    // reader can tell which contract answered without inferring it from the code.
+    const requireDatabase = wantsDatabaseReadiness(req.query.database);
+
     if (!db) {
-      res.json(
+      // No database is wired at all, so there is nothing to probe and nothing
+      // that can be unreachable. Readiness cannot be satisfied; liveness can.
+      const database: HealthDatabaseState = { probed: false, reachable: null };
+      res.status(requireDatabase ? 503 : 200).json(
         exposeFullDetails
           ? {
               status: healthStatus,
@@ -279,6 +349,8 @@ export function healthRoutes(
               serverVersion: serverVersion,
               commit,
               serverInfo,
+              database,
+              ...(requireDatabase ? { error: "database_unavailable" } : {}),
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             }
@@ -286,6 +358,8 @@ export function healthRoutes(
               status: healthStatus,
               deploymentMode: opts.deploymentMode,
               commit,
+              database,
+              ...(requireDatabase ? { error: "database_unavailable" } : {}),
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             },
@@ -293,30 +367,50 @@ export function healthRoutes(
       return;
     }
 
-    try {
-      await db.execute(sql`SELECT 1`);
-    } catch (error) {
-      logger.warn({ err: error }, "Health check database probe failed");
-      // Carry readiness on the unhealthy response too: the seed phase recorded on
-      // disk is exactly what tells an operator whether this is a half-finished
-      // restore or a database that died after being verified.
-      const workspace = exposeWorkspaceReadiness
-        ? await resolveWorkspaceReadiness({ db, handoffSubject }).catch(() => null)
-        : null;
-      res.status(503).json({
-        status: "unhealthy",
-        version: serverVersion,
-        serverVersion,
-        commit,
-        error: "database_unreachable",
-        ...(exposeFullDetails ? { serverInfo } : {}),
-        ...(workspace ? { workspace } : {}),
-        ...(cloud ? { cloud } : {}),
-      });
-      return;
+    let databaseReachable = true;
+    if (requireDatabase) {
+      try {
+        await db.execute(sql`SELECT 1`);
+      } catch (error) {
+        databaseReachable = false;
+        logger.warn({ err: error }, "Health readiness database probe failed");
+        const database: HealthDatabaseState = { probed: true, reachable: false };
+        // Carry readiness on the unhealthy response too: the seed phase recorded on
+        // disk is exactly what tells an operator whether this is a half-finished
+        // restore or a database that died after being verified.
+        const workspace = exposeWorkspaceReadiness
+          ? await resolveWorkspaceReadiness({ db, handoffSubject }).catch(() => null)
+          : null;
+        res.status(503).json({
+          status: "unhealthy",
+          version: serverVersion,
+          serverVersion,
+          commit,
+          error: "database_unreachable",
+          database,
+          ...(exposeFullDetails ? { serverInfo } : {}),
+          ...(workspace ? { workspace } : {}),
+          ...(cloud ? { cloud } : {}),
+        });
+        return;
+      }
     }
+    const database: HealthDatabaseState = {
+      probed: requireDatabase,
+      reachable: requireDatabase ? databaseReachable : null,
+    };
 
-    let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
+    // The bootstrap, dev-server, native-recovery and workspace-readiness blocks
+    // below are all database reads. They stay reachable for a readiness caller
+    // and for a full-details actor that already proved a session, and are
+    // skipped for an anonymous liveness probe — which is the whole point of the
+    // split: the default path answers with nothing but this process's own state.
+
+    // Only a readiness request carries this at all, so an anonymous liveness probe
+    // cannot pay for the counts. Within readiness the default stays "ready",
+    // which is what cloud-managed instances have always reported without being
+    // asked.
+    let bootstrapStatus: "ready" | "bootstrap_pending" | undefined = requireDatabase ? "ready" : undefined;
     let bootstrapInviteActive = false;
     // Cloud-managed instances have no first-admin concept: the control
     // plane owns identity and its trusted-header users are deliberately
@@ -324,15 +418,16 @@ export function healthRoutes(
     // bootstrap_pending forever and lock every managed tenant out at the
     // claim screen. Self-hosted deployments (neither canonical managed signal)
     // are unaffected.
-    if (opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
+    const resolvedBootstrapStatus = async () => {
       const roleCount = await db
         .select({ count: count() })
         .from(instanceUserRoles)
         .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
         .then((rows) => Number(rows[0]?.count ?? 0));
-      bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
+      const status: "ready" | "bootstrap_pending" = roleCount > 0 ? "ready" : "bootstrap_pending";
 
-      if (bootstrapStatus === "bootstrap_pending") {
+      let inviteActive = false;
+      if (status === "bootstrap_pending") {
         const now = new Date();
         const inviteCount = await db
           .select({ count: count() })
@@ -346,13 +441,29 @@ export function healthRoutes(
             ),
           )
           .then((rows) => Number(rows[0]?.count ?? 0));
-        bootstrapInviteActive = inviteCount > 0;
+        inviteActive = inviteCount > 0;
       }
+      return { status, inviteActive };
+    };
+
+    const wantsBootstrapStatus =
+      requireDatabase
+      && opts.deploymentMode === "authenticated"
+      && !isCloudManagedInstance(runtimeEnv);
+    if (wantsBootstrapStatus) {
+      const resolved = await resolvedBootstrapStatus();
+      bootstrapStatus = resolved.status;
+      bootstrapInviteActive = resolved.inviteActive;
     }
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
     let devServer: ReturnType<typeof toDevServerHealthStatus> | undefined;
-    if (exposeDevServerDetails && persistedDevServerStatus && typeof (db as { select?: unknown }).select === "function") {
+    if (
+      requireDatabase
+      && exposeDevServerDetails
+      && persistedDevServerStatus
+      && typeof (db as { select?: unknown }).select === "function"
+    ) {
       const instanceSettings = instanceSettingsService(db);
       const experimentalSettings = await instanceSettings.getExperimental();
       const activeRunCount = await db
@@ -367,7 +478,7 @@ export function healthRoutes(
       });
     }
 
-    const workspaceReadiness = exposeWorkspaceReadiness
+    const workspaceReadiness = requireDatabase && exposeWorkspaceReadiness
       ? await resolveWorkspaceReadiness({ db, handoffSubject }).catch((error) => {
           logger.warn({ err: error }, "workspace readiness probe failed");
           return null;
@@ -378,7 +489,7 @@ export function healthRoutes(
       ? inspectDatabaseBackupHealth(opts.databaseBackupHealth)
       : undefined;
     const warnings = databaseBackup?.warnings.length ? databaseBackup.warnings : undefined;
-    const nativeRecovery = exposeFullDetails
+    const nativeRecovery = requireDatabase && exposeFullDetails
       ? await nativeRestartRecoverySummary(db).catch((error) => {
           logger.warn({ err: error }, "native recovery health summary failed");
           return {};
@@ -394,8 +505,9 @@ export function healthRoutes(
         deploymentExposure: opts.deploymentExposure,
         localAiLoginSupported: supportsLocalAiLogin(opts),
         commit,
-        bootstrapStatus,
-        bootstrapInviteActive,
+        database,
+        ...(bootstrapStatus ? { bootstrapStatus } : {}),
+        ...(bootstrapStatus ? { bootstrapInviteActive } : {}),
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -418,8 +530,9 @@ export function healthRoutes(
       deploymentExposure: opts.deploymentExposure,
         localAiLoginSupported: supportsLocalAiLogin(opts),
       authReady: opts.authReady,
-      bootstrapStatus,
-      bootstrapInviteActive,
+      database,
+      ...(bootstrapStatus ? { bootstrapStatus } : {}),
+      ...(bootstrapStatus ? { bootstrapInviteActive } : {}),
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },

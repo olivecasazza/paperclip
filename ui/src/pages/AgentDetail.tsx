@@ -152,6 +152,12 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 };
 
 const RUN_LOG_PAGE_BYTES = 256_000;
+// The run list rendered by AgentOverview/RunsTab is a display list, so it
+// takes the same 200-row cap as every other run list in the UI (Inbox,
+// LegacyInbox, useInboxBadge, AuditRuns). Omitting it fetched every run for
+// the agent with the full transcript projection selected - 5,482 rows and
+// ~15s on the pool as of 2026-10-03.
+const AGENT_RUN_LIST_LIMIT = 200;
 
 const REDACTED_ENV_VALUE = "***REDACTED***";
 const SECRET_ENV_KEY_RE =
@@ -916,7 +922,7 @@ export function AgentDetail() {
 
   const { data: heartbeats } = useQuery({
     queryKey: queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined),
-    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined),
+    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined, AGENT_RUN_LIST_LIMIT),
     enabled: !!resolvedCompanyId && !!agent?.id && shouldLoadHeartbeats,
   });
 

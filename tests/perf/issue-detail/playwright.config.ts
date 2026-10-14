@@ -36,7 +36,10 @@ export default defineConfig({
   },
   webServer: EXTERNAL_URL ? undefined : {
     command: "pnpm paperclipai onboard --yes --run",
-    url: `${BASE_URL}/api/health`,
+    // Readiness gate, not the default liveness path: this has to mean "the server
+    // is actually serving". The liveness default returns 200 before migrations
+    // finish, which would hand Playwright a not-yet-ready server.
+    url: `${BASE_URL}/api/health?database=required`,
     reuseExistingServer: false,
     timeout: 120_000,
     stdout: "pipe",

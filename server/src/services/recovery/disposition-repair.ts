@@ -28,6 +28,7 @@ type DispositionRepairIssue = Pick<
   | "executionPolicy"
   | "executionState"
   | "monitorNextCheckAt"
+  | "unblockDescriptor"
 >;
 
 export type DispositionRepairSourceState = {
@@ -37,6 +38,21 @@ export type DispositionRepairSourceState = {
   hasDurableWaitingPath: boolean;
   durablePathReason: string | null;
 };
+
+/**
+ * True when the only recorded unblock owner is the agent that is itself blocked. A
+ * descriptor naming a human, the board, or any other agent is someone else's obligation and
+ * is a real waiting path; a self-owned one certifies its own escape and never resolves.
+ */
+function isSelfOwnedUnblockDescriptor(
+  issue: Pick<DispositionRepairIssue, "assigneeAgentId" | "unblockDescriptor">,
+  assigneeAgentId: string | null,
+): boolean {
+  if (!assigneeAgentId) return false;
+  const owner = issue.unblockDescriptor?.owner;
+  if (!owner || typeof owner === "string" || !("agentId" in owner)) return false;
+  return owner.agentId === assigneeAgentId;
+}
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -193,19 +209,26 @@ export async function collectDispositionRepairSourceState(
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
+  // A self-owned unblockDescriptor is self-certifying: the party that cannot act is the
+  // party certifying the unblock, so it is never a durable waiting path. Blocked issues are
+  // exempt from the `blocker` short-circuit below, which otherwise reports every blocked
+  // issue as already having a durable path via its own attention state.
+  const selfOwnedUnblock = issue.status === "blocked" && isSelfOwnedUnblockDescriptor(issue, issue.assigneeAgentId);
   const durablePathReason = issue.assigneeUserId
     ? "user_owner"
-    : blockers.length > 0
-      ? "blocker"
-      : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
-        ? "monitor"
-        : pendingExecutionState?.status === "pending"
-          ? "execution_stage"
-          : pendingInteraction
-            ? "interaction"
-            : pendingApproval
-              ? "approval"
-              : null;
+    : selfOwnedUnblock
+      ? null
+      : blockers.length > 0
+        ? "blocker"
+        : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
+          ? "monitor"
+          : pendingExecutionState?.status === "pending"
+            ? "execution_stage"
+            : pendingInteraction
+              ? "interaction"
+              : pendingApproval
+                ? "approval"
+                : null;
 
   const durableState = {
     source: {

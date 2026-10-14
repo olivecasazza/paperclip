@@ -251,7 +251,11 @@ sign_up_or_sign_in() {
 }
 
 auto_bootstrap_authenticated_smoke() {
-  local health_url="$PAPERCLIP_PUBLIC_URL/api/health"
+  # Readiness, not the default liveness path: the bootstrapStatus check below is
+  # a database read that only the readiness contract returns. On liveness the
+  # field is absent and the `*"bootstrapStatus":"ready"*` match fails, so this
+  # would always take the invite branch even on an already-claimed instance.
+  local health_url="$PAPERCLIP_PUBLIC_URL/api/health?database=required"
   local health_json
   health_json="$(curl -fsS "$health_url")"
   if [[ "$health_json" != *'"deploymentMode":"authenticated"'* ]]; then

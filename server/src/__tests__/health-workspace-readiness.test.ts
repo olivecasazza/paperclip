@@ -101,7 +101,7 @@ describe("GET /api/health workspace readiness", () => {
       [WORKSPACE_EXECUTION_WORKSPACE_ID_ENV_KEY]: "ews-1",
       [WORKSPACE_EXECUTION_WORKSPACE_COMPANY_ID_ENV_KEY]: "company-1",
     });
-    const response = await request(createApp("board")).get("/api/health").expect(200);
+    const response = await request(createApp("board")).get("/api/health?database=required").expect(200);
     expect(response.body.workspace).toMatchObject({
       state: "ready",
       databaseReady: true,
@@ -136,7 +136,7 @@ describe("GET /api/health workspace readiness", () => {
       [WORKSPACE_EXECUTION_WORKSPACE_COMPANY_ID_ENV_KEY]: "company-1",
     });
     const response = await request(createApp("none"))
-      .get("/api/health")
+      .get("/api/health?database=required")
       .set(WORKSPACE_READINESS_TOKEN_HEADER, "probe-token")
       .set(WORKSPACE_READINESS_USER_ID_HEADER, "user-1")
       .set(WORKSPACE_READINESS_USER_EMAIL_HEADER, "operator@example.com")
@@ -159,7 +159,7 @@ describe("GET /api/health workspace readiness", () => {
       [WORKSPACE_EXECUTION_WORKSPACE_COMPANY_ID_ENV_KEY]: "company-1",
     });
     const response = await request(createApp("none"))
-      .get("/api/health")
+      .get("/api/health?database=required")
       .set(WORKSPACE_READINESS_TOKEN_HEADER, "probe-token-but-wrong")
       .expect(200);
     expect(response.body.workspace).toBeUndefined();
@@ -172,7 +172,7 @@ describe("GET /api/health workspace readiness", () => {
     setEnv({ PAPERCLIP_CONFIG: path.join(dir, "config.json") });
     delete process.env[WORKSPACE_HANDOFF_KEY_ENV_KEY];
     delete process.env[WORKSPACE_EXECUTION_WORKSPACE_ID_ENV_KEY];
-    const response = await request(createApp("board")).get("/api/health").expect(200);
+    const response = await request(createApp("board")).get("/api/health?database=required").expect(200);
     expect(response.body.workspace).toBeUndefined();
   });
 });

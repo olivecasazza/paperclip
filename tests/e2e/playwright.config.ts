@@ -16,6 +16,7 @@ const PAPERCLIP_DECISION_SIGNING_SECRET =
 const PAPERCLIP_TOOL_ACTION_SIGNING_SECRET =
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "playwright-e2e-tool-action-signing-secret";
 const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
+const PLAYWRIGHT_EXECUTABLE_PATH = process.env.PAPERCLIP_PLAYWRIGHT_EXECUTABLE_PATH;
 
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
@@ -55,6 +56,9 @@ export default defineConfig({
       use: {
         browserName: "chromium",
         ...(PLAYWRIGHT_CHANNEL ? { channel: PLAYWRIGHT_CHANNEL } : {}),
+        ...(PLAYWRIGHT_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: PLAYWRIGHT_EXECUTABLE_PATH } }
+          : {}),
       },
     },
   ],
@@ -68,7 +72,10 @@ export default defineConfig({
     // Build the server's first-choice static directory so a prior package build
     // cannot shadow the UI under test with stale server/ui-dist assets.
     command: "pnpm --filter @paperclipai/ui build --outDir ../server/ui-dist --emptyOutDir && node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts onboard --yes --run",
-    url: `${BASE_URL}/api/health`,
+    // Readiness gate, not the default liveness path: this has to mean "the server
+    // is actually serving". The liveness default returns 200 before migrations
+    // finish, which would hand Playwright a not-yet-ready server.
+    url: `${BASE_URL}/api/health?database=required`,
     // Always boot a dedicated throwaway instance for e2e so browser tests
     // never attach to the developer's active Paperclip home/server.
     reuseExistingServer: false,
