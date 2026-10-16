@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { assertPublicRemoteHttpEndpoint } from "../services/remote-http-endpoint-guard.js";
+import {
+  assertPublicRemoteHttpEndpoint,
+  parseRemoteHttpEndpoint,
+} from "../services/remote-http-endpoint-guard.js";
 
 function guardError(message: string, code: string) {
   return Object.assign(new Error(message), { code });
@@ -72,5 +75,96 @@ describe("remote HTTP endpoint guard", () => {
       {},
       guardError,
     )).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
+  });
+
+  it.each([
+    "http://mcp.example/mcp",
+    "https://mcp.example/mcp",
+    "https://mcp.example/mcp?tenant=acme#frag",
+    "https://user:pass@mcp.example:8443/mcp",
+  ])("parses allowed endpoint %s", (value) => {
+    const parsed = parseRemoteHttpEndpoint(value, guardError);
+    expect(parsed).toBeInstanceOf(URL);
+    expect(parsed.protocol).toMatch(/^https?:$/);
+    expect(parsed.toString()).toBe(new URL(value).toString());
+  });
+
+  it("normalizes an uppercase scheme to the lowercase allowlist form", () => {
+    const parsed = parseRemoteHttpEndpoint("HTTPS://MCP.EXAMPLE/mcp", guardError);
+    expect(parsed.protocol).toBe("https:");
+    expect(parsed.hostname).toBe("mcp.example");
+  });
+
+  it.each([
+    "file:///etc/passwd",
+    "gopher://mcp.example/mcp",
+    "data:text/plain,leak",
+    "ftp://mcp.example/mcp",
+    "ws://mcp.example/mcp",
+    "wss://mcp.example/mcp",
+    "javascript:alert(1)",
+    "chrome-extension://abc/def",
+  ])("rejects non-http(s) scheme %s as invalid", (value) => {
+    // Schemes that `new URL()` accepts must be refused by the allowlist, not
+    // reach the socket layer.
+    expect(() => new URL(value)).not.toThrow();
+    expect(() => parseRemoteHttpEndpoint(value, guardError))
+      .toThrowError(expect.objectContaining({ code: "mcp_remote_url_invalid" }));
+  });
+
+  it.each([
+    ["not a url", "unparseable text"],
+    ["//mcp.example/mcp", "scheme-relative"],
+    ["http://", "scheme with no host"],
+    ["http://mcp.example:notaport/mcp", "invalid port"],
+  ])("rejects %s as an invalid URL (%s)", (value) => {
+    expect(() => parseRemoteHttpEndpoint(value, guardError))
+      .toThrowError(expect.objectContaining({ code: "mcp_remote_url_invalid" }));
+  });
+
+  it.each([
+    ["", "empty string"],
+    ["   ", "whitespace only"],
+  ])("rejects a missing URL (%s) before parsing", (value) => {
+    expect(() => parseRemoteHttpEndpoint(value, guardError))
+      .toThrowError(expect.objectContaining({ code: "mcp_remote_url_missing" }));
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["number", 42],
+    ["object", { url: "https://mcp.example/mcp" }],
+  ])("rejects a non-string %s value as a missing URL", (_label, value) => {
+    expect(() => parseRemoteHttpEndpoint(value, guardError))
+      .toThrowError(expect.objectContaining({ code: "mcp_remote_url_missing" }));
+  });
+
+  it("routes the error through the injected factory rather than throwing bare", () => {
+    // Call sites map these codes onto 422s (tool-gateway/tool-access), so the
+    // guard must surface the caller-supplied error, not its own.
+    expect(() => parseRemoteHttpEndpoint("file:///etc/passwd", guardError))
+      .toThrowError(/must use http or https/);
+    expect(() => parseRemoteHttpEndpoint("", guardError))
+      .toThrowError(/requires config\.url/);
+    expect(() => parseRemoteHttpEndpoint("nope", guardError))
+      .toThrowError(/URL is invalid/);
+  });
+
+  it("fails closed when the hostname resolves to no addresses at all", async () => {
+    // An empty answer must not be treated as "no private addresses found".
+    await expect(assertPublicRemoteHttpEndpoint(
+      new URL("https://empty-dns.example/mcp"),
+      { lookup: async () => [] },
+      guardError,
+    )).rejects.toMatchObject({ code: "remote_http_dns_failed" });
+  });
+
+  it("fails closed when the resolver itself throws", async () => {
+    await expect(assertPublicRemoteHttpEndpoint(
+      new URL("https://broken-dns.example/mcp"),
+      { lookup: async () => { throw new Error("ECONNREFUSED"); } },
+      guardError,
+    )).rejects.toMatchObject({ code: "remote_http_dns_failed" });
   });
 });
