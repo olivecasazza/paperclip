@@ -1177,6 +1177,55 @@ function corruptSemanticInputDigest(
   return event;
 }
 
+it("records a committed event when the non-integrity callback fails after the external commit", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-commit-callback-"));
+  const externalEffects = new Set<string>();
+  const afterExternalCommit = Object.assign(
+    new Error("external commit callback failed after commit"),
+    { committed: true },
+  );
+  const onCommittedEvent = vi.fn(async (event: { sourceEventId: string }) => {
+    externalEffects.add(event.sourceEventId);
+    throw afterExternalCommit;
+  });
+  const core = new DurablePrpControlPlane({
+    stateDirectory: root,
+    identity,
+    expectedRunnerVersion,
+    expectedRunnerDigest,
+    onCommittedEvent,
+    onSemanticToolInput: async () => ({ result: { ok: true } }),
+  });
+  try {
+    await core.start();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    sendSecure(client, semanticInputEvent());
+    await expect(receiveSecure(client)).resolves.toBeNull();
+    expect(onCommittedEvent).toHaveBeenCalledTimes(1);
+    expect(externalEffects).toEqual(new Set(["semantic-event-1"]));
+    expect(core.store.state.ackedSourceSeq).toBe(1);
+    expect(core.store.state.committedEvents).toHaveLength(1);
+    expect(core.store.state.committedEvents[0]).toMatchObject({
+      sourceSeq: 1,
+      sourceEventId: "semantic-event-1",
+      eventType: "semantic_tool.input",
+      deliveryCount: 1,
+      logicalEffectCount: 1,
+    });
+    const retry = (await authenticate(core, client.leaseToken!))!;
+    sendSecure(retry, semanticInputEvent());
+    await expect(receiveSecure(retry)).resolves.toMatchObject({
+      kind: "ack",
+      payload: { ackedSourceSeq: 1 },
+    });
+    expect(onCommittedEvent).toHaveBeenCalledTimes(1);
+    expect(core.store.state.committedEvents[0]?.deliveryCount).toBe(2);
+  } finally {
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it.each(["committed", "rejected"] as const)(
   "holds explicit maintenance retirement through a closed connection's queued processing (%s)",
   async (suffixOutcome) => {
@@ -1256,12 +1305,12 @@ it.each(["committed", "rejected"] as const)(
       const stored = JSON.parse(
         readFileSync(resolve(root, "control-plane-state.json"), "utf8"),
       );
-      expect(stored.ackedSourceSeq).toBe(suffixOutcome === "committed" ? 2 : 1);
+      expect(stored.ackedSourceSeq).toBe(2);
       expect(
         stored.committedEvents.map(
           (event: { sourceSeq: number }) => event.sourceSeq,
         ),
-      ).toEqual(suffixOutcome === "committed" ? [1, 2] : [1]);
+      ).toEqual([1, 2]);
       expect(stored.commands).toEqual([]);
     } finally {
       releases.forEach((release) => release());
@@ -2026,7 +2075,11 @@ describe.sequential("DurablePrpControlPlane", () => {
         const first = (await authenticate(core, core.issueBootstrapTicket()))!;
         sendSecure(first, semanticInputEvent());
         await expect(receiveSecure(first)).resolves.toBeNull();
-        expect(core.store.state.ackedSourceSeq).toBe(0);
+        expect(core.store.state.ackedSourceSeq).toBe(1);
+        expect(core.store.state.committedEvents[0]).toMatchObject({
+          sourceSeq: 1,
+          logicalEffectCount: 1,
+        });
         expect(onSemanticToolInput).not.toHaveBeenCalled();
         const retry = (await authenticate(core, first.leaseToken!))!;
         sendSecure(retry, semanticInputEvent());
@@ -2035,7 +2088,7 @@ describe.sequential("DurablePrpControlPlane", () => {
           payload: { ackedSourceSeq: 1 },
         });
         expect(onProtocolIntegrityError).not.toHaveBeenCalled();
-        expect(onCommittedEvent).toHaveBeenCalledTimes(2);
+        expect(onCommittedEvent).toHaveBeenCalledTimes(1);
         expect(onSemanticToolInput).toHaveBeenCalledTimes(1);
         retry.socket.destroy();
       } finally {
@@ -2290,13 +2343,13 @@ describe.sequential("DurablePrpControlPlane", () => {
     try {
       await recovered.start();
       const client = await authenticate(recovered, leaseToken!);
-      expect(client?.welcome.payload).toMatchObject({ ackedSourceSeq: 0 });
+      expect(client?.welcome.payload).toMatchObject({ ackedSourceSeq: 1 });
       sendSecure(client!, semanticInputEvent());
       await expect(receiveSecure(client!)).resolves.toMatchObject({
         kind: "ack",
         payload: { ackedSourceSeq: 1 },
       });
-      expect(committed).toBe(1);
+      expect(committed).toBe(0);
       client?.socket.destroy();
     } finally {
       await recovered.stop();
