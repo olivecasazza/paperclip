@@ -12,6 +12,8 @@ import { validate } from "../middleware/validate.js";
 import {
   budgetService,
   costService,
+  DEFAULT_MAX_SAMPLED_RUNS,
+  tenantCpuService,
   financeService,
   companyService,
   agentService,
@@ -45,6 +47,16 @@ export function parseCostLimit(query: Record<string, unknown>) {
   return limit;
 }
 
+export function parseTenantCpuLimit(query: Record<string, unknown>) {
+  const raw = Array.isArray(query.limit) ? query.limit[0] : query.limit;
+  if (raw == null || raw === "") return {};
+  const limit = typeof raw === "number" ? raw : Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(limit) || limit <= 0 || limit > DEFAULT_MAX_SAMPLED_RUNS) {
+    throw badRequest(`invalid 'limit' value (max ${DEFAULT_MAX_SAMPLED_RUNS})`);
+  }
+  return { limit };
+}
+
 export function costRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -63,6 +75,7 @@ export function costRoutes(
   const agents = agentService(db);
   const issues = issueService(db);
   const access = accessService(db);
+  const tenantCpu = tenantCpuService(db);
 
   async function resolveIssueByRef(rawId: string) {
     const identifier = normalizeIssueIdentifier(rawId);
@@ -205,6 +218,41 @@ export function costRoutes(
     const range = parseCostDateRange(req.query);
     const rows = await costs.byAgentModel(companyId, range);
     res.json(rows);
+  });
+
+  // Per-tenant CPU attribution, beside the per-company token/cost rollups.
+  //
+  // The pod's `cpu.max` is a cross-tenant budget, so a company's demand is only
+  // meaningful next to its cost. This joins the run rows this company already
+  // owns against `/proc/<pid>/stat`, so it carries exactly the company-boundary
+  // rules of the cost rollup above: `assertCompanyCostReadAllowed` gates it and
+  // the service only ever reads this company's own pids. Observability only —
+  // it gates nothing.
+  router.get("/companies/:companyId/costs/tenant-cpu", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
+    const rollup = await tenantCpu.tenantCpu(companyId, parseTenantCpuLimit(req.query));
+    res.json(rollup);
+  });
+
+  // The operator-only cross-tenant view. `assertBoard` is the load-bearing
+  // check: this returns every company, so a company actor must never reach it.
+  router.get("/companies/tenant-cpu", async (req, res) => {
+    assertBoard(req);
+    const rollup = await tenantCpu.tenantCpuAcrossCompanies(parseTenantCpuLimit(req.query));
+    res.json(rollup);
+  });
+
+  // The `/proc`-scoped census, for agreement checks against
+  // `scripts/pod-tenant-cpu-census.sh`. Board-only for the same reason: the
+  // unscoped form attributes load to every tenant at once.
+  router.get("/companies/tenant-cpu/census", async (req, res) => {
+    assertBoard(req);
+    const companyId = (req.query.companyId as string | undefined) || null;
+    if (companyId) assertCompanyAccess(req, companyId);
+    const census = await tenantCpu.podCensus({ scopeCompanyId: companyId });
+    res.json(census);
   });
 
   router.get("/companies/:companyId/costs/by-provider", async (req, res) => {

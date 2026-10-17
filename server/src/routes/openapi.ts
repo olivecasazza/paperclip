@@ -1329,6 +1329,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
   "GET /api/companies/{companyId}/decisions",
+  // Cross-tenant CPU attribution: every company in one payload, so board only.
+  "GET /api/companies/tenant-cpu",
+  "GET /api/companies/tenant-cpu/census",
   "GET /api/cloud/stacks",
   "GET /api/companies",
   "POST /api/companies",
@@ -5180,6 +5183,37 @@ for (const segment of costSummaryPaths) {
     responses: { 200: r.ok(), 401: r.unauthorized },
   });
 }
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/costs/tenant-cpu",
+  tags: ["costs"],
+  summary: "Per-tenant CPU attribution rollup for one company",
+  description:
+    "Joins this company's unfinished run pids against /proc/<pid>/stat and buckets CPU by company. Readable under the same rules as the per-company cost rollup. Observability only: it gates no work.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/tenant-cpu",
+  tags: ["costs"],
+  summary: "Cross-tenant CPU attribution rollup (board only)",
+  description:
+    "Every company's CPU share of the shared control-plane cgroup quota. Cross-tenant visibility is operator-only, so this requires board access.",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/tenant-cpu/census",
+  tags: ["costs"],
+  summary: "Pod-wide /proc tenant CPU census (board only)",
+  description:
+    "Attributes CPU per tenant for every process carrying a company id, the same population scripts/pod-tenant-cpu-census.sh reports, for agreement checks.",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
 
 registry.registerPath({
   method: "post",

@@ -11,6 +11,8 @@ import type {
   FinanceByKind,
   FinanceEvent,
   ProviderQuotaResult,
+  TenantCpuReport,
+  TenantCpuCensus,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -47,6 +49,14 @@ export const costsApi = {
     api.get<CostWindowSpendRow[]>(`/companies/${companyId}/costs/window-spend`),
   quotaWindows: (companyId: string) =>
     api.get<ProviderQuotaResult[]>(`/companies/${companyId}/costs/quota-windows`),
+  // Per-tenant CPU attribution for this company, under the same access rules as
+  // the cost rollups above. Observability only — it never gates anything.
+  tenantCpu: (companyId: string) =>
+    api.get<TenantCpuReport>(`/companies/${companyId}/costs/tenant-cpu`),
+  // Board-only cross-tenant views; a company actor is denied both.
+  tenantCpuAcrossCompanies: () => api.get<TenantCpuReport>("/companies/tenant-cpu"),
+  tenantCpuCensus: (companyId?: string) =>
+    api.get<TenantCpuCensus>(`/companies/tenant-cpu/census${companyId ? `?companyId=${companyId}` : ""}`),
 };
 
 function dateParamsWithLimit(from?: string, to?: string, limit?: number): string {

@@ -109,18 +109,29 @@ const mockBudgetService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
+// Per-tenant CPU attribution is joined from heartbeat_runs + /proc, neither of
+// which this suite fakes, so the route's service is stubbed at the boundary.
+const mockTenantCpuService = vi.hoisted(() => ({
+  tenantCpu: vi.fn(),
+  tenantCpuAcrossCompanies: vi.fn(),
+  podCensus: vi.fn(),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     budgetService: () => mockBudgetService,
     costService: () => mockCostService,
+    tenantCpuService: () => mockTenantCpuService,
     financeService: () => mockFinanceService,
     companyService: () => mockCompanyService,
     agentService: () => mockAgentService,
     issueService: () => mockIssueService,
     heartbeatService: () => mockHeartbeatService,
     logActivity: mockLogActivity,
+    // The route module imports the sample ceiling at module scope; the mock
+    // must supply it or the limit guard compares against undefined.
+    DEFAULT_MAX_SAMPLED_RUNS: 500,
   }));
 
   vi.doMock("../services/quota-windows.js", () => ({
@@ -397,6 +408,167 @@ describe("cost routes", () => {
         details: { budgetMonthlyCents: 2500 },
       }),
     );
+  });
+
+  // The company-boundary contract for per-tenant CPU: a company reads only its
+  // own attribution, and the cross-tenant rollup is operator-only. The pod's
+  // cpu.max is a cross-tenant budget, so a per-tenant view that leaked across
+  // companies would expose one tenant's load to another.
+  describe("per-tenant CPU attribution boundary", () => {
+    const rollup = {
+      scopeCompanyId: "company-1",
+      generatedAt: "2026-10-04T00:00:00.000Z",
+      tenants: [
+        {
+          companyId: "company-1",
+          companyName: "Paperclip",
+          trackedRunCount: 2,
+          missingPidCount: 0,
+          cpuSeconds: 447.8,
+          sharePercent: 100,
+          maxRunCpuSeconds: 300,
+          liveRunCount: 2,
+          recycledPidCount: 0,
+          sampledAt: "2026-10-04T00:00:00.000Z",
+        },
+      ],
+      totalCpuSeconds: 447.8,
+      skippedProcessCount: 0,
+      procUnavailable: false,
+      cgroupCpuMax: { quotaCores: 4, periodMs: 100000 },
+      cgroupThrottling: { usageUsec: 1, nrPeriods: 2, nrThrottled: 1, throttledUsec: 3 },
+    };
+
+    it("serves a company's own CPU rollup through the same cost access gate", async () => {
+      mockTenantCpuService.tenantCpu.mockResolvedValue(rollup as any);
+      const app = createAppWithActor({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: ["company-1"],
+      });
+
+      const res = await request(app).get("/api/companies/company-1/costs/tenant-cpu");
+
+      expect(res.status).toBe(200);
+      expect(mockTenantCpuService.tenantCpu).toHaveBeenCalledWith(
+        "company-1",
+        expect.anything(),
+      );
+      expect(res.body.totalCpuSeconds).toBe(447.8);
+    });
+
+    it("denies a company's CPU rollup to an actor outside its cost boundary", async () => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        action: "company_scope:read",
+        reason: "deny_test",
+        explanation: "Not in this actor's company boundary.",
+      });
+      const app = createAppWithActor({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: ["company-1"],
+      });
+
+      const res = await request(app).get("/api/companies/company-1/costs/tenant-cpu");
+
+      expect(res.status).toBe(403);
+      expect(mockTenantCpuService.tenantCpu).not.toHaveBeenCalled();
+    });
+
+    it("denies a company actor its own CPU rollup when it lacks the cost scope", async () => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        action: "company_scope:read",
+        reason: "deny_test",
+        explanation: "Not in this actor's company boundary.",
+      });
+      const app = createAppWithActor({
+        type: "agent",
+        agentId: "agent-2",
+        companyId: "company-1",
+        runId: "run-2",
+      });
+
+      const res = await request(app).get("/api/companies/company-1/costs/tenant-cpu");
+
+      expect(res.status).toBe(403);
+      expect(mockTenantCpuService.tenantCpu).not.toHaveBeenCalled();
+    });
+
+    it("rejects an out-of-range sample limit rather than clamping silently", async () => {
+      const app = createApp();
+      const res = await request(app).get(
+        "/api/companies/company-1/costs/tenant-cpu?limit=999999",
+      );
+      expect(res.status).toBe(400);
+      expect(mockTenantCpuService.tenantCpu).not.toHaveBeenCalled();
+    });
+
+    it("keeps the cross-tenant rollup board-only", async () => {
+      const app = createAppWithActor({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        runId: "run-1",
+      });
+
+      const res = await request(app).get("/api/companies/tenant-cpu");
+
+      expect(res.status).toBe(403);
+      expect(mockTenantCpuService.tenantCpuAcrossCompanies).not.toHaveBeenCalled();
+    });
+
+    it("keeps the pod census board-only, including when scoped to one company", async () => {
+      const app = createAppWithActor({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        runId: "run-1",
+      });
+
+      const res = await request(app).get(
+        "/api/companies/tenant-cpu/census?companyId=company-1",
+      );
+
+      expect(res.status).toBe(403);
+      expect(mockTenantCpuService.podCensus).not.toHaveBeenCalled();
+    });
+
+    it("serves the cross-tenant rollup to a board actor", async () => {
+      mockTenantCpuService.tenantCpuAcrossCompanies.mockResolvedValue({
+        ...rollup,
+        scopeCompanyId: null,
+        tenants: [
+          { ...rollup.tenants[0], sharePercent: 74.5 },
+          {
+            ...rollup.tenants[0],
+            companyId: "company-2",
+            companyName: "Other",
+            cpuSeconds: 152.8,
+            sharePercent: 25.5,
+          },
+        ],
+        totalCpuSeconds: 600.6,
+      } as any);
+      const app = createAppWithActor({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: ["company-1", "company-2"],
+      });
+
+      const res = await request(app).get("/api/companies/tenant-cpu");
+
+      expect(res.status).toBe(200);
+      expect(res.body.tenants).toHaveLength(2);
+      expect(res.body.scopeCompanyId).toBeNull();
+    });
   });
 });
 
