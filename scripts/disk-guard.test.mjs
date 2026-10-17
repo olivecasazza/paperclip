@@ -1835,6 +1835,21 @@ test("shared cargo target scope: a hardlinked shared dir is skipped, not deleted
   try {
     installDfStub(sandbox, { size: 100 * 1024 * MIB, used: 5 * 1024 * MIB, avail: 95 * 1024 * MIB });
     const apiStub = installPaperclipApiStub(sandbox, { roster: ["agent-1"], issues: { "DEF-1": "todo" } });
+    // Shadow the process lister so "no build is running" is a fact about this
+    // test rather than about the host. The guard tries pgrep then pidof before
+    // falling back to a /proc scan, and the three sibling shared-scope tests
+    // stub the lister for exactly this reason. Without the stub the result
+    // depends on whether the machine happens to be running cargo or rustc:
+    // it passed on a container with no pgrep (falling through to /proc) and
+    // failed on a runner that had one (run 37233752756), for a reason that has
+    // nothing to do with the nlink behaviour this test is about.
+    //
+    // exit 1 is "matched nothing", which is the one lister result the guard
+    // treats as evidence of absence; 0 would mean a build is running and 2
+    // would mean the table is unreadable, and both make the guard skip.
+    for (const tool of ["pgrep", "pidof"]) {
+      writeFileSync(path.join(sandbox.binDir, tool), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    }
     // Same nlink gate as every other candidate: a shared dir whose inodes are
     // also linked into a live tree frees nothing and must not be removed.
     const live = seed(sandbox, "live/blob", 2 * MIB);

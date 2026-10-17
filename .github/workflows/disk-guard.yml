@@ -1,0 +1,91 @@
+name: Disk Pressure Guard
+
+# Why this is a separate workflow instead of a step in pr-trusted.yml
+# ---------------------------------------------------------------------------
+# ae7f6dc94 added `pnpm run test:disk-guard` as a step in *this repo's*
+# .github/workflows/pr-trusted.yml. That step never runs, because
+# pr.yml delegates the whole CI job to the upstream reusable workflow:
+#
+#   jobs.ci.uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+#
+# `uses:` with an owner/repo reference resolves the called workflow from the
+# *upstream* repo at that ref, never from a fork's copy. Upstream has no
+# disk-guard surface at all (`git ls-tree -r upstream/master -- scripts/disk-guard*`
+# returns nothing), so the fork's copy of pr-trusted.yml is dead code here.
+#
+# Confirmed empirically rather than inferred: run 37229375494 on head
+# e60b3bfda has `path = .github/workflows/pr.yml`, and its `ci / policy` job
+# step list has no disk-guard step -- the job passed without running the suite.
+#
+# This workflow is fork-local and does execute on pull_request, so it is where
+# the gate belongs. Repointing pr.yml at a local copy of pr-trusted.yml is the
+# other possible fix and is deliberately NOT done here: that would swap the
+# trusted PR policy lane wholesale and needs its own reviewed change.
+on:
+  pull_request:
+    paths:
+      - scripts/disk-guard.sh
+      - scripts/disk-guard.test.mjs
+      - .github/workflows/disk-guard.yml
+      - package.json
+  push:
+    branches:
+      - master
+    paths:
+      - scripts/disk-guard.sh
+      - scripts/disk-guard.test.mjs
+      - .github/workflows/disk-guard.yml
+      - package.json
+  # A guard that reclaims disk only proves itself over time, and the
+  # runtime-copy assertion below is a host-side check that cannot run here
+  # (see the skip note in the job). A daily run catches a drifted or edited
+  # guard on master even when no pull request touches it.
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: disk-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disk_guard:
+    name: Disk-pressure guard thresholds and reclaim gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      # The suite imports only node: builtins, so there is no workspace install
+      # to do here. Invoking the npm script directly keeps that explicit.
+      - name: Run disk-pressure guard suite
+        run: pnpm run test:disk-guard
+
+      - name: Report that the runtime-copy assertion self-skips here
+        # "every installed runtime copy of the guard is the version the repo
+        # ships" self-skips on a machine with no installed copies, which a CI
+        # runner always is. That is correct behaviour, but it means a green run
+        # here must not be read as deployed-copy coverage. Say so in the log so
+        # the run is self-describing instead of quietly implying more than it
+        # checked.
+        run: |
+          echo "::notice title=Disk guard coverage::the installed-runtime-copy assertion self-skips on CI runners; deployed-vs-repo drift needs a host-side run of node --test scripts/disk-guard.test.mjs"
