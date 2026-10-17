@@ -75,6 +75,29 @@ export const AGENT_ROLE_LABELS: Record<AgentRole, string> = {
 };
 
 export const AGENT_DEFAULT_MAX_CONCURRENT_RUNS = 20;
+
+// Run-admission ceilings that bound CPU contention across tenants sharing one
+// control-plane process (and therefore one cgroup CPU quota).
+//
+// `HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT` is a process-scoped aggregate
+// ceiling: it caps in-flight heartbeat runs across every company so a company
+// with many agents cannot spend the whole pod quota on its own.
+// `HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT` is the per-company ceiling,
+// so one tenant can never exhaust the manager-wide resource.
+//
+// Sizing (measured 2026-10-01, 181s window, attributed via
+// `/proc/<pid>/environ` PAPERCLIP_COMPANY_ID): with a `cpu.max` of 4.00 cores
+// and the control-plane server itself drawing ~0.43 cores, the worst case for a
+// global cap of 5 is 5 workers x 0.6 cores single-worker p95 peak + 0.43 server
+// = 3.43 against the 4.00 quota. A global cap of 6 was rejected (6 x 0.6 + 0.43
+// = 4.03, marginally over quota). Global 5 / company 2 keeps 3 aggregate slots
+// reachable by other tenants regardless of how many agents one company adds.
+//
+// These are ceilings, not floors. A tenant that already holds its slots can
+// still be slowed by kernel CFS fair-share inside the shared quota; guaranteed
+// floors need `cpu.weight`, which requires a privileged control-plane container.
+export const HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT = 5;
+export const HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT = 2;
 export const WORKSPACE_BRANCH_ROUTINE_VARIABLE = "workspaceBranch";
 
 // Config keys owned by Paperclip/company state rather than one concrete adapter.

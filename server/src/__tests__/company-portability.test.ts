@@ -3675,6 +3675,8 @@ describe("company portability", () => {
         heartbeat: {
           enabled: false,
           maxConcurrentRuns: 20,
+          companyMaxConcurrentRuns: 2,
+          globalMaxConcurrentRuns: 5,
         },
       },
     }));
@@ -5869,6 +5871,8 @@ describe("company portability", () => {
         heartbeat: {
           enabled: false,
           maxConcurrentRuns: 20,
+          companyMaxConcurrentRuns: 2,
+          globalMaxConcurrentRuns: 5,
         },
       },
     }));

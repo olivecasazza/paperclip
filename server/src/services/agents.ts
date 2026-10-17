@@ -20,6 +20,8 @@ import {
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT,
+  HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT,
   agentRuntimeConfigSchema,
   getAgentWorkEligibility,
   isUuidLike,
@@ -251,6 +253,18 @@ function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<strin
     : {};
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
     heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+  }
+  // Persist the aggregate ceilings alongside the per-agent ceiling so a new
+  // agent's config snapshot records the process-wide defaults explicitly.
+  // These resolve process-wide, not per agent: an unset value here would be
+  // indistinguishable from "no ceiling" at the admission gate.
+  if (parseFiniteNumberLike(heartbeat.companyMaxConcurrentRuns) == null) {
+    heartbeat.companyMaxConcurrentRuns =
+      HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT;
+  }
+  if (parseFiniteNumberLike(heartbeat.globalMaxConcurrentRuns) == null) {
+    heartbeat.globalMaxConcurrentRuns =
+      HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
   return normalizedRuntimeConfig;

@@ -47,6 +47,8 @@ import type {
 } from "@paperclipai/shared";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT,
+  HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT,
   ISSUE_PRIORITIES,
   ISSUE_STATUSES,
   PROJECT_ICON_NAMES,
@@ -790,6 +792,12 @@ const RUNTIME_DEFAULT_RULES: Array<{ path: string[]; value: unknown }> = [
   { path: ["heartbeat", "wakeOnAutomation"], value: true },
   { path: ["heartbeat", "wakeOnDemand"], value: true },
   { path: ["heartbeat", "maxConcurrentRuns"], value: AGENT_DEFAULT_MAX_CONCURRENT_RUNS },
+  // The company- and process-scoped run-admission ceilings. Pruning them on
+  // export and re-seeding them on import keeps an exported bundle free of
+  // per-agent copies of the process-wide defaults while the round trip still
+  // lands on 5 / 2.
+  { path: ["heartbeat", "companyMaxConcurrentRuns"], value: HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT },
+  { path: ["heartbeat", "globalMaxConcurrentRuns"], value: HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT },
 ];
 
 const ADAPTER_DEFAULT_RULES_BY_TYPE: Record<string, Array<{ path: string[]; value: unknown }>> = {
@@ -1322,6 +1330,17 @@ function sanitizeImportedAgentRuntimeConfig(runtimeConfig: unknown) {
   heartbeat.enabled = false;
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
     heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
+  }
+  // Re-seed the aggregate run-admission ceilings after an export pruned them as
+  // default-like, so an imported agent never lands with "no ceiling" where the
+  // source agent had the process-wide defaults.
+  if (parseFiniteNumberLike(heartbeat.companyMaxConcurrentRuns) == null) {
+    heartbeat.companyMaxConcurrentRuns =
+      HEARTBEAT_COMPANY_MAX_CONCURRENT_RUNS_DEFAULT;
+  }
+  if (parseFiniteNumberLike(heartbeat.globalMaxConcurrentRuns) == null) {
+    heartbeat.globalMaxConcurrentRuns =
+      HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_DEFAULT;
   }
   next.heartbeat = heartbeat;
   if (isPlainRecord(next.debug)) {
