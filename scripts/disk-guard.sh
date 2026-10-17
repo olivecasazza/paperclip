@@ -97,9 +97,13 @@
 #                             DISK_GUARD_FORCE=1.
 #   disk-guard.sh --status    print last recorded status (no measurement)
 #
-# Thresholds are volume-relative: percentages are absolute, but the free-space
-# floor is max(MIN_FREE_MB, 3% of total) so it stays correct after a resize.
-# Set DISK_GUARD_MIN_FREE_MB=0 to disable the floor entirely.
+# Byte thresholds are volume-relative: percentages are absolute, but the
+# free-space floor is max(MIN_FREE_MB, 3% of total) so it stays correct after a
+# resize. Set DISK_GUARD_MIN_FREE_MB=0 to disable the byte floor entirely.
+#
+# Inode pressure is floor-based only: DISK_GUARD_MIN_FREE_INODES defaults to
+# 200000; below that is critical, below 2x that is warn. Set it to 0 to disable
+# the inode floor entirely.
 #
 # Trend thresholds: FALL_RATE_MB_PER_HOUR (default -1024, i.e. "losing more than
 # 1GiB/hour") escalates a falling trend to warn even when the snapshot level is
@@ -141,7 +145,17 @@ MOUNT="${DISK_GUARD_MOUNT:-/paperclip}"
 WARN_PCT="${DISK_GUARD_WARN_PCT:-88}"
 CRIT_PCT="${DISK_GUARD_CRIT_PCT:-94}"
 MIN_FREE_MB="${DISK_GUARD_MIN_FREE_MB:-1500}"
+MIN_FREE_INODES="${DISK_GUARD_MIN_FREE_INODES:-200000}"
 STATUS_FILE="${DISK_GUARD_STATUS_FILE:-/paperclip/run/disk-guard.status}"
+# Append-only delete journal. This guard is the only thing on the volume that
+# deletes reclaimable build output, and until now it kept no record of what it
+# removed. A 17.6 GiB deletion of /paperclip/cargo-target-shared (CON-391) left
+# no actor, no path and no byte count in any Paperclip surface; a guard that
+# only reports used_bytes cannot answer "who deleted this". Every path this
+# guard removes is recorded here, one NDJSON object per line, with the actor and
+# run that removed it. It sits beside the status file so a caller that relocates
+# the status file relocates the journal with it. Set to empty to disable.
+JOURNAL_FILE="${DISK_GUARD_JOURNAL_FILE:-$(dirname "$STATUS_FILE")/disk-guard-journal.ndjson}"
 API_URL="${PAPERCLIP_API_URL:-http://127.0.0.1:3100}"
 WORKSPACES_DIR="${DISK_GUARD_WORKSPACES_DIR:-$MOUNT/instances/default/workspaces}"
 WORKSPACE_RECLAIM_MIN_AGE_HOURS="${DISK_GUARD_WORKSPACE_RECLAIM_MIN_AGE_HOURS:-24}"
@@ -231,13 +245,53 @@ require_company_id() {
   fi
 }
 
+# Append one delete record to the journal: ts, actor, run_id, company_id, pid,
+# path, bytes, inodes, reason, rm_exit. Written as NDJSON so a reader can tail
+# it and a truncated final line is the only possible corruption.
+#
+# The journal is an audit sink, not an authorization gate. A write failure is
+# logged loudly but must never block a reclaim the guard's own gates already
+# authorized: refusing to delete on an unwritable journal would turn an audit
+# gap into a full volume, which is the failure the guard exists to prevent. The
+# record is written after rm so it reports what actually happened, not intent.
+journal_delete() {
+  local p="$1" bytes="$2" inodes="$3" reason="$4" rc="$5"
+  [ -n "$JOURNAL_FILE" ] || return 0
+  mkdir -p -- "$(dirname "$JOURNAL_FILE")" 2>/dev/null
+  node -e '
+    const fs = require("fs");
+    const [file, path, bytes, inodes, reason, rc] = process.argv.slice(1);
+    const row = {
+      ts: new Date().toISOString(),
+      actor: process.env.PAPERCLIP_AGENT_ID || process.env.DISK_GUARD_ACTOR || "unknown",
+      run_id: process.env.PAPERCLIP_RUN_ID || null,
+      company_id: process.env.PAPERCLIP_COMPANY_ID || process.env.DISK_GUARD_COMPANY_ID || null,
+      pid: process.pid,
+      path,
+      bytes: Number(bytes),
+      inodes: Number(inodes),
+      reason,
+      rm_exit: Number(rc),
+    };
+    fs.appendFileSync(file, JSON.stringify(row) + "\n");
+  ' "$JOURNAL_FILE" "$p" "$bytes" "$inodes" "$reason" "$rc" 2>/dev/null \
+    || log "journal: could not record delete of $p (reason=$reason)"
+}
+
 remove_path() {
-  local p="$1"
+  local p="$1" reason="${2:-unspecified}" bytes inodes rc
   if [ "${DISK_GUARD_DRY_RUN:-0}" = "1" ]; then
     log "dry-run rm -rf $p"
     return 0
   fi
+  # Measure before deleting: these are the figures the journal exists to keep,
+  # and a path that no longer exists cannot be measured.
+  bytes="$(unlinked_bytes "$p")"
+  inodes="$(find "$p" -xdev -type f -links 1 -printf 'x\n' 2>/dev/null | wc -l | tr -d ' ')"
   rm -rf -- "$p" 2>/dev/null
+  rc=$?
+  journal_delete "$p" "$bytes" "$inodes" "$reason" "$rc"
+  return "$rc"
 }
 
 api_get() {
@@ -635,7 +689,7 @@ reclaim_nix_orphans() {
       log "skip  $candidate (only $(( ${size:-0} / 1024 ))KiB unlinked-reclaimable)"
       continue
     fi
-    remove_path "$candidate"
+    remove_path "$candidate" "nix_orphan_temp_pack"
     log "reclaim $candidate (~$(( size / 1024 / 1024 ))MiB orphaned nix temp pack/idx)"
     total=$(( total + size ))
   done <<<"$(nix_orphan_temp_pack_candidates)"
@@ -1139,6 +1193,14 @@ cargo_target_reclaim_candidates() {
   done
 }
 
+measure_inodes() {
+  df --output=iavail --output=itotal "$MOUNT" 2>/dev/null | awk '
+    NR>1 && NF>=2 {
+      iavail=$1+0; itotal=$2+0
+      printf "%d %d\n", iavail, itotal
+    }' | tail -1
+}
+
 measure() {
   # df -P columns: 1=filesystem 2=size 3=used 4=avail 5=capacity 6=mount
   # Use awk so column positions and the percentage are explicit rather than
@@ -1190,10 +1252,13 @@ capture_prev_measurement() {
 
 report() {
   local size used avail pct avail_mb level rc floor_mb
+  local iavail itotal iused iuse_pct inode_floor
   local prev_avail_mb prev_checked_at elapsed_min delta_mb rate_mb_hour
   local trend="" level_prev level_snapshot
+  local inode_pressure="0"
   capture_prev_measurement
   read -r size used avail pct <<<"$(measure)"
+  read -r iavail itotal <<<"$(measure_inodes)"
 
   # An unreadable or unparseable df is a measurement failure, not a pressure
   # signal. Without this guard the empty fields fall through the integer
@@ -1205,8 +1270,18 @@ report() {
     log "cannot measure $MOUNT (df returned no usable row); treating as a measurement error"
     return 1
   fi
+  if [ -z "$iavail" ] || [ -z "$itotal" ]; then
+    log "cannot measure $MOUNT inodes (df returned no usable row); treating as a measurement error"
+    return 1
+  fi
 
   avail_mb=$(( avail / 1024 / 1024 ))
+  iused=$(( itotal - iavail ))
+  if [ "$itotal" -gt 0 ]; then
+    iuse_pct=$(( (iused * 100 + itotal - 1) / itotal ))
+  else
+    iuse_pct=0
+  fi
 
   # Free-space floor scales with the volume: a fixed 1500MiB floor meant
   # something different on a 20G volume than on a 59G one. 3% of total keeps
@@ -1219,15 +1294,30 @@ report() {
     [ "$floor_mb" -lt "$MIN_FREE_MB" ] && floor_mb=$MIN_FREE_MB
   fi
 
+  if [ "$MIN_FREE_INODES" -le 0 ]; then
+    inode_floor=0
+  else
+    inode_floor=$MIN_FREE_INODES
+  fi
+
   level="ok"; rc=0
   if   [ "$pct" -ge "$CRIT_PCT" ]; then level="critical"; rc=3
   elif [ "$pct" -ge "$WARN_PCT" ] || [ "$avail_mb" -lt "$floor_mb" ]; then level="warn"; rc=2
   fi
-  # What df said, before any trend escalated it. Kept separately because the two
-  # answer different questions and callers need to be able to tell them apart:
-  # `level` is what to tell a human, `level_snapshot` is what authorises deletion.
-  # An ok volume falling 10GiB/hour is an incident and still not a reclaim trigger.
+  # What byte df said, before any inode or trend escalated it. Kept separately
+  # because it authorises deletion, while inode pressure is a report signal only.
   level_snapshot="$level"
+  if [ "$inode_floor" -gt 0 ]; then
+    if [ "$iavail" -lt "$inode_floor" ]; then
+      inode_pressure="critical"
+      level="critical"; rc=3
+    elif [ "$iavail" -lt $(( inode_floor * 2 )) ]; then
+      inode_pressure="warn"
+      if [ "$rc" -lt 2 ]; then
+        level="warn"; rc=2
+      fi
+    fi
+  fi
 
   # Trend against the previous recorded measurement, read from the status file
   # this function is about to overwrite. Read here, not after the write: the file
@@ -1325,9 +1415,10 @@ report() {
     esac
   fi
 
-  printf 'mount=%s size=%sGiB used=%sGiB(>%s%%) free=%sMiB floor=%sMiB level=%s\n' \
+  printf 'mount=%s size=%sGiB used=%sGiB(>%s%%) free=%sMiB floor=%sMiB iavail=%s itotal=%s iuse=%s%% ifloor=%s level=%s\n' \
     "$MOUNT" "$(( size / 1024 / 1024 / 1024 ))" \
-    "$(( used / 1024 / 1024 / 1024 ))" "$pct" "$avail_mb" "$floor_mb" "$level"
+    "$(( used / 1024 / 1024 / 1024 ))" "$pct" "$avail_mb" "$floor_mb" \
+    "$iavail" "$itotal" "$iuse_pct" "$inode_floor" "$level"
   # The trend on the same line as the level, so a routine comment carries the
   # whole story and a human diffing two runs does not have to open the status file.
   if [ -n "$rate_mb_hour" ]; then
@@ -1350,11 +1441,13 @@ report() {
     printf 'mount=%s\n' "$MOUNT"
     printf 'size_bytes=%s\nused_bytes=%s\navail_bytes=%s\nuse_pct=%s\navail_mb=%s\nfloor_mb=%s\n' \
       "$size" "$used" "$avail" "$pct" "$avail_mb" "$floor_mb"
+    printf 'iavail=%s\nitotal=%s\niuse_pct=%s\ninode_floor=%s\ninode_pressure=%s\n' \
+      "$iavail" "$itotal" "$iuse_pct" "$inode_floor" "$inode_pressure"
     printf 'avail_mb_prev=%s\navail_mb_delta=%s\navail_mb_elapsed_minutes=%s\nfall_rate_mb_per_hour=%s\n' \
       "${prev_avail_mb:-}" "${delta_mb:-}" "${elapsed_min:-}" "${rate_mb_hour:-}"
-    printf 'level=%s\nlevel_snapshot=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
-      "$level" "${level_snapshot:-}" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$FALL_RATE_MB_PER_HOUR"
-    printf 'guard_version=8\n'
+    printf 'level=%s\nlevel_snapshot=%s\nlevel_prev=%s\nwarn_pct=%s\ncrit_pct=%s\nmin_free_mb=%s\nmin_free_inodes=%s\nfall_rate_threshold_mb_per_hour=%s\n' \
+      "$level" "${level_snapshot:-}" "${level_prev:-}" "$WARN_PCT" "$CRIT_PCT" "$MIN_FREE_MB" "$MIN_FREE_INODES" "$FALL_RATE_MB_PER_HOUR"
+    printf 'guard_version=10\n'
   } >"$STATUS_FILE" 2>/dev/null
 
   return "$rc"
@@ -1431,7 +1524,7 @@ prune() {
       log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
       continue
     fi
-    remove_path "$p"
+    remove_path "$p" "safe_cache"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable)"
     total=$(( total + freed ))
   done
@@ -1453,7 +1546,7 @@ prune() {
       log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
       continue
     fi
-    remove_path "$p"
+    remove_path "$p" "workspace_build_output"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable workspace build output)"
     total=$(( total + freed ))
   done
@@ -1468,7 +1561,7 @@ prune() {
       log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
       continue
     fi
-    remove_path "$p"
+    remove_path "$p" "worktree_build_output"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable worktree build output)"
     total=$(( total + freed ))
   done
@@ -1483,14 +1576,21 @@ prune() {
       log "skip  $p (only $((freed/1024))KiB unlinked-reclaimable)"
       continue
     fi
-    remove_path "$p"
+    remove_path "$p" "cargo_target"
     log "prune $p (~$((freed/1024/1024))MiB reclaimable cargo target)"
     total=$(( total + freed ))
   done
 
   for p in "${log_dirs[@]}"; do
     [ -d "$p" ] || continue
+    # This one deletes per-file rather than the whole tree, so measure the
+    # rotated set the same way before it goes and journal the aggregate under
+    # the directory path. Same record shape as remove_path, same actor.
+    local log_bytes log_inodes
+    log_bytes="$(find "$p" -xdev -type f -mtime +1 -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    log_inodes="$(find "$p" -xdev -type f -mtime +1 -printf 'x\n' 2>/dev/null | wc -l | tr -d ' ')"
     find "$p" -xdev -type f -mtime +1 -delete 2>/dev/null
+    journal_delete "$p" "$log_bytes" "$log_inodes" "rotated_log" "0"
     log "prune $p (rotated logs, mtime>1d)"
   done
 
