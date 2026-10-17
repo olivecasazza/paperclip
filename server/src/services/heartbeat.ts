@@ -39,7 +39,11 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import {
+  PROJECT_REPOSITORIES_DIR,
+  readGitAncestryBoundaryState,
+  readGitWorkspaceSnapshot,
+} from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -22556,6 +22560,33 @@ export function heartbeatService(
         context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
           ...wakePayloadForWorkspace,
           executionWorkspace: { branchName: executionWorkspace.branchName },
+        };
+      }
+      // A workspace staged into a sandbox is transported as a depth-1 shallow
+      // clone, which leaves the boundary commit parentless: `git merge-base`
+      // against any older commit returns nothing, `git rev-list --count <ref>`
+      // returns 1, and `git rev-list --max-parents=0 <ref>` reports a root
+      // commit. Those are exactly what a force-pushed trunk looks like, so
+      // announce the truncation in the agent's environment rather than letting
+      // a run report a fork and propose rewriting a shared branch. Detection is
+      // one local `rev-parse`, so a full-history checkout costs nothing extra
+      // and pays the depth it asks for only on a real shallow boundary.
+      const executionWorkspaceIsShallow =
+        await readGitAncestryBoundaryState(executionWorkspace.cwd) === "shallow";
+      if (executionWorkspaceIsShallow) {
+        context.paperclipWorkspaceShallowHistory = true;
+        const wakePayloadForShallowWorkspace = parseObject(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+        );
+        const existingWorkspacePin = parseObject(
+          wakePayloadForShallowWorkspace.executionWorkspace,
+        );
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
+          ...wakePayloadForShallowWorkspace,
+          executionWorkspace: {
+            ...existingWorkspacePin,
+            shallowHistory: true,
+          },
         };
       }
       const runtimeServiceIntents = (() => {

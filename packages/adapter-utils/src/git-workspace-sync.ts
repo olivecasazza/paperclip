@@ -573,6 +573,11 @@ export async function withShallowGitWorkspaceClone<T>(
         maxBuffer: 16 * 1024,
       }).catch(() => undefined);
     }
+    // Depth is load-bearing for transport cost and must not grow here. A
+    // depth-1 clone leaves the boundary commit parentless, so any ancestry
+    // measurement taken in the sandbox reads like a history rewrite; the
+    // receiving side announces that condition from the transport shape
+    // (see SHALLOW_CLONE_HISTORY_NOTICE) rather than probing the repo.
     await runLocalGit(cloneDir, ["fetch", "--depth=1", input.localDir, tempRef], {
       timeout: 60_000,
       maxBuffer: 1024 * 1024,
@@ -763,6 +768,51 @@ export function buildRemoteGitDeltaBundleScript(input: {
 }
 
 /**
+ * How a repo checkout's history was truncated on purpose, so an ancestry
+ * measurement taken against it is not mistaken for a real rewrite.
+ *
+ * - `complete`: the repository holds full history; a missing common ancestor
+ *   between two commits really is an unrelated history.
+ * - `shallow`: at least one shallow boundary commit exists (a depth-limited
+ *   clone, which is what `withShallowGitWorkspaceClone` transports to a
+ *   sandbox). The boundary commit reads as parentless, so
+ *   `git merge-base`, `git rev-list --count`, and `git rev-list
+ *   --max-parents=0` all report the same numbers a genuinely rewritten root
+ *   would. `git rev-parse --is-shallow-repository` answers this in one
+ *   process and without any network access.
+ */
+export type GitAncestryBoundaryState = "complete" | "shallow";
+
+/**
+ * Read the checkout's shallow-boundary state. Non-git directories, missing
+ * git, and any other failure resolve to `complete`: an unreadable answer must
+ * not turn a genuine unrelated-history result into a "maybe shallow" one, and
+ * the caller still keeps its loud failure for a failed `merge-base`.
+ */
+export async function readGitAncestryBoundaryState(
+  localDir: string,
+): Promise<GitAncestryBoundaryState> {
+  const result = await runLocalGit(localDir, ["rev-parse", "--is-shallow-repository"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).catch(() => null);
+  return result?.stdout.trim() === "true" ? "shallow" : "complete";
+}
+
+/**
+ * The sentence an agent needs before trusting any ancestry measurement in a
+ * shallow checkout, naming the exact command that repairs the measurement.
+ */
+export const SHALLOW_CLONE_HISTORY_NOTICE =
+  "This checkout is a depth-limited (shallow) git clone, so history above the shallow boundary is missing: "
+  + "`git merge-base` between the boundary commit and an older commit returns nothing, "
+  + "`git rev-list --count <ref>` undercounts, and `git rev-list --max-parents=0 <ref>` reports the "
+  + "boundary as a root commit. That is indistinguishable from a genuinely unrelated history or a squashed "
+  + "trunk — do not report a divergent or rewritten history, and do not propose a force-push, on the strength "
+  + "of it. Run `git fetch --unshallow origin` (or `git fetch --deepen=<n> origin` for more history) first, "
+  + "then re-measure.";
+
+/**
  * Preserve imported work whose history does not connect to the local one.
  *
  * The dominant real-world cause is a history rewrite inside a transported
@@ -782,6 +832,13 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   currentHead: string;
   importedHead: string;
   syncLabel: string;
+  /**
+   * Whether the graft is running against a depth-limited checkout. The graft
+   * is required either way (an unmergeable imported tree must not be dropped),
+   * but the boundary may only be shallow rather than genuinely unrelated, so
+   * the recorded message must not assert a rewrite it did not observe.
+   */
+  boundaryState?: GitAncestryBoundaryState;
 }): Promise<string> {
   const importedTree = (await runLocalGit(input.localDir, ["rev-parse", `${input.importedHead}^{tree}`], {
     timeout: 10_000,
@@ -794,7 +851,9 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   const message = [
     importedMessage.trim(),
     "",
-    `(${input.syncLabel} graft ${input.importedHead.slice(0, 12)}: imported history shares no ancestor with ${input.currentHead.slice(0, 12)})`,
+    input.boundaryState === "shallow"
+      ? `(${input.syncLabel} graft ${input.importedHead.slice(0, 12)}: imported history shares no ancestor with ${input.currentHead.slice(0, 12)}, but this repository is a shallow (depth-limited) clone, so the boundary may be shallow rather than a genuine unrelated history — measure with \`git fetch --unshallow origin\` before reading this as a rewrite)`
+      : `(${input.syncLabel} graft ${input.importedHead.slice(0, 12)}: imported history shares no ancestor with ${input.currentHead.slice(0, 12)})`,
   ].join("\n");
   const graftCommit = await runLocalGit(
     input.localDir,
@@ -858,12 +917,18 @@ export async function integrateImportedGitHead(input: {
     if (noCommonAncestor) {
       // No common ancestor — merging is impossible and failing here would
       // discard the imported work. Graft it onto the current head instead;
-      // see createUnrelatedHistoryGraftCommit.
+      // see createUnrelatedHistoryGraftCommit. Read the checkout's
+      // shallow-boundary state first: a depth-limited clone reports the same
+      // no-ancestor result as a real rewrite, and the graft message must not
+      // assert the histories were genuinely unrelated when the measurement
+      // could only be an artifact of the transport.
+      const boundaryState = await readGitAncestryBoundaryState(input.localDir);
       const graftCommit = await createUnrelatedHistoryGraftCommit({
         localDir: input.localDir,
         currentHead,
         importedHead: input.importedHead,
         syncLabel: "Paperclip remote git sync",
+        boundaryState,
       });
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {

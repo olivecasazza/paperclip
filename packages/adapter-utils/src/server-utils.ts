@@ -12,6 +12,7 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import { SHALLOW_CLONE_HISTORY_NOTICE } from "./git-workspace-sync.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -813,6 +814,16 @@ type PaperclipWakeExternalChatQuestionResponse = {
 
 type PaperclipWakeExecutionWorkspace = {
   branchName: string | null;
+  /**
+   * The checkout the agent runs in is a depth-1 shallow clone, so history
+   * above the shallow boundary is missing. Set by the transport that staged
+   * the workspace; absent for a full-history checkout. The renderer turns this
+   * into a visible diagnostic because a shallow boundary makes
+   * `git merge-base`, `git rev-list --count`, and `git rev-list
+   * --max-parents=0` report exactly what a squashed or force-pushed trunk
+   * reports, and the wrong reading of that is a proposed force-push.
+   */
+  shallowHistory: boolean;
 };
 
 type PaperclipWakeToolResult = {
@@ -1682,8 +1693,11 @@ function normalizePaperclipWakeExecutionWorkspace(
       .replace(/[\u0000-\u001f\u007f]/g, "")
       .trim()
       .slice(0, 300) || null;
-  if (!branchName) return null;
-  return { branchName };
+  // The shallow flag stands alone: a transported depth-1 clone carries no
+  // branch pin, and the diagnostic must still reach the agent then.
+  const shallowHistory = workspace.shallowHistory === true;
+  if (!branchName && !shallowHistory) return null;
+  return { branchName, shallowHistory };
 }
 
 // Wrap a value in a Markdown inline-code span whose backtick fence is longer
@@ -2618,6 +2632,12 @@ function renderPaperclipWakePromptBody(
       `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it.`,
     );
   }
+  if (normalized.executionWorkspace?.shallowHistory && !externalChatContract) {
+    // Always rendered, resumed sessions included: the truncated history is a
+    // property of the checkout, not of this wake, and the misreading it
+    // invites (a "divergent" or force-pushed trunk) outlives the prompt.
+    lines.push(`- shallow clone history: ${SHALLOW_CLONE_HISTORY_NOTICE}`);
+  }
   if (normalized.simplifiedEnglishInteractions) {
     lines.push(
       "- interaction language (experimental): write every user interaction you post (request_confirmation, ask_user_questions, suggest_tasks, checkbox prompts and options, and any other content rendered inside an interaction block) in ASD-STE100 Simplified Technical English. In each interaction, briefly tell the user what information they need to make the decision and what happens for each choice. This applies only to interaction content — write your thinking, comments, documents, and other responses in your usual style.",
@@ -3207,6 +3227,14 @@ export function applyPaperclipWorkspaceEnv(
     workspaceRepoRef?: string | null;
     workspaceBranch?: string | null;
     workspaceWorktreePath?: string | null;
+    /**
+     * The staged checkout is depth-limited (shallow), so history above the
+     * shallow boundary is missing. Surfaces the diagnostic in the agent's
+     * environment as well as the wake prompt, so an agent that reads its
+     * environment rather than the prompt still sees it. Absent/undefined for a
+     * full-history checkout, which is the common case and adds no env key.
+     */
+    shallowHistory?: boolean | null;
     agentHome?: string | null;
   },
 ): Record<string, string> {
@@ -3226,6 +3254,13 @@ export function applyPaperclipWorkspaceEnv(
     if (typeof value === "string" && value.length > 0) {
       env[key] = value;
     }
+  }
+
+  // The notice travels as the value rather than a bare flag so the agent can
+  // print the exact recovery command without reconstructing it, and a run that
+  // logs its environment shows the reason instead of an unexplained key.
+  if (input.shallowHistory === true) {
+    env.PAPERCLIP_WORKSPACE_SHALLOW_HISTORY = SHALLOW_CLONE_HISTORY_NOTICE;
   }
 
   return env;
@@ -3397,6 +3432,8 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   workspaceBranch?: string | null;
   workspaceWorktreePath?: string | null;
   workspaceHints?: Array<Record<string, unknown>>;
+  /** True when the staged checkout is depth-limited; see applyPaperclipWorkspaceEnv. */
+  shallowHistory?: boolean | null;
   agentHome?: string | null;
   executionTargetIsRemote?: boolean;
   executionCwd?: string | null;
@@ -3429,6 +3466,7 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
     workspaceRepoRef: input.workspaceRepoRef,
     workspaceBranch: input.workspaceBranch,
     workspaceWorktreePath: shapedWorkspaceEnv.workspaceWorktreePath,
+    shallowHistory: input.shallowHistory,
     agentHome: input.agentHome,
   });
 

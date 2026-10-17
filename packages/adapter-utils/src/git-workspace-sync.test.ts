@@ -9,10 +9,12 @@ import {
   buildRemoteGitDeltaBundleScript,
   createImportedGitRef,
   createRemoteGitExportRef,
+  createUnrelatedHistoryGraftCommit,
   deleteLocalGitRef,
   fetchGitBundleIntoLocalRef,
   integrateImportedGitHead,
   isMissingGitPrerequisiteError,
+  readGitAncestryBoundaryState,
   readGitWorkspaceSnapshot,
   ReferencedSourceIgnoreScanLimitExceededError,
   readReferencedSourceGitIgnoredPaths,
@@ -683,6 +685,207 @@ describe("git workspace sync", () => {
     const body = await git(repo, ["log", "-1", "--format=%B"]);
     expect(body).toContain(`Paperclip remote git sync graft ${importedHead.slice(0, 12)}`);
     expect(body).toContain("shares no ancestor");
+  });
+
+  // The CON-231 false signal: in a depth-1 clone every ancestry command reports
+  // what a force-pushed trunk reports. One builder, one switch (the fetch
+  // depth), so the pair is a real discriminator rather than two incidental
+  // fixtures: `git merge-base` finds nothing for both, and the shallow
+  // boundary is the only difference between them.
+  async function buildNoCommonAncestorShape(
+    rootDir: string,
+    options: { depth1: boolean },
+  ): Promise<{ cloneDir: string; currentHead: string; importedHead: string }> {
+    const setupIdentity = ["-c", "user.name=Setup", "-c", "user.email=setup@paperclip.dev"];
+    const source = path.join(rootDir, "source");
+    await mkdir(source, { recursive: true });
+    await git(source, ["init"]);
+    await git(source, ["checkout", "-b", "main"]);
+    await writeFile(path.join(source, "tracked.txt"), "base\n", "utf8");
+    await git(source, ["add", "tracked.txt"]);
+    await git(source, [...setupIdentity, "commit", "-m", "base"]);
+    await writeFile(path.join(source, "local.txt"), "local\n", "utf8");
+    await git(source, ["add", "local.txt"]);
+    await git(source, [...setupIdentity, "commit", "-m", "local advance"]);
+    const currentHead = await git(source, ["rev-parse", "HEAD"]);
+
+    // A history rewrite: an orphan root commit that shares no ancestor with the
+    // local advance. This is what a real force-push looks like.
+    await git(source, ["checkout", "--orphan", "rewritten"]);
+    await git(source, ["rm", "-rf", "."]);
+    await writeFile(path.join(source, "tracked.txt"), "squashed\n", "utf8");
+    await git(source, ["add", "tracked.txt"]);
+    await git(source, [...setupIdentity, "commit", "-m", "sandbox rewrite"]);
+    const importedHead = await git(source, ["rev-parse", "HEAD"]);
+
+    await git(source, ["update-ref", "refs/paperclip/import/current", currentHead]);
+    await git(source, ["update-ref", "refs/paperclip/import/rewritten", importedHead]);
+
+    // The product transport verbatim: `withShallowGitWorkspaceClone` inits a
+    // directory and runs `fetch --depth=1 <localDir> <tempRef>` against a
+    // temporary ref, then force-checks-out FETCH_HEAD. Only the depth differs
+    // between the two shapes.
+    const cloneDir = path.join(rootDir, options.depth1 ? "shallow-clone" : "full-clone");
+    await git(rootDir, ["init", "--quiet", cloneDir]);
+    const fetchArgs = options.depth1 ? ["--depth=1"] : [];
+    await git(cloneDir, [
+      "fetch",
+      ...fetchArgs,
+      `file://${source}`,
+      "refs/paperclip/import/current:refs/paperclip/current",
+      "refs/paperclip/import/rewritten:refs/paperclip/rewritten",
+    ]);
+    return { cloneDir, currentHead, importedHead };
+  }
+
+  it("distinguishes a depth-1 shallow boundary from a genuinely unrelated history", async () => {
+    const shallowDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-shallow-boundary-"));
+    const unrelatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-unrelated-history-"));
+    cleanupDirs.push(shallowDir, unrelatedDir);
+
+    const shallow = await buildNoCommonAncestorShape(shallowDir, { depth1: true });
+    const unrelated = await buildNoCommonAncestorShape(unrelatedDir, { depth1: false });
+
+    // The measurement surface: identical, which is exactly why code may not
+    // classify on git's ancestry commands alone.
+    await expect(git(shallow.cloneDir, ["merge-base", "refs/paperclip/current", "refs/paperclip/rewritten"]))
+      .rejects.toThrow();
+    await expect(git(unrelated.cloneDir, ["merge-base", "refs/paperclip/current", "refs/paperclip/rewritten"]))
+      .rejects.toThrow();
+
+    // The code surface: one local probe separates the two shapes, with no
+    // network access and no unshallowing.
+    expect(await readGitAncestryBoundaryState(shallow.cloneDir)).toBe("shallow");
+    expect(await readGitAncestryBoundaryState(unrelated.cloneDir)).toBe("complete");
+  });
+
+  it("records the shallow boundary instead of a genuine unrelated history in the graft message", async () => {
+    const shallowDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-graft-shallow-"));
+    const unrelatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-graft-unrelated-"));
+    cleanupDirs.push(shallowDir, unrelatedDir);
+
+    const shallow = await buildNoCommonAncestorShape(shallowDir, { depth1: true });
+    const unrelated = await buildNoCommonAncestorShape(unrelatedDir, { depth1: false });
+
+    // The graft is required either way — the imported tree is unmergeable in
+    // both shapes — so only the recorded message may differ.
+    const shallowGraft = await createUnrelatedHistoryGraftCommit({
+      localDir: shallow.cloneDir,
+      currentHead: shallow.currentHead,
+      importedHead: shallow.importedHead,
+      syncLabel: "Paperclip remote git sync",
+      boundaryState: await readGitAncestryBoundaryState(shallow.cloneDir),
+    });
+    const unrelatedGraft = await createUnrelatedHistoryGraftCommit({
+      localDir: unrelated.cloneDir,
+      currentHead: unrelated.currentHead,
+      importedHead: unrelated.importedHead,
+      syncLabel: "Paperclip remote git sync",
+      boundaryState: await readGitAncestryBoundaryState(unrelated.cloneDir),
+    });
+
+    const shallowBody = (await runLocalGit(shallow.cloneDir, [
+      "log", "-1", "--format=%B", shallowGraft,
+    ])).stdout;
+    const unrelatedBody = (await runLocalGit(unrelated.cloneDir, [
+      "log", "-1", "--format=%B", unrelatedGraft,
+    ])).stdout;
+
+    // Both record the graft.
+    expect(shallowBody).toContain(`Paperclip remote git sync graft ${shallow.importedHead.slice(0, 12)}`);
+    expect(unrelatedBody).toContain(`Paperclip remote git sync graft ${unrelated.importedHead.slice(0, 12)}`);
+    // Only the shallow one records that the boundary may be shallow rather than
+    // asserting the histories were genuinely unrelated.
+    expect(shallowBody).toContain("shallow (depth-limited) clone");
+    expect(shallowBody).toContain("the boundary may be shallow rather than a genuine unrelated history");
+    expect(shallowBody).toContain("git fetch --unshallow origin");
+    expect(unrelatedBody).toContain("shares no ancestor");
+    expect(unrelatedBody).not.toContain("shallow");
+  });
+
+  it("keeps the graft message plain when the integrating host is not shallow", async () => {
+    // `integrateImportedGitHead` runs against the host repository, which is
+    // never the shallow clone, so the boundary probe must read "complete" and
+    // the message must not soften itself. This is the guard on the probe: it
+    // must not invent a shallow boundary on a full-history host.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-graft-boundary-state-"));
+    cleanupDirs.push(rootDir);
+    const setupIdentity = ["-c", "user.name=Setup", "-c", "user.email=setup@paperclip.dev"];
+    const repo = path.join(rootDir, "repo");
+    await mkdir(repo, { recursive: true });
+    await git(repo, ["init"]);
+    await git(repo, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repo, "tracked.txt"), "base\n", "utf8");
+    await git(repo, ["add", "tracked.txt"]);
+    await git(repo, [...setupIdentity, "commit", "-m", "base"]);
+    const baseHead = await git(repo, ["rev-parse", "HEAD"]);
+    await writeFile(path.join(repo, "local.txt"), "local\n", "utf8");
+    await git(repo, ["add", "local.txt"]);
+    await git(repo, [...setupIdentity, "commit", "-m", "local advance"]);
+    const importedTree = await git(repo, ["rev-parse", `${baseHead}^{tree}`]);
+    const importedHead = await git(repo, [...setupIdentity, "commit-tree", importedTree, "-m", "sandbox rewrite"]);
+
+    expect(await readGitAncestryBoundaryState(repo)).toBe("complete");
+    await integrateImportedGitHead({ localDir: repo, importedHead });
+
+    const body = await git(repo, ["log", "-1", "--format=%B"]);
+    expect(body).toContain("shares no ancestor");
+    expect(body).not.toContain("shallow");
+  });
+
+  it("reads a full-history checkout and a non-git directory as complete", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-boundary-state-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    await writeFile(path.join(repo, "second.txt"), "second\n", "utf8");
+    await git(repo, ["add", "second.txt"]);
+    await git(repo, ["commit", "-m", "second"]);
+
+    expect(await readGitAncestryBoundaryState(repo)).toBe("complete");
+
+    const notARepo = path.join(rootDir, "plain");
+    await mkdir(notARepo, { recursive: true });
+    expect(await readGitAncestryBoundaryState(notARepo)).toBe("complete");
+  });
+
+  it("reports a real shallow clone as shallow without unshallowing it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-depth-one-"));
+    cleanupDirs.push(rootDir);
+    const setupIdentity = ["-c", "user.name=Setup", "-c", "user.email=setup@paperclip.dev"];
+    const source = path.join(rootDir, "source");
+    await mkdir(source, { recursive: true });
+    await git(source, ["init"]);
+    await git(source, ["checkout", "-b", "main"]);
+    await writeFile(path.join(source, "tracked.txt"), "base\n", "utf8");
+    await git(source, ["add", "tracked.txt"]);
+    await git(source, [...setupIdentity, "commit", "-m", "base"]);
+    const baseHead = await git(source, ["rev-parse", "HEAD"]);
+    await writeFile(path.join(source, "second.txt"), "second\n", "utf8");
+    await git(source, ["add", "second.txt"]);
+    await git(source, [...setupIdentity, "commit", "-m", "second"]);
+    const headCommit = await git(source, ["rev-parse", "HEAD"]);
+    // An older, unreachable-in-the-clone commit: what a run would compare
+    // against to decide the histories diverged.
+    await git(source, ["update-ref", "refs/heads/history", baseHead]);
+    await git(source, ["checkout", "main"]);
+
+    const cloneDir = path.join(rootDir, "clone");
+    await git(rootDir, ["clone", "--no-hardlinks", "--depth=1", `file://${source}`, cloneDir]);
+
+    // The CON-224 measurement, on a genuine depth-1 clone: every number an
+    // agent could compute looks like a squashed, unrelated trunk.
+    expect(await git(cloneDir, ["rev-parse", "--is-shallow-repository"])).toBe("true");
+    expect(await git(cloneDir, ["rev-list", "--count", "HEAD"])).toBe("1");
+    expect(await git(cloneDir, ["rev-list", "--max-parents=0", "HEAD"])).toBe(headCommit);
+    // The dangerous measurement: the boundary commit has no ancestor in common
+    // with the older development commit, so merge-base finds nothing and the
+    // trunk reads as unrelated.
+    await expect(git(cloneDir, ["merge-base", "HEAD", baseHead])).rejects.toThrow();
+    expect(await readGitAncestryBoundaryState(cloneDir)).toBe("shallow");
+
+    // Detection must not unshallow on its own: the depth is load-bearing for
+    // transport cost.
+    expect(await git(cloneDir, ["rev-list", "--count", "HEAD"])).toBe("1");
   });
 
   it("does not graft when merge-base fails for a reason other than missing ancestry", async () => {

@@ -9,6 +9,7 @@ import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  readGitAncestryBoundaryState,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -969,12 +970,17 @@ async function integrateImportedGitHead(input: {
     if (noCommonAncestor) {
       // No common ancestor — merging is impossible and failing here would
       // discard the imported work. Graft it onto the current head instead;
-      // see createUnrelatedHistoryGraftCommit.
+      // see createUnrelatedHistoryGraftCommit. The shallow-boundary state is
+      // read for the same reason as the remote-git-sync copy: a depth-limited
+      // clone produces an identical no-ancestor reading, and the graft
+      // message must record that instead of asserting a real rewrite.
+      const boundaryState = await readGitAncestryBoundaryState(input.localDir);
       const graftCommit = await createUnrelatedHistoryGraftCommit({
         localDir: input.localDir,
         currentHead,
         importedHead: input.importedHead,
         syncLabel: "Paperclip SSH sync",
+        boundaryState,
       });
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {

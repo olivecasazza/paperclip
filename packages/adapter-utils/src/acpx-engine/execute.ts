@@ -1766,6 +1766,11 @@ async function buildRuntime(input: {
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
   const workspaceBranch = asString(workspaceContext.branchName, "");
   const workspaceWorktreePath = asString(workspaceContext.worktreePath, "");
+  // Server-resolved shallow-boundary flag for the staged checkout. It rides the
+  // run context rather than a probe so the adapter never pays a git call (and
+  // never has to guess from a depth-1 clone it cannot unshallow) — see
+  // SHALLOW_CLONE_HISTORY_NOTICE.
+  const workspaceShallowHistory = context.paperclipWorkspaceShallowHistory === true;
   const agentHome = asString(workspaceContext.agentHome, "");
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
@@ -1944,6 +1949,7 @@ async function buildRuntime(input: {
     workspaceRepoRef,
     workspaceBranch,
     workspaceWorktreePath: shapedWorkspaceEnv.workspaceWorktreePath,
+    shallowHistory: workspaceShallowHistory,
     agentHome,
   });
   const shapedEnvConfig = rewriteWorkspaceCwdEnvVarsForExecution({
