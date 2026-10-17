@@ -1,10 +1,20 @@
-import { describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { companies, createDb, issueWorkProducts, issues, projects } from "@paperclipai/db";
 import {
   enrichWorkProductMetadataWithDiff,
   refreshPullRequestWorkProductMetadata,
   workProductDiffSummaryFromEventPayload,
   workProductService,
 } from "../services/work-products.ts";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.ts";
+
+const postgresSupport = await getEmbeddedPostgresTestSupport();
+const describeDatabase = postgresSupport.supported ? describe : describe.skip;
 
 function createWorkProductRow(overrides: Partial<Record<string, unknown>> = {}) {
   const now = new Date("2026-03-17T00:00:00.000Z");
@@ -126,68 +136,135 @@ describe("workProductService", () => {
       sha: "9c12ae7b41e5",
     });
   });
+});
 
-  it("uses a transaction when creating a new primary work product", async () => {
-    const updatedWhere = vi.fn(async () => undefined);
-    const updateSet = vi.fn(() => ({ where: updatedWhere }));
-    const txUpdate = vi.fn(() => ({ set: updateSet }));
+describeDatabase("workProductService primary invariant", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
 
-    const insertedRow = createWorkProductRow();
-    const insertReturning = vi.fn(async () => [insertedRow]);
-    const insertValues = vi.fn(() => ({ returning: insertReturning }));
-    const txInsert = vi.fn(() => ({ values: insertValues }));
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-work-product-primary-");
+    db = createDb(database.connectionString);
+  }, 30_000);
 
-    const tx = {
-      update: txUpdate,
-      insert: txInsert,
-    };
-    const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => await callback(tx));
+  afterAll(async () => { await database?.cleanup(); });
 
-    const svc = workProductService({ transaction } as any);
-    const result = await svc.createForIssue("issue-1", "company-1", {
-      type: "pull_request",
-      provider: "github",
-      title: "PR 1",
-      status: "open",
-      reviewState: "draft",
-      isPrimary: true,
-    });
+  async function fixture() {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Test company", issuePrefix: companyId });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Test project" });
+    await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Test issue" });
+    return { companyId, projectId, issueId };
+  }
 
-    expect(transaction).toHaveBeenCalledTimes(1);
-    expect(txUpdate).toHaveBeenCalledTimes(1);
-    expect(txInsert).toHaveBeenCalledTimes(1);
-    expect(result?.id).toBe("work-product-1");
+  const input = { type: "pull_request", provider: "github", title: "PR", status: "open" };
+
+  async function primaryRows(f: { companyId: string; issueId: string }, type = "pull_request") {
+    return db
+      .select()
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, f.companyId),
+          eq(issueWorkProducts.issueId, f.issueId),
+          eq(issueWorkProducts.type, type),
+        ),
+      );
+  }
+
+  async function primaryIds(f: { companyId: string; issueId: string }, type = "pull_request") {
+    const rows = await primaryRows(f, type);
+    return rows.filter((row) => row.isPrimary).map((row) => row.id).sort();
+  }
+
+  it("leaves exactly one primary in the issue/type group when a new primary is created", async () => {
+    const f = await fixture();
+    const svc = workProductService(db);
+
+    const first = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "first", isPrimary: true });
+    const second = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "second", isPrimary: true });
+
+    expect(await primaryIds(f)).toEqual([second!.id]);
+    expect(await svc.getById(first!.id)).toMatchObject({ isPrimary: false });
   });
 
-  it("uses a transaction when promoting an existing work product to primary", async () => {
-    const existingRow = createWorkProductRow({ isPrimary: false });
+  it("leaves exactly one primary in the company when an existing product is promoted", async () => {
+    const f = await fixture();
+    const svc = workProductService(db);
 
-    const selectWhere = vi.fn(async () => [existingRow]);
-    const selectFrom = vi.fn(() => ({ where: selectWhere }));
-    const txSelect = vi.fn(() => ({ from: selectFrom }));
+    const incumbent = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "incumbent", isPrimary: true });
+    const challenger = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "challenger", isPrimary: false });
 
-    const updateReturning = vi
-      .fn()
-      .mockResolvedValue([createWorkProductRow({ reviewState: "ready_for_review" })]);
-    const updateWhere = vi.fn(() => ({ returning: updateReturning }));
-    const updateSet = vi.fn(() => ({ where: updateWhere }));
-    const txUpdate = vi.fn(() => ({ set: updateSet }));
+    const promoted = await svc.update(challenger!.id, { isPrimary: true, reviewState: "ready_for_review" });
 
-    const tx = {
-      select: txSelect,
-      update: txUpdate,
-    };
-    const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => await callback(tx));
+    expect(promoted).toMatchObject({ id: challenger!.id, isPrimary: true, reviewState: "ready_for_review" });
+    expect(await primaryIds(f)).toEqual([challenger!.id]);
+    expect(await svc.getById(incumbent!.id)).toMatchObject({ isPrimary: false });
+  });
 
-    const svc = workProductService({ transaction } as any);
-    const result = await svc.update("work-product-1", {
-      isPrimary: true,
-      reviewState: "ready_for_review",
+  it("keeps a different issue/type group primary when promoting, so the demote is scoped", async () => {
+    const f = await fixture();
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, projectId: f.projectId, title: "Other issue" });
+    const svc = workProductService(db);
+
+    const otherType = await svc.createForIssue(f.issueId, f.companyId, { ...input, type: "commit", title: "commit", isPrimary: true });
+    const otherIssue = await svc.createForIssue(otherIssueId, f.companyId, { ...input, title: "other issue", isPrimary: true });
+    const challenger = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "challenger", isPrimary: false });
+
+    await svc.update(challenger!.id, { isPrimary: true });
+
+    expect(await primaryIds(f)).toEqual([challenger!.id]);
+    expect(await primaryIds(f, "commit")).toEqual([otherType!.id]);
+    expect(await primaryIds({ companyId: f.companyId, issueId: otherIssueId })).toEqual([otherIssue!.id]);
+  });
+
+  // A regression that hoists the demote out of db.transaction still produces one
+  // primary on success, so the count assertions above stay green. Aborting the
+  // transaction is what distinguishes the two implementations.
+  function abortingDatabase() {
+    return new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return (callback: Parameters<typeof db.transaction>[0]) => target.transaction(async (tx) => {
+          await callback(tx);
+          throw new Error("forced transaction abort");
+        });
+      },
     });
+  }
 
-    expect(transaction).toHaveBeenCalledTimes(1);
-    expect(txSelect).toHaveBeenCalledTimes(1);
-    expect(txUpdate).toHaveBeenCalledTimes(2);
-    expect(result?.reviewState).toBe("ready_for_review");
+  it("rolls the demotion back with the insert when creating a primary aborts", async () => {
+    const f = await fixture();
+    const svc = workProductService(db);
+
+    const incumbent = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "incumbent", isPrimary: true });
+
+    await expect(
+      workProductService(abortingDatabase() as typeof db).createForIssue(f.issueId, f.companyId, {
+        ...input,
+        title: "challenger",
+        isPrimary: true,
+      }),
+    ).rejects.toThrow("forced transaction abort");
+
+    expect(await primaryIds(f)).toEqual([incumbent!.id]);
+  });
+
+  it("rolls the demotion back with the promotion when a promotion aborts", async () => {
+    const f = await fixture();
+    const svc = workProductService(db);
+
+    const incumbent = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "incumbent", isPrimary: true });
+    const challenger = await svc.createForIssue(f.issueId, f.companyId, { ...input, title: "challenger", isPrimary: false });
+
+    await expect(
+      workProductService(abortingDatabase() as typeof db).update(challenger!.id, { isPrimary: true }),
+    ).rejects.toThrow("forced transaction abort");
+
+    expect(await primaryIds(f)).toEqual([incumbent!.id]);
+    expect(await svc.getById(challenger!.id)).toMatchObject({ isPrimary: false });
   });
 });
