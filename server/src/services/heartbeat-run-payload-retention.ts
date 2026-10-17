@@ -10,6 +10,10 @@ import { logger } from "../middleware/logger.js";
  * the bulky per-run blobs. A run's identity, status, timings, usage counters
  * and routing keys all survive, so every list/filter/join keeps working and the
  * change is reversible by re-running against a shorter window.
+ *
+ * Note that this is a *logical* payload window, not a disk window: trimming
+ * frees detoast work, not OS bytes. See the `pruneHeartbeatRunPayloads` doc
+ * comment and CON-468 for the measurement that corrected the earlier claim.
  */
 const DEFAULT_RETENTION_DAYS = 30;
 
@@ -20,7 +24,9 @@ export const TRIM_BATCH_SIZE = 500;
  * Maximum batches per sweep so a backlog cannot monopolise the connection.
  *
  * At `TRIM_BATCH_SIZE` this caps a single sweep at 10,000 rows. A larger backlog
- * is not an error: the next sweep continues where this one stopped.
+ * is not an error: the next sweep continues where this one stopped — but the
+ * sweep must *say* so with the real remainder, not just "some runs may remain".
+ * See `pruneHeartbeatRunPayloads`, which counts the leftovers on the cap path.
  */
 export const MAX_ITERATIONS = 20;
 
@@ -125,18 +131,92 @@ function trimCandidates(cutoff: Date) {
 }
 
 /**
+ * How many rows still match `trimCandidates` at `cutoff`.
+ *
+ * Only ever called on the per-sweep cap path, so it is one cheap `count(*)`
+ * over an already-selective predicate and not something the hot loop pays for.
+ */
+async function countTrimCandidates(db: Db, cutoff: Date): Promise<number> {
+  return db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(heartbeatRuns)
+    .where(trimCandidates(cutoff))
+    .then((rows) => rows[0]?.count ?? 0);
+}
+
+/**
  * Trim the stored payload on terminal runs older than the retention window.
  *
  * Unlike a delete, this keeps the row: id, status, timings, exit metadata and
  * every `context_snapshot` routing key survive, so history, filters and joins
  * are unaffected. What goes away is `result_json`, `usage_json`, the stdout and
- * stderr excerpts, and the non-routing half of `context_snapshot` — together
- * roughly 90% of the bytes on an aged run.
+ * stderr excerpts, and the non-routing half of `context_snapshot`.
  *
- * Row removal itself is deliberately out of scope: see CON-436 item 1. This
- * recovers the space without foreclosing that decision, and because the heavy
- * columns live in TOAST, nulling them lets the space be returned to the OS
- * instead of only shrinking future inserts.
+ * ## This does not return disk space to the OS
+ *
+ * An earlier revision of this comment claimed that "because the heavy columns
+ * live in TOAST, nulling them lets the space be returned to the OS instead of
+ * only shrinking future inserts". That was false, and CON-468 measured it false
+ * on the live database: trimming the aged backlog left `heartbeat_runs` at
+ * 1041 MB total / 930 MB TOAST, and a real `VACUUM` afterwards left it at
+ * 1041 MB / 930 MB — unchanged.
+ *
+ * The mechanism is ordinary MVCC. An `UPDATE` writes a *new* tuple version; the
+ * superseded tuple's TOAST chunks are not reused and are not released by
+ * `VACUUM`, which only marks dead tuples reusable for future inserts. Returning
+ * them to the OS needs `VACUUM FULL` (rewrites the table under an
+ * `ACCESS EXCLUSIVE` lock) or `pg_repack` (needs the extension, which this
+ * deployment does not have, plus its own lock window). Neither is something
+ * this sweep can do on a live, saturated pool.
+ *
+ * So the honest description of what this sweep does:
+ *
+ * - **It does:** shrink what each future read of an aged row has to detoast, and
+ *   shrink the size of the tuple a future rewrite of that row writes. The
+ *   logical payload of an aged run genuinely goes to near zero.
+ * - **It does not:** reduce `pg_total_relation_size('heartbeat_runs')`. It leaves
+ *   the freed bytes as dead tuples for `VACUUM` to recycle.
+ *
+ * Reclaiming the space is a separate, deliberate operation owned by ops, not by
+ * this scheduled job. See CON-436 item 1 for row deletion and CON-446 for why
+ * deletion is gated behind the FK graph.
+ *
+ * ## This does not mitigate pool starvation
+ *
+ * The run-list query (`heartbeat.list`, and the 26 call sites that order by
+ * `heartbeat_runs.created_at DESC`) reads the *newest* rows first. This sweep
+ * trims the *oldest* rows first. Those two sets barely overlap, so on this
+ * deployment the sweep is structurally incapable of helping the query that is
+ * actually saturating the pool (CON-431, CON-433).
+ *
+ * Measured live on 2026-10-04, by varying only which columns the list
+ * projection extracts (newest 200 rows, same connection, median of 7):
+ *
+ * | projection | wall time |
+ * | --- | --- |
+ * | `result_json` + `context_snapshot` extracts (as shipped) | 831 ms |
+ * | `context_snapshot` extracts only | 38 ms |
+ * | `result_json` extracts only | 1282 ms |
+ * | neither — the floor, and what a fully-trimmed table would give | 13 ms |
+ *
+ * So the cost the hot path pays is almost entirely `result_json` detoast, and
+ * trimming `result_json` on rows the list query *does* read is worth roughly
+ * two orders of magnitude. The 30-day window simply never reaches them: on the
+ * measured table, 9,469 rows / 359 MB of `result_json` sit inside the window
+ * against 19,010 rows / 128 MB outside it, and the oldest row in the table is
+ * 2026-05-11, so nothing ages into the trim range quickly.
+ *
+ * Shortening the window far enough to overlap the hot cohort would fix the
+ * starvation, and would also mean discarding the full `result_json` of runs
+ * that are only days old — which is what the single-run `getRun` read (and
+ * therefore run debugging) still depends on. That is a retention-policy
+ * tradeoff, not a code default, so it is deliberately not changed here. It is
+ * tracked as a decision on CON-468 and cross-linked from CON-446, which already
+ * holds the board gate on run retention policy.
+ *
+ * Read this module as what it is: a housekeeping job that keeps aged rows from
+ * growing without bound. It is not, on its own, a mitigation for pool
+ * starvation. It was previously described as one, and it is not.
  *
  * Batching matters here and is not an optimisation. These columns live in
  * TOAST, so one statement over an unbounded candidate set rewrites hundreds of
@@ -156,6 +236,7 @@ export async function pruneHeartbeatRunPayloads(
 
   let totalTrimmed = 0;
   let iterations = 0;
+  let hitIterationCap = false;
 
   while (iterations < MAX_ITERATIONS) {
     // Oldest first, so a backlog drains in age order rather than in whatever
@@ -187,18 +268,39 @@ export async function pruneHeartbeatRunPayloads(
     iterations++;
 
     // The batch was fully claimed, so a full batch means there is more to do.
-    if (batchIds.length < TRIM_BATCH_SIZE) break;
+    if (batchIds.length < TRIM_BATCH_SIZE) {
+      hitIterationCap = false;
+      break;
+    }
+    hitIterationCap = true;
   }
 
-  if (iterations >= MAX_ITERATIONS) {
+  if (hitIterationCap) {
+    // CON-468 defect 3: the live backlog (18,385 candidates) exceeds one
+    // sweep's 10,000-row ceiling every single time, so this is the *normal*
+    // path, not an exceptional one. Logging "some runs may remain untrimmed"
+    // here hid that. Count the actual remainder instead, so the log answers
+    // "how many sweeps will it take" instead of leaving it to be guessed.
+    const remainingCandidates = await countTrimCandidates(db, cutoff);
+    const sweepsToDrain = Math.ceil(remainingCandidates / (MAX_ITERATIONS * TRIM_BATCH_SIZE));
     logger.warn(
-      { totalTrimmed, iterations, cutoffDate: cutoff },
-      "Heartbeat run payload retention hit iteration limit; some runs may remain untrimmed",
+      {
+        totalTrimmed,
+        iterations,
+        cutoffDate: cutoff,
+        remainingCandidates,
+        maxRowsPerSweep: MAX_ITERATIONS * TRIM_BATCH_SIZE,
+        sweepsToDrain,
+      },
+      "Heartbeat run payload retention hit the per-sweep row cap; backlog remains",
     );
   }
 
   if (totalTrimmed > 0) {
-    logger.info({ totalTrimmed, retentionDays }, "Trimmed payload on aged terminal heartbeat runs");
+    logger.info(
+      { totalTrimmed, retentionDays, spaceReturnedToOs: false },
+      "Trimmed payload on aged terminal heartbeat runs (logical payload only; freed TOAST stays on disk until VACUUM FULL/pg_repack)",
+    );
   }
 
   return totalTrimmed;
